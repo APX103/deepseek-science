@@ -8,6 +8,7 @@ description = "Deepseek Science tool system (Tool trait, registry, router, built
 dss-core = { path = "../dss-core" }
 dss-skills = { path = "../dss-skills" }
 dss-mcp = { path = "../dss-mcp" }
+dss-llm = { path = "../dss-llm" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

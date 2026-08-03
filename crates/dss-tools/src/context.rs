@@ -39,6 +39,11 @@ pub struct ToolContext {
     pub mcp: Arc<dss_mcp::MCPServerManager>,
     /// plan 模式共享态（P6a：generate_plan 写入，Runner 读以转 awaiting）。
     pub plan: Arc<Mutex<Option<PlanState>>>,
+    /// LLM 客户端 + 模型（P6b：delegate 工具用，做单次子任务 LLM 调用）。
+    pub llm: Option<std::sync::Arc<dyn dss_llm::LlmClient>>,
+    pub model: String,
+    /// delegate 深度（modules.md 上限 2；主 agent 为 0，子为 1，孙为 2）。
+    pub delegate_depth: u32,
 }
 
 /// plan 模式状态（generate_plan 产出）。
@@ -64,11 +69,21 @@ impl ToolContext {
             skill_catalog: Arc::new(dss_skills::SkillCatalog::new()),
             mcp: Arc::new(dss_mcp::MCPServerManager::new()),
             plan: Arc::new(Mutex::new(None)),
+            llm: None,
+            model: String::new(),
+            delegate_depth: 0,
         }
     }
 
     pub fn with_skill_catalog(mut self, catalog: dss_skills::SkillCatalog) -> Self {
         self.skill_catalog = Arc::new(catalog);
+        self
+    }
+
+    /// 注入 LLM 客户端 + 模型（delegate 工具用）。
+    pub fn with_llm(mut self, llm: std::sync::Arc<dyn dss_llm::LlmClient>, model: String) -> Self {
+        self.llm = Some(llm);
+        self.model = model;
         self
     }
 

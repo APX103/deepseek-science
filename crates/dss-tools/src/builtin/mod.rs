@@ -5,6 +5,7 @@
 pub mod ask_user;
 pub mod bash;
 pub mod compile;
+pub mod delegate;
 pub mod files;
 pub mod mcp;
 pub mod plan;
@@ -33,4 +34,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(skills::SkillTool));
     registry.register(Arc::new(plan::GeneratePlanTool));
     registry.register(Arc::new(plan::UpdateStepStatusTool));
+    registry.register(Arc::new(delegate::DelegateTool));
+    registry.register(Arc::new(delegate::SubmitOutputTool));
 }
