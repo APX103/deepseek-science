@@ -1,0 +1,17 @@
+[package]
+name = "dss-llm"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science LLM client (OpenAI-compatible, Deepseek specialization)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true

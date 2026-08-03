@@ -1,0 +1,23 @@
+[package]
+name = "dss-agent"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science agent kernel (Runner + Frames + Session)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-llm = { path = "../dss-llm" }
+dss-tools = { path = "../dss-tools" }
+dss-compact = { path = "../dss-compact" }
+dss-memory = { path = "../dss-memory" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

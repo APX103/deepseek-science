@@ -1,0 +1,18 @@
+[package]
+name = "dss-db"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science SQLite storage (rusqlite + deadpool-sqlite, inline migrations, repos)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+deadpool.workspace = true
+deadpool-sqlite.workspace = true
+uuid.workspace = true

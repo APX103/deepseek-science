@@ -1,0 +1,14 @@
+[package]
+name = "dss-observability"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science observability (LogStore: system + agent logs)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-db = { path = "../dss-db" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true

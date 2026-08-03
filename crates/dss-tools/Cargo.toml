@@ -1,0 +1,17 @@
+[package]
+name = "dss-tools"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science tool system (Tool trait, registry, router, built-in tools)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-skills = { path = "../dss-skills" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true

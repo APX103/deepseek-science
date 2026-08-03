@@ -1,0 +1,18 @@
+[package]
+name = "dss-bin"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science backend binary (CLI + server bootstrap)"
+
+[[bin]]
+name = "dss-backend"
+path = "src/main.rs"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-api = { path = "../dss-api" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

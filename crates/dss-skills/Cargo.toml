@@ -1,0 +1,13 @@
+[package]
+name = "dss-skills"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science skills (SKILL.md parsing, multi-source loading, BM25+RRF retrieval)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+include_dir.workspace = true

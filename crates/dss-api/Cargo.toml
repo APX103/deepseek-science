@@ -1,0 +1,27 @@
+[package]
+name = "dss-api"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science HTTP/SSE API layer (axum)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-llm = { path = "../dss-llm" }
+dss-agent = { path = "../dss-agent" }
+dss-tools = { path = "../dss-tools" }
+dss-db = { path = "../dss-db" }
+dss-compact = { path = "../dss-compact" }
+dss-skills = { path = "../dss-skills" }
+dss-memory = { path = "../dss-memory" }
+dss-observability = { path = "../dss-observability" }
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+futures.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+include_dir.workspace = true

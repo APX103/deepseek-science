@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * DeepSeek 设计 token（docs/design-system.md）
+ * 亮色为默认；[data-theme="dark"] 覆盖为深色。
+ * 核心：品牌蓝 #4D6BFE、1px 细边框、几乎无阴影、圆角克制。
+ */
+:root {
+  --brand: #4d6bfe;
+  --brand-hover: #3d5ae0;
+  --brand-soft: rgba(77, 107, 254, 0.1);
+  --bg: #ffffff;
+  --surface: #f9fafb;
+  --surface-2: #f3f4f6;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --text: #111827;
+  --text-secondary: #6b7280;
+  --text-tertiary: #9ca3af;
+  --danger: #ef4444;
+  --danger-soft: rgba(239, 68, 68, 0.1);
+  --success: #10b981;
+}
+
+[data-theme='dark'] {
+  --brand: #5b7cff;
+  --brand-hover: #4d6bfe;
+  --brand-soft: rgba(91, 124, 255, 0.14);
+  --bg: #151517;
+  --surface: #1f1f23;
+  --surface-2: #2a2a2e;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #f9fafb;
+  --text-secondary: #9ca3af;
+  --text-tertiary: #6b7280;
+  --danger: #ef4444;
+  --danger-soft: rgba(239, 68, 68, 0.16);
+  --success: #10b981;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-bg text-ink font-sans;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 全局交互克制：150ms ease */
+* {
+  transition-property: background-color, border-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: ease;
+}
+
+::selection {
+  background: var(--brand-soft);
+}
+
+/* 细滚动条，贴合细线条风格 */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  /* 细边框按钮（次）/ 实心品牌蓝按钮（主） */
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] font-medium;
+  }
+  .btn-primary {
+    @apply btn bg-brand text-white hover:bg-brandHover;
+  }
+  .btn-outline {
+    @apply btn border border-border bg-bg text-ink hover:bg-surface2;
+  }
+  .btn-ghost {
+    @apply btn text-ink2 hover:bg-surface2 hover:text-ink;
+  }
+  .input {
+    @apply w-full rounded-md border border-border bg-bg px-3 py-2 text-[13px] text-ink placeholder:text-ink3 focus:border-brand focus:outline-none;
+  }
+  .card {
+    @apply rounded-lg border border-border bg-bg;
+  }
+}

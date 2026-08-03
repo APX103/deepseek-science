@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / 前端
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# 本地运行时数据（不入库；数据目录在 ~/.deepseek-science，但项目内若有同名也忽略）
+*.db
+*.db-shm
+*.db-wal
+workspaces/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# ZCode 会话元数据（agent 工作目录，非项目源码）
+.zcode/
