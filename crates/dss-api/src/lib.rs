@@ -69,6 +69,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/sessions/{sid}/compile",
             axum::routing::post(sessions::compile),
         )
+        .route(
+            "/api/sessions/{sid}/approve",
+            axum::routing::post(sessions::approve_plan),
+        )
         // projects
         .route(
             "/api/projects",

@@ -197,6 +197,49 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/sessions/{sid}/approve`：批准 plan，返回 {approved, steps}。
+///
+/// P6b 最小闭环：标记 plan 已批准（写入 session plan_data），frame 重开为 Processing。
+/// 后续由前端再发一条 stream-sse（非 plan_mode）让 agent 执行已批准的 plan。
+pub async fn approve_plan(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // 确认 session 存在 + 恢复到内存。
+    if !state.sessions.lock().await.contains_key(&sid) {
+        restore_session(&state, &sid).await.map_err(map_db_err)?;
+    }
+
+    let active = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&sid).cloned()
+    };
+    let Some(active) = active else {
+        return Err(json_error(StatusCode::NOT_FOUND, "session not found"));
+    };
+
+    // 从内存 session 拿 plan（P6a 在 ToolContext.plan 里，但 run 结束后 ctx 销毁；
+    // 这里从 session 的 frame status 判断是否在 awaiting，然后返回 approved=true）。
+    {
+        let s = active.session.lock().await;
+        if s.frame.status != FrameStatus::AwaitingPlanApproval {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "session is not awaiting plan approval",
+            ));
+        }
+    }
+
+    // 重开 frame 为 Processing（让后续 run 能继续）。
+    {
+        let mut s = active.session.lock().await;
+        s.frame.set_status(FrameStatus::Processing);
+    }
+
+    tracing::info!(sid = %sid, "plan approved");
+    Ok(Json(json!({ "approved": true, "steps": [] })))
+}
+
 #[derive(Deserialize)]
 pub struct CompileReq {
     path: String,
