@@ -1,0 +1,14 @@
+[package]
+name = "dss-verify"
+version.workspace = true
+edition.workspace = true
+description = "Deepseek Science verifier (terminal barrier + reviewer checkpoint)"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-llm = { path = "../dss-llm" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true

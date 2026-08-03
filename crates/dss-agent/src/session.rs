@@ -30,6 +30,8 @@ pub struct GateState {
     pub length_finish_count: u32,
     /// plan_mode 下未生成 plan 的连续重试次数（plan denial 门）。
     pub plan_denial_count: u32,
+    /// terminal barrier veto 次数（P6b verify；上限 VETO_CAP=1）。
+    pub veto_count: u32,
 }
 
 impl Session {

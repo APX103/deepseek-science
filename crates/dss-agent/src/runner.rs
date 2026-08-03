@@ -35,6 +35,8 @@ pub const LENGTH_FINISH_HARD_CAP: u32 = 5;
 pub const LENGTH_FINISH_TRIM_AT: u32 = 3;
 /// plan denial 门：plan_mode 无 plan 的重试上限（modules.md ≤3）。
 pub const PLAN_DENIAL_CAP: u32 = 3;
+/// terminal barrier veto 上限（P6b verify：自然完成被 veto 后最多再修 1 轮，避免无限循环）。
+pub const VETO_CAP: u32 = 1;
 
 /// 检索/阅读类工具（用于检索熔断判断）。写/执行类不在此列。
 fn is_retrieval_tool(name: &str) -> bool {
@@ -436,6 +438,24 @@ impl Runner {
                 }
 
                 final_text = text_buf.clone();
+
+                // —— terminal barrier（P6b verify）：自然完成时 review；veto 则再修一轮（≤1 次）——
+                if session.gate_state.veto_count < VETO_CAP {
+                    if let Some(verdict) = dss_verify::terminal_barrier(llm, model, prompt, &final_text).await {
+                        if !verdict.pass && !verdict.findings.is_empty() {
+                            session.gate_state.veto_count += 1;
+                            tracing::info!(findings = ?verdict.findings, "terminal barrier veto");
+                            session.messages.push(ChatMessage::assistant(&final_text));
+                            let notice = format!(
+                                "reviewer 发现以下问题，请修复后重新给出最终回复：\n{}",
+                                verdict.findings.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+                            );
+                            session.messages.push(harness_notice(&notice));
+                            continue;
+                        }
+                    }
+                }
+
                 session.messages.push(ChatMessage::assistant(&final_text));
                 session.frame.set_status(FrameStatus::Completed);
 

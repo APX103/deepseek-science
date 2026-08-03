@@ -10,6 +10,7 @@ dss-llm = { path = "../dss-llm" }
 dss-tools = { path = "../dss-tools" }
 dss-compact = { path = "../dss-compact" }
 dss-memory = { path = "../dss-memory" }
+dss-verify = { path = "../dss-verify" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

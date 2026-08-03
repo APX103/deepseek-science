@@ -9,6 +9,7 @@ members = [
     "crates/dss-skills",
     "crates/dss-memory",
     "crates/dss-mcp",
+    "crates/dss-verify",
     "crates/dss-observability",
     "crates/dss-agent",
     "crates/dss-api",
