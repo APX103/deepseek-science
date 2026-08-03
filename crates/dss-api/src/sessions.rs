@@ -337,7 +337,7 @@ async fn restore_session(state: &AppState, sid: &str) -> Result<(), dss_db::DbEr
 #[derive(Deserialize)]
 pub struct RunReq {
     prompt: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     plan_mode: Option<bool>,
     #[allow(dead_code)]
     deep_review: Option<bool>,
@@ -377,6 +377,7 @@ pub async fn stream_sse(
     let db = state.db.clone();
     let memory = state.memory.clone();
     let prompt = req.prompt;
+    let plan_mode = req.plan_mode.unwrap_or(false);
     let sid_clone = sid.clone();
     // session 的 project_id（记忆按项目隔离）。
     let project_id = dbq::get_session_row(&state.db, sid.clone())
@@ -421,6 +422,7 @@ pub async fn stream_sse(
                     dss_compact::constants::DEFAULT_CONTEXT_CEILING,
                     Some(&memory),
                     project_id.as_deref(),
+                    plan_mode,
                     &tx,
                 )
                 .await
@@ -447,6 +449,7 @@ pub async fn stream_sse(
                         iterations: 0,
                         frame_status: session.frame.status,
                         pending_ask: None,
+                        plan: None,
                     })
                     .await;
                 dss_agent::RunOutcome {

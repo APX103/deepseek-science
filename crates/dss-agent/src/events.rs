@@ -44,6 +44,10 @@ pub enum AgentEvent {
     ToolResults {
         results: Vec<ToolResultView>,
     },
+    /// plan 更新（generate_plan / update_step_status 后推）。
+    PlanUpdate {
+        plan: dss_tools::PlanState,
+    },
     Complete {
         kind: CompleteKind,
         final_text: String,
@@ -56,6 +60,9 @@ pub enum AgentEvent {
         /// ask_user 触发的挂起提问（kind=awaiting 时才有）。
         #[serde(skip_serializing_if = "Option::is_none")]
         pending_ask: Option<PendingAsk>,
+        /// plan（generate_plan 后；kind=awaiting awaiting=plan_approval 时带）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan: Option<dss_tools::PlanState>,
     },
     Error {
         message: String,

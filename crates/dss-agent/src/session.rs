@@ -28,6 +28,8 @@ pub struct GateState {
     pub retrieval_streak: u32,
     /// finish_reason=length 累计次数（max_tokens 续传门三档）。
     pub length_finish_count: u32,
+    /// plan_mode 下未生成 plan 的连续重试次数（plan denial 门）。
+    pub plan_denial_count: u32,
 }
 
 impl Session {

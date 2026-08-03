@@ -33,6 +33,8 @@ pub const RETRIEVAL_CIRCUIT_BREAKER: u32 = 6;
 pub const LENGTH_FINISH_HARD_CAP: u32 = 5;
 /// max_tokens 续传门缩减档（modules.md ≥3）。
 pub const LENGTH_FINISH_TRIM_AT: u32 = 3;
+/// plan denial 门：plan_mode 无 plan 的重试上限（modules.md ≤3）。
+pub const PLAN_DENIAL_CAP: u32 = 3;
 
 /// 检索/阅读类工具（用于检索熔断判断）。写/执行类不在此列。
 fn is_retrieval_tool(name: &str) -> bool {
@@ -84,6 +86,7 @@ impl Runner {
         context_window: usize,
         memory: Option<&dss_memory::MemoryStore>,
         project_id: Option<&str>,
+        plan_mode: bool,
         tx: &mpsc::Sender<AgentEvent>,
     ) -> RunOutcome {
         session.frame.task_summary = truncate_chars(prompt, 80);
@@ -232,6 +235,7 @@ impl Runner {
                         iterations,
                         frame_status: session.frame.status,
                         pending_ask: None,
+                        plan: None,
                     }).await;
                     return RunOutcome {
                         kind: CompleteKind::MaxIters,
@@ -335,6 +339,7 @@ impl Runner {
                     iterations,
                     frame_status: session.frame.status,
                     pending_ask: Some(ask),
+                    plan: None,
                 };
                 let _ = send(tx, event).await;
                 return RunOutcome {
@@ -345,6 +350,36 @@ impl Runner {
                 };
             }
             drop(pending_ask_guard);
+
+            // —— plan 检测：plan_mode 且 ctx.plan 有未批准 plan → 转 AwaitingPlanApproval ——
+            if plan_mode {
+                let plan_guard = ctx.plan.lock().await;
+                if let Some(plan) = plan_guard.clone() {
+                    if !plan.approved {
+                        drop(plan_guard);
+                        // 推 plan_update 事件给前端。
+                        let _ = send(tx, AgentEvent::PlanUpdate { plan: plan.clone() }).await;
+                        session.frame.set_status(FrameStatus::AwaitingPlanApproval);
+                        let _ = send(tx, AgentEvent::Complete {
+                            kind: CompleteKind::Awaiting,
+                            final_text: final_text.clone(),
+                            awaiting: Some("plan_approval".to_string()),
+                            error: None,
+                            usage,
+                            iterations,
+                            frame_status: session.frame.status,
+                            pending_ask: None,
+                            plan: Some(plan),
+                        }).await;
+                        return RunOutcome {
+                            kind: CompleteKind::Awaiting,
+                            final_text,
+                            usage,
+                            iterations,
+                        };
+                    }
+                }
+            }
 
             // —— 检索熔断（modules.md：连续纯检索 ≥6 轮强制写作）——
             let all_retrieval = finalized.iter().all(|tc| is_retrieval_tool(&tc.function.name));
@@ -380,6 +415,26 @@ impl Runner {
                 }
                 // 有内容：clean completion（重置 empty_retry）。
                 session.gate_state.empty_retry_count = 0;
+
+                // —— plan denial 门：plan_mode 但未生成 plan → ≤3 次提示重生成，超限 Failed ——
+                if plan_mode {
+                    let has_plan = ctx.plan.lock().await.is_some();
+                    if !has_plan {
+                        session.gate_state.plan_denial_count += 1;
+                        if session.gate_state.plan_denial_count > PLAN_DENIAL_CAP {
+                            return fail(
+                                session, tx, iterations, final_text, usage,
+                                "plan mode requires a plan (denial cap exceeded)".to_string(), None,
+                            ).await;
+                        }
+                        session.messages.push(ChatMessage::assistant(text_buf.clone().as_str()));
+                        session.messages.push(harness_notice(
+                            "你处于 plan 模式但还没生成计划。请调用 generate_plan 工具给出步骤计划，再继续。",
+                        ));
+                        continue;
+                    }
+                }
+
                 final_text = text_buf.clone();
                 session.messages.push(ChatMessage::assistant(&final_text));
                 session.frame.set_status(FrameStatus::Completed);
@@ -393,6 +448,7 @@ impl Runner {
                     iterations,
                     frame_status: session.frame.status,
                     pending_ask: None,
+                    plan: None,
                 }).await;
                 return RunOutcome {
                     kind: CompleteKind::Natural,
@@ -415,6 +471,7 @@ impl Runner {
             iterations,
             frame_status: session.frame.status,
             pending_ask: None,
+            plan: None,
         };
         let _ = send(tx, event).await;
         RunOutcome {
@@ -484,6 +541,7 @@ async fn fail(
             iterations,
             frame_status: session.frame.status,
             pending_ask,
+            plan: None,
         })
         .await;
     RunOutcome {

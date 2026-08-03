@@ -98,6 +98,7 @@ async fn run_agent(
         500_000,
         None,
         None,
+        false, // plan_mode
         &tx,
     )
     .await;

@@ -7,6 +7,7 @@ pub mod bash;
 pub mod compile;
 pub mod files;
 pub mod mcp;
+pub mod plan;
 pub mod python;
 pub mod skills;
 pub mod web;
@@ -30,4 +31,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(skills::SearchSkillsTool));
     registry.register(Arc::new(skills::ListSkillsTool));
     registry.register(Arc::new(skills::SkillTool));
+    registry.register(Arc::new(plan::GeneratePlanTool));
+    registry.register(Arc::new(plan::UpdateStepStatusTool));
 }

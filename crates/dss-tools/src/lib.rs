@@ -9,7 +9,7 @@ pub mod error;
 pub mod router;
 pub mod spec;
 
-pub use context::{PendingAsk, PendingAskOption, ToolContext};
+pub use context::{PendingAsk, PendingAskOption, PlanState, PlanStep, ToolContext};
 pub use error::ToolError;
 pub use router::{parse_arguments, PendingToolCall, ToolRegistry, ToolResult, ToolRouter};
 pub use spec::{Tool, ToolDef, ToolOutput, ToolSpec};

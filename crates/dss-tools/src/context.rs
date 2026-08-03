@@ -37,6 +37,23 @@ pub struct ToolContext {
     pub skill_catalog: Arc<dss_skills::SkillCatalog>,
     /// MCP server 管理器（P7：让 mcp__{server}__{tool} 动态工具转发）。
     pub mcp: Arc<dss_mcp::MCPServerManager>,
+    /// plan 模式共享态（P6a：generate_plan 写入，Runner 读以转 awaiting）。
+    pub plan: Arc<Mutex<Option<PlanState>>>,
+}
+
+/// plan 模式状态（generate_plan 产出）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanState {
+    pub steps: Vec<PlanStep>,
+    pub approved: bool,
+    #[serde(default)]
+    pub research_question: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanStep {
+    pub title: String,
+    pub status: String, // pending|running|done|failed
 }
 
 impl ToolContext {
@@ -46,6 +63,7 @@ impl ToolContext {
             pending_ask: Arc::new(Mutex::new(None)),
             skill_catalog: Arc::new(dss_skills::SkillCatalog::new()),
             mcp: Arc::new(dss_mcp::MCPServerManager::new()),
+            plan: Arc::new(Mutex::new(None)),
         }
     }
 
