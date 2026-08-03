@@ -14,6 +14,7 @@ dss-compact = { path = "../dss-compact" }
 dss-skills = { path = "../dss-skills" }
 dss-memory = { path = "../dss-memory" }
 dss-observability = { path = "../dss-observability" }
+dss-mcp = { path = "../dss-mcp" }
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

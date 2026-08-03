@@ -25,6 +25,17 @@ pub struct Settings {
     pub llm: LlmSettings,
     /// 日志级别 filter（`DSS_LOG`/`RUST_LOG` 之外来自配置文件的兜底）。
     pub log_level: Option<String>,
+    /// MCP server 配置（P7）：启动时尝试连接。
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// MCP server 配置。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,9 +92,14 @@ impl LlmSettings {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileSettings {
+    #[serde(default)]
     server: FileServerSettings,
+    #[serde(default)]
     llm: FileLlmSettings,
+    #[serde(default)]
     log_level: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -109,6 +125,7 @@ impl Settings {
         let mut server = ServerSettings::default();
         let mut llm = LlmSettings::default();
         let mut log_level = None;
+        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
 
         // config.toml（低优先级文件）
         let config_toml = data_dir.join("config.toml");
@@ -119,7 +136,7 @@ impl Settings {
                     path: config_toml.clone(),
                     message: e.to_string(),
                 })?;
-            file.apply_to(&mut server, &mut llm, &mut log_level);
+            file.apply_to(&mut server, &mut llm, &mut log_level, &mut mcp_servers);
         }
 
         // settings.json（高优先级文件）
@@ -131,7 +148,7 @@ impl Settings {
                     path: settings_json.clone(),
                     message: e.to_string(),
                 })?;
-            file.apply_to(&mut server, &mut llm, &mut log_level);
+            file.apply_to(&mut server, &mut llm, &mut log_level, &mut mcp_servers);
         }
 
         // env（最高优先级）
@@ -169,6 +186,7 @@ impl Settings {
             server,
             llm,
             log_level,
+            mcp_servers,
         })
     }
 }
@@ -179,6 +197,7 @@ impl FileSettings {
         server: &mut ServerSettings,
         llm: &mut LlmSettings,
         log_level: &mut Option<String>,
+        mcp_servers: &mut Vec<McpServerConfig>,
     ) {
         if let Some(host) = self.server.host {
             server.host = host;
@@ -199,6 +218,10 @@ impl FileSettings {
         }
         if self.log_level.is_some() {
             *log_level = self.log_level;
+        }
+        // mcp_servers：非空则覆盖（后文件覆盖前文件）。
+        if !self.mcp_servers.is_empty() {
+            *mcp_servers = self.mcp_servers;
         }
     }
 }

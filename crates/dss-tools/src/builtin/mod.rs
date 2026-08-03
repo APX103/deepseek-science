@@ -6,6 +6,7 @@ pub mod ask_user;
 pub mod bash;
 pub mod compile;
 pub mod files;
+pub mod mcp;
 pub mod python;
 pub mod skills;
 pub mod web;

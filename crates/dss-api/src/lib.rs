@@ -2,6 +2,7 @@
 
 pub mod db;
 pub mod logs;
+pub mod mcp_endpoints;
 pub mod memories;
 pub mod meta;
 pub mod projects;
@@ -109,6 +110,8 @@ pub fn build_router(state: AppState) -> Router {
             get(meta::list_templates),
         )
         .route("/api/templates/{id}", get(meta::get_template))
+        // MCP
+        .route("/api/mcp/{name}/tools", get(mcp_endpoints::mcp_tools))
         .with_state(state)
 }
 

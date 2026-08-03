@@ -45,6 +45,7 @@ pub struct AppState {
     pub catalog: Arc<dss_skills::SkillCatalog>,
     pub memory: Arc<dss_memory::MemoryStore>,
     pub logs: Arc<dss_observability::LogStore>,
+    pub mcp: Arc<dss_mcp::MCPServerManager>,
     pub db: Arc<DbPool>,
     /// 活跃 session（id → Arc<ActiveSession>）。LRU 驱逐仅影响内存。
     pub sessions: Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>,
@@ -96,6 +97,18 @@ pub async fn build_state(settings: Settings) -> AppState {
     let memory = Arc::new(dss_memory::MemoryStore::new(db.clone()));
     let logs = Arc::new(dss_observability::LogStore::new(db.clone()));
 
+    // MCP server 管理器：连接 settings 配置的 server，挂载其工具到 ToolRegistry。
+    let mcp = Arc::new(dss_mcp::MCPServerManager::new());
+    let mcp_cfg = settings.mcp_servers.clone();
+    for srv in mcp_cfg.iter().filter(|s| s.enabled) {
+        if mcp.add_server(&srv.name, &srv.url).await {
+            if let Some(mcp_tools) = mcp.list_tools(&srv.name).await {
+                let count = dss_tools::builtin::mcp::register_mcp_tools(&mut tools, &srv.name, &mcp_tools);
+                tracing::info!(server = %srv.name, tools = count, "MCP tools mounted");
+            }
+        }
+    }
+
     // 启动日志（system source）。
     let _ = logs
         .append(dss_observability::LogEntry {
@@ -124,6 +137,7 @@ pub async fn build_state(settings: Settings) -> AppState {
         catalog,
         memory,
         logs,
+        mcp,
         db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
     }

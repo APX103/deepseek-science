@@ -391,7 +391,9 @@ pub async fn stream_sse(
             // 复制全局 catalog（builtin+global），再叠加 project 源（workspace/.deepseek-science/skills）。
             let mut cat = (*state.catalog).clone();
             cat.load_dir(&dss_skills::project_skills_dir(&session.workspace), "project");
-            ToolContext::new(session.workspace.clone()).with_skill_catalog(cat)
+            ToolContext::new(session.workspace.clone())
+                .with_skill_catalog(cat)
+                .with_mcp_arc(state.mcp.clone())
         };
         let llm_for_extract = llm.clone();
         // —— agent 日志：run_start ——

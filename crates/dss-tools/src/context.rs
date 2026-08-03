@@ -35,6 +35,8 @@ pub struct ToolContext {
     pub pending_ask: Arc<Mutex<Option<PendingAsk>>>,
     /// skill 目录（P5a：让 search_skills/list_skills/skill 工具可用）。
     pub skill_catalog: Arc<dss_skills::SkillCatalog>,
+    /// MCP server 管理器（P7：让 mcp__{server}__{tool} 动态工具转发）。
+    pub mcp: Arc<dss_mcp::MCPServerManager>,
 }
 
 impl ToolContext {
@@ -43,11 +45,23 @@ impl ToolContext {
             workspace,
             pending_ask: Arc::new(Mutex::new(None)),
             skill_catalog: Arc::new(dss_skills::SkillCatalog::new()),
+            mcp: Arc::new(dss_mcp::MCPServerManager::new()),
         }
     }
 
     pub fn with_skill_catalog(mut self, catalog: dss_skills::SkillCatalog) -> Self {
         self.skill_catalog = Arc::new(catalog);
+        self
+    }
+
+    pub fn with_mcp(mut self, mcp: dss_mcp::MCPServerManager) -> Self {
+        self.mcp = Arc::new(mcp);
+        self
+    }
+
+    /// 共享同一个 MCPServerManager（跨 session 复用连接态）。
+    pub fn with_mcp_arc(mut self, mcp: Arc<dss_mcp::MCPServerManager>) -> Self {
+        self.mcp = mcp;
         self
     }
 

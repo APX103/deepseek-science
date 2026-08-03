@@ -1,18 +1,20 @@
 [package]
-name = "dss-tools"
+name = "dss-mcp"
 version.workspace = true
 edition.workspace = true
-description = "Deepseek Science tool system (Tool trait, registry, router, built-in tools)"
+description = "Deepseek Science MCP streamable-HTTP client + server manager + dynamic mounting"
 
 [dependencies]
 dss-core = { path = "../dss-core" }
-dss-skills = { path = "../dss-skills" }
-dss-mcp = { path = "../dss-mcp" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
-anyhow.workspace = true
 reqwest.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
