@@ -7,20 +7,10 @@
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "cd ../frontend && bun run dev",
-    "beforeBuildCommand": "cd ../frontend && bun run build"
+    "beforeBuildCommand": "if [ -d frontend ]; then cd frontend; elif [ -d ../frontend ]; then cd ../frontend; else echo 'frontend dir not found' >&2; exit 1; fi && bun run build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Deepseek Science",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 600,
-        "resizable": true,
-        "fullscreen": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }
@@ -35,7 +25,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../target/debug/dss-backend"],
+    "resources": ["../target/release/dss-backend"],
     "category": "DeveloperTool"
   }
 }

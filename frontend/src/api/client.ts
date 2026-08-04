@@ -35,10 +35,17 @@ import {
   mockTemplates,
 } from "../mock/data";
 
-/** API 基址：Tauri 注入端口优先，浏览器开发走 Vite 代理（/api）。 */
+const DEFAULT_BACKEND_PORT = "17896";
+
+/** API 基址：Tauri 注入端口优先，浏览器开发走 Vite 代理（/api）。
+ *  生产环境（非 Vite dev）若注入/localStorage 都失败，回退默认 17896。 */
 export function apiBase(): string {
   const w = window as unknown as { __BACKEND_PORT__?: number };
-  const port = w.__BACKEND_PORT__ ?? localStorage.getItem("dss_backend_port");
+  const isDev = (import.meta as any).env?.DEV === true;
+  const port =
+    w.__BACKEND_PORT__ ??
+    localStorage.getItem("dss_backend_port") ??
+    (isDev ? null : DEFAULT_BACKEND_PORT);
   return port ? `http://127.0.0.1:${port}/api` : "/api";
 }
 
@@ -322,16 +329,21 @@ export async function listSessions(): Promise<SessionSummary[]> {
 /** 后端探测：GET /api/health + /api/config，判断在线与 LLM 配置状态。 */
 export async function probeBackend(): Promise<BackendStatus> {
   try {
-    const h = await fetch(`${apiBase()}/health`);
+    const base = apiBase();
+    console.log("[probeBackend] probing", base);
+    const h = await fetch(`${base}/health`);
+    console.log("[probeBackend] health", h.status);
     if (!h.ok) return { online: false, llmConfigured: false };
-    const c = await fetch(`${apiBase()}/config`);
+    const c = await fetch(`${base}/config`);
+    console.log("[probeBackend] config", c.status);
     const cfg = c.ok ? ((await c.json()) as AppConfig) : null;
     return {
       online: true,
       llmConfigured: cfg?.llm_configured ?? false,
       model: cfg?.model,
     };
-  } catch {
+  } catch (e) {
+    console.error("[probeBackend] failed", e);
     return { online: false, llmConfigured: false };
   }
 }

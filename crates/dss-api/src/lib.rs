@@ -12,6 +12,8 @@ pub mod state;
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
 use state::AppState;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 pub use state::build_state;
 
@@ -24,6 +26,7 @@ struct HealthResponse {
 }
 
 async fn health() -> Json<HealthResponse> {
+    tracing::info!("GET /api/health");
     Json(HealthResponse {
         status: "ok",
         version: VERSION,
@@ -108,6 +111,13 @@ pub fn build_router(state: AppState) -> Router {
         // MCP
         .route("/api/mcp/{name}/tools", get(mcp_endpoints::mcp_tools))
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        .layer(TraceLayer::new_for_http())
 }
 
 /// 启动 HTTP 服务，收到 ctrl-c / SIGTERM 时优雅关闭。
