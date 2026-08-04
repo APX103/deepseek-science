@@ -39,9 +39,11 @@
 | **P6a（plan 工具）** | ✅ 部分 | `generate_plan`/`update_step_status` 工具 + ToolContext.plan + PlanState；Runner plan_mode 接入（plan 检测转 AwaitingPlanApproval + PlanUpdate 事件 + plan denial 门≤3）；dss-api 传 plan_mode。**curl 实测**：plan_mode 生成计划→plan_update→awaiting plan_approval。37 测试全绿。审批闭环（/approve）+ verify/delegate 留 P6b。计划：`docs/plans/P6a-plan.md` |
 | **P6（完整）** | ✅ 完成 | P6a plan + P6b：plan 审批闭环（POST /approve）+ delegate/submit_output（子 agent 单次 LLM 调用，深度上限 2）+ verify（terminal barrier reviewer，veto ≤1）。**curl 全验证**：approve→200→continue、delegate 子任务返回结构化结果、terminal barrier 正常对话 pass。**40 测试全绿**（3 verify）。 |
 | **P8 Tauri 壳** | ✅ 完成 | `src-tauri/`（独立 workspace）：main.rs 找端口→spawn dss-backend→轮询 health→注入端口→关窗杀进程；tauri.conf.json + 图标。**cargo build 通过**；`cargo tauri build` 出 .app 待用户执行。计划：`docs/plans/P8-tauri.md` |
+| **P5b 论文编排链** | ✅ 完成 | 充实 paper-writing skill（完整 6 步编排：clarify→survey→bib→tex→compile→report，含 LaTeX 模板+bibtex 格式+编译容错）。**端到端实测**：agent 找 skill→写 references.bib（10 条真实引用）→写 main.tex（完整论文结构）→Tectonic 编译→main.pdf（42KB）编译无错。 |
+| **GUI 测试方案** | ✅ 文档 | `docs/plans/gui-test-guide.md`：10 个前端测试点（T1-T10），含操作/预期/截图检查/排查办法。供能读图的 agent（CodeX）或人工执行。 |
 | skills/templates 真实端点 | ✅ 完成 | GET /api/skills、/api/templates、/api/templates/{id}（dss-api/meta.rs，include_dir!）；前端 listSkills/listTemplates/getTemplate 切真实。curl 实测真实数据。 |
 
-**其余均未开始**：P4b（三层记忆 + L2 fold + boundary + compaction state 持久化 + uuid Message 迁移）、P2b-gates（max_tokens 续传/empty-retry/检索熔断门控，需 FakeLLM 测试基建——P4a 已建 FakeLLM 可复用）、P5 skills 与论文链、P6 verify 与子 agent（届时落 frames 表，见 D-F09）、P7 MCP、P8 Tauri 打包、F2 日志后端。
+**roadmap 全阶段已完成**：P0-P8 + F2 + P5b + P2b-gates + 前端接 P3。**40 测试全绿**。唯一剩余：`cargo tauri build` 出完整 .app/.dmg（命令已就绪，需用户执行）、CodeX/人工执行 GUI 测试（`docs/plans/gui-test-guide.md`）。
 
 ## 3. 环境事实（不要重新踩坑）
 
