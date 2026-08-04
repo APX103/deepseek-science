@@ -58,7 +58,8 @@ pub fn ensure_default_project(conn: &Connection) -> Result<ProjectRow, DbError> 
          VALUES (?1, ?2, ?3, 0, ?4, ?4)",
         params!["proj_default", "Default", "默认项目", now],
     )?;
-    get_project(conn, "proj_default")?.ok_or_else(|| DbError::Other("default project missing".into()))
+    get_project(conn, "proj_default")?
+        .ok_or_else(|| DbError::Other("default project missing".into()))
 }
 
 pub fn get_project(conn: &Connection, id: &str) -> Result<Option<ProjectRow>, DbError> {
@@ -73,7 +74,10 @@ pub fn get_project(conn: &Connection, id: &str) -> Result<Option<ProjectRow>, Db
     Ok(row)
 }
 
-pub fn list_projects(conn: &Connection, include_archived: bool) -> Result<Vec<ProjectRow>, DbError> {
+pub fn list_projects(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<ProjectRow>, DbError> {
     let mut rows = if include_archived {
         conn.prepare(
             "SELECT id, name, description, last_session_id, archived, created_at, updated_at \
@@ -91,7 +95,11 @@ pub fn list_projects(conn: &Connection, include_archived: bool) -> Result<Vec<Pr
     Ok(list)
 }
 
-pub fn create_project(conn: &Connection, name: &str, description: Option<&str>) -> Result<ProjectRow, DbError> {
+pub fn create_project(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+) -> Result<ProjectRow, DbError> {
     let now = now();
     let id = format!("proj_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     conn.execute(
@@ -112,20 +120,35 @@ pub fn update_project(
     let now = now();
     // 只更新非 None 字段。
     if let Some(n) = name {
-        conn.execute("UPDATE projects SET name=?1, updated_at=?2 WHERE id=?3", params![n, now, id])?;
+        conn.execute(
+            "UPDATE projects SET name=?1, updated_at=?2 WHERE id=?3",
+            params![n, now, id],
+        )?;
     }
     if let Some(d) = description {
-        conn.execute("UPDATE projects SET description=?1, updated_at=?2 WHERE id=?3", params![d, now, id])?;
+        conn.execute(
+            "UPDATE projects SET description=?1, updated_at=?2 WHERE id=?3",
+            params![d, now, id],
+        )?;
     }
     if let Some(s) = last_session_id {
-        conn.execute("UPDATE projects SET last_session_id=?1, updated_at=?2 WHERE id=?3", params![s, now, id])?;
+        conn.execute(
+            "UPDATE projects SET last_session_id=?1, updated_at=?2 WHERE id=?3",
+            params![s, now, id],
+        )?;
     }
     get_project(conn, id)?.ok_or_else(|| DbError::NotFound(format!("project {id}")))
 }
 
-pub fn set_project_archived(conn: &Connection, id: &str, archived: bool) -> Result<ProjectRow, DbError> {
+pub fn set_project_archived(
+    conn: &Connection,
+    id: &str,
+    archived: bool,
+) -> Result<ProjectRow, DbError> {
     if id == "proj_default" {
-        return Err(DbError::Conflict("default project cannot be archived".into()));
+        return Err(DbError::Conflict(
+            "default project cannot be archived".into(),
+        ));
     }
     let now = now();
     let n = conn.execute(
@@ -142,7 +165,9 @@ pub fn set_project_archived(conn: &Connection, id: &str, archived: bool) -> Resu
 /// 但项目级联删除其会话更符合「删项目连带删会话」语义——这里采用：有 session 则拒绝）。
 pub fn delete_project(conn: &Connection, id: &str, force: bool) -> Result<(), DbError> {
     if id == "proj_default" {
-        return Err(DbError::Conflict("default project cannot be deleted".into()));
+        return Err(DbError::Conflict(
+            "default project cannot be deleted".into(),
+        ));
     }
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
@@ -156,7 +181,10 @@ pub fn delete_project(conn: &Connection, id: &str, force: bool) -> Result<(), Db
     }
     // force：把会话的 project_id 置 NULL（不级联删会话，会话仍可 orphan 存在）。
     if count > 0 {
-        conn.execute("UPDATE sessions SET project_id=NULL WHERE project_id=?1", params![id])?;
+        conn.execute(
+            "UPDATE sessions SET project_id=NULL WHERE project_id=?1",
+            params![id],
+        )?;
     }
     let n = conn.execute("DELETE FROM projects WHERE id=?1", params![id])?;
     if n == 0 {
@@ -166,7 +194,10 @@ pub fn delete_project(conn: &Connection, id: &str, force: bool) -> Result<(), Db
 }
 
 /// 项目详情 + 其会话列表（archived=false 的会话）。
-pub fn get_project_detail(conn: &Connection, id: &str) -> Result<(ProjectRow, Vec<SessionRow>), DbError> {
+pub fn get_project_detail(
+    conn: &Connection,
+    id: &str,
+) -> Result<(ProjectRow, Vec<SessionRow>), DbError> {
     let proj = get_project(conn, id)?.ok_or_else(|| DbError::NotFound(format!("project {id}")))?;
     let mut stmt = conn.prepare(
         "SELECT id, title, workspace, model, plan_mode, status, project_id, created_at, updated_at \
@@ -242,8 +273,35 @@ pub fn set_session_title(conn: &Connection, id: &str, title: &str) -> Result<(),
 
 pub fn touch_session(conn: &Connection, id: &str) -> Result<(), DbError> {
     let now = now();
-    conn.execute("UPDATE sessions SET updated_at=?1 WHERE id=?2", params![now, id])?;
+    conn.execute(
+        "UPDATE sessions SET updated_at=?1 WHERE id=?2",
+        params![now, id],
+    )?;
     Ok(())
+}
+
+pub fn set_session_plan(
+    conn: &Connection,
+    id: &str,
+    plan_data: Option<&str>,
+) -> Result<(), DbError> {
+    let now = now();
+    conn.execute(
+        "UPDATE sessions SET plan_data=?1, updated_at=?2 WHERE id=?3",
+        params![plan_data, now, id],
+    )?;
+    Ok(())
+}
+
+pub fn get_session_plan(conn: &Connection, id: &str) -> Result<Option<String>, DbError> {
+    let row = conn
+        .query_row(
+            "SELECT plan_data FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(row.flatten())
 }
 
 pub fn delete_session(conn: &Connection, id: &str) -> Result<(), DbError> {
@@ -421,7 +479,10 @@ pub fn delete_memory(conn: &Connection, id: &str) -> Result<(), DbError> {
 }
 
 /// 取全部记忆（BM25 在 dss-memory 里做；这里只读候选集：profile + project）。
-pub fn candidate_memories(conn: &Connection, project_id: Option<&str>) -> Result<Vec<MemoryRow>, DbError> {
+pub fn candidate_memories(
+    conn: &Connection,
+    project_id: Option<&str>,
+) -> Result<Vec<MemoryRow>, DbError> {
     list_memories(conn, project_id, None)
 }
 
@@ -483,12 +544,24 @@ pub fn list_logs(conn: &Connection, f: &LogFilter) -> Result<(Vec<LogRow>, i64),
             args.push(Box::new($val));
         };
     }
-    if let Some(s) = &f.session_id { push!("session_id = ?", s.clone()); }
-    if let Some(s) = &f.source { push!("source = ?", s.clone()); }
-    if let Some(s) = &f.level { push!("level = ?", s.clone()); }
-    if let Some(s) = &f.kind { push!("kind = ?", s.clone()); }
-    if let Some(s) = &f.since { push!("ts >= ?", s.clone()); }
-    if let Some(s) = &f.until { push!("ts <= ?", s.clone()); }
+    if let Some(s) = &f.session_id {
+        push!("session_id = ?", s.clone());
+    }
+    if let Some(s) = &f.source {
+        push!("source = ?", s.clone());
+    }
+    if let Some(s) = &f.level {
+        push!("level = ?", s.clone());
+    }
+    if let Some(s) = &f.kind {
+        push!("kind = ?", s.clone());
+    }
+    if let Some(s) = &f.since {
+        push!("ts >= ?", s.clone());
+    }
+    if let Some(s) = &f.until {
+        push!("ts <= ?", s.clone());
+    }
     let where_sql = if where_clauses.is_empty() {
         String::new()
     } else {
@@ -497,7 +570,14 @@ pub fn list_logs(conn: &Connection, f: &LogFilter) -> Result<(Vec<LogRow>, i64),
 
     // total
     let count_sql = format!("SELECT COUNT(*) FROM logs {where_sql}");
-    let total: i64 = conn.query_row(&count_sql, args.iter().map(|b| b.as_ref()).collect::<Vec<_>>().as_slice(), |r| r.get(0))?;
+    let total: i64 = conn.query_row(
+        &count_sql,
+        args.iter()
+            .map(|b| b.as_ref())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        |r| r.get(0),
+    )?;
 
     // page
     let page_sql = format!(

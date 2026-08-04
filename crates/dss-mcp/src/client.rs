@@ -60,7 +60,8 @@ impl MCPClient {
     }
 
     fn next_id(&self) -> u64 {
-        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn req_builder(&self) -> reqwest::RequestBuilder {
@@ -83,16 +84,26 @@ impl MCPClient {
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let resp = self.req_builder().json(&body).send().await?;
         // 捕获 session id（initialize 响应带；其它幂等设）。
-        if let Some(sid) = resp.headers().get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
+        if let Some(sid) = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Ok(mut guard) = self.session_id.lock() {
                 *guard = Some(sid.to_string());
             }
         }
         let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| McpError::Transport(format!("read body: {e}")))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| McpError::Transport(format!("read body: {e}")))?;
         if !status.is_success() {
-            return Err(McpError::Transport(format!("HTTP {status}: {}", truncate(&text, 300))));
+            return Err(McpError::Transport(format!(
+                "HTTP {status}: {}",
+                truncate(&text, 300)
+            )));
         }
         let value = parse_response(&text, ct.as_ref().and_then(|v| v.to_str().ok()))?;
         let ResponsePayload::Result(r) = value;
@@ -118,7 +129,8 @@ impl MCPClient {
         )
         .await?;
         self.notify("notifications/initialized", json!({})).await?;
-        self.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -132,17 +144,33 @@ impl MCPClient {
         let tools_val = result.get("tools").cloned().unwrap_or(Value::Array(vec![]));
         let tools = match tools_val {
             Value::Array(arr) => arr,
-            _ => return Err(McpError::Invalid("tools/list result.tools not array".into())),
+            _ => {
+                return Err(McpError::Invalid(
+                    "tools/list result.tools not array".into(),
+                ))
+            }
         };
         let mut out = Vec::new();
         for t in tools {
-            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if name.is_empty() {
                 continue;
             }
-            let description = t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let description = t
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let input_schema = t.get("inputSchema").cloned().unwrap_or(json!({}));
-            out.push(McpTool { name, description, input_schema });
+            out.push(McpTool {
+                name,
+                description,
+                input_schema,
+            });
         }
         Ok(out)
     }
@@ -150,9 +178,15 @@ impl MCPClient {
     /// tools/call → result.content（简化：聚合 text）。
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, McpError> {
         let result = self
-            .rpc("tools/call", json!({ "name": name, "arguments": arguments }))
+            .rpc(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
             .await?;
-        let content = result.get("content").cloned().unwrap_or(Value::Array(vec![]));
+        let content = result
+            .get("content")
+            .cloned()
+            .unwrap_or(Value::Array(vec![]));
         // content 是 [{type:"text", text:"..."}, ...]，聚合 text。
         let mut text_parts = Vec::new();
         if let Value::Array(arr) = content {
@@ -194,13 +228,20 @@ pub fn parse_response(text: &str, content_type: Option<&str>) -> Result<Response
         }
         last.ok_or_else(|| McpError::Invalid("SSE response had no parseable data".into()))?
     } else {
-        serde_json::from_str::<Value>(text).map_err(|e| McpError::Invalid(format!("non-JSON body: {e}")))?
+        serde_json::from_str::<Value>(text)
+            .map_err(|e| McpError::Invalid(format!("non-JSON body: {e}")))?
     };
 
-    let obj = candidate.as_object().ok_or_else(|| McpError::Invalid("response not an object".into()))?;
+    let obj = candidate
+        .as_object()
+        .ok_or_else(|| McpError::Invalid("response not an object".into()))?;
     if let Some(err) = obj.get("error") {
         let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-        let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
         return Err(McpError::Rpc { code, message });
     }
     if let Some(result) = obj.get("result") {

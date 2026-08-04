@@ -131,11 +131,10 @@ impl Settings {
         let config_toml = data_dir.join("config.toml");
         if config_toml.is_file() {
             let text = std::fs::read_to_string(&config_toml)?;
-            let file: FileSettings =
-                toml::from_str(&text).map_err(|e| Error::ConfigParse {
-                    path: config_toml.clone(),
-                    message: e.to_string(),
-                })?;
+            let file: FileSettings = toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: config_toml.clone(),
+                message: e.to_string(),
+            })?;
             file.apply_to(&mut server, &mut llm, &mut log_level, &mut mcp_servers);
         }
 

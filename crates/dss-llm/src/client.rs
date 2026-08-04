@@ -8,9 +8,7 @@ use futures::{Stream, StreamExt};
 use serde_json::json;
 
 use crate::error::LlmError;
-use crate::types::{
-    BoxedEventStream, ChatRequest, LlmClient, LlmResponse, StreamEvent, Usage,
-};
+use crate::types::{BoxedEventStream, ChatRequest, LlmClient, LlmResponse, StreamEvent, Usage};
 
 /// OpenAI 兼容 chat/completions 客户端（Deepseek 特化：`reasoning_content`）。
 pub struct OpenAICompatClient {
@@ -71,7 +69,10 @@ impl OpenAICompatClient {
         if let Some(tools) = &req.tools {
             body["tools"] = serde_json::to_value(tools).unwrap_or(json!([]));
             // 默认 auto：让模型自行决定是否调用工具。
-            body["tool_choice"] = json!(req.tool_choice.clone().unwrap_or_else(|| "auto".to_string()));
+            body["tool_choice"] = json!(req
+                .tool_choice
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()));
         }
         if stream {
             body["stream"] = json!(true);
@@ -114,9 +115,7 @@ impl LlmClient for OpenAICompatClient {
         let choice = &body["choices"][0];
         let message = &choice["message"];
         let text = message["content"].as_str().unwrap_or_default().to_string();
-        let thinking = message["reasoning_content"]
-            .as_str()
-            .map(|s| s.to_string());
+        let thinking = message["reasoning_content"].as_str().map(|s| s.to_string());
         Ok(LlmResponse {
             text,
             thinking,
@@ -126,10 +125,7 @@ impl LlmClient for OpenAICompatClient {
         })
     }
 
-    fn chat_stream(
-        &self,
-        req: ChatRequest,
-    ) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+    fn chat_stream(&self, req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
         Box::pin(async move {
             let resp = self
                 .http
@@ -268,11 +264,7 @@ fn parse_sse_line(line: &[u8]) -> LineOutcome {
 
     let v: serde_json::Value = match serde_json::from_str(payload) {
         Ok(v) => v,
-        Err(e) => {
-            return LineOutcome::Error(LlmError::Stream(format!(
-                "invalid SSE JSON: {e}"
-            )))
-        }
+        Err(e) => return LineOutcome::Error(LlmError::Stream(format!("invalid SSE JSON: {e}"))),
     };
 
     let mut events = Vec::new();
@@ -300,9 +292,7 @@ fn parse_sse_line(line: &[u8]) -> LineOutcome {
                 let index = tc["index"].as_u64().unwrap_or(0) as u32;
                 let id = tc["id"].as_str().map(|s| s.to_string());
                 let name = tc["function"]["name"].as_str().map(|s| s.to_string());
-                let arguments = tc["function"]["arguments"]
-                    .as_str()
-                    .map(|s| s.to_string());
+                let arguments = tc["function"]["arguments"].as_str().map(|s| s.to_string());
                 events.push(StreamEvent::ToolCallDelta(crate::types::ToolCallDelta {
                     index,
                     id,

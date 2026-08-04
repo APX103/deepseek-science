@@ -63,13 +63,16 @@ impl Tool for WebSearchTool {
         );
 
         let client = http_client()?;
-        let resp = client.get(&url).send().await.map_err(|e| {
-            ToolError::Other(format!("web_search request failed: {e}"))
-        })?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ToolError::Other(format!("web_search request failed: {e}")))?;
         let status = resp.status();
-        let html = resp.text().await.map_err(|e| {
-            ToolError::Other(format!("web_search read body failed: {e}"))
-        })?;
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| ToolError::Other(format!("web_search read body failed: {e}")))?;
         if !status.is_success() {
             return Ok(ToolOutput::err(format!(
                 "web_search HTTP {status} (DuckDuckGo may be rate-limiting); try again later"
@@ -85,7 +88,13 @@ impl Tool for WebSearchTool {
         }
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n   {}\n   {}\n\n", i + 1, r.title, r.url, r.snippet));
+            out.push_str(&format!(
+                "{}. {}\n   {}\n   {}\n\n",
+                i + 1,
+                r.title,
+                r.url,
+                r.snippet
+            ));
         }
         Ok(ToolOutput::ok(out.trim().to_string()))
     }
@@ -255,19 +264,26 @@ impl Tool for FetchUrlTool {
         let parsed = reqwest::Url::parse(&a.url)
             .map_err(|e| ToolError::InvalidArgs(format!("invalid url: {e}")))?;
         if !matches!(parsed.scheme(), "http" | "https") {
-            return Ok(ToolOutput::err(format!("only http/https allowed, got {}", parsed.scheme())));
+            return Ok(ToolOutput::err(format!(
+                "only http/https allowed, got {}",
+                parsed.scheme()
+            )));
         }
 
         let client = http_client()?;
-        let resp = client.get(parsed).send().await.map_err(|e| {
-            ToolError::Other(format!("fetch_url request failed: {e}"))
-        })?;
+        let resp = client
+            .get(parsed)
+            .send()
+            .await
+            .map_err(|e| ToolError::Other(format!("fetch_url request failed: {e}")))?;
         let status = resp.status();
         // 限制响应体大小：先看 content-length，再读上限。
         let cap: usize = 256 * 1024; // 256KB
         let body = match resp.content_length() {
             Some(n) if (n as usize) > cap => {
-                return Ok(ToolOutput::err(format!("response too large ({n} bytes > {cap} cap)")));
+                return Ok(ToolOutput::err(format!(
+                    "response too large ({n} bytes > {cap} cap)"
+                )));
             }
             _ => {
                 let bytes = resp

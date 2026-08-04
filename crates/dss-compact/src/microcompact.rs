@@ -2,9 +2,7 @@
 //!
 //! 作用于 **projection**（给 LLM 的视图），不 mutate 日志。
 
-use crate::constants::{
-    MICROCOMPACT_TOOLRESULT_KEEP, MICROCOMPACT_TOOLRESULT_THRESHOLD,
-};
+use crate::constants::{MICROCOMPACT_TOOLRESULT_KEEP, MICROCOMPACT_TOOLRESULT_THRESHOLD};
 use dss_llm::ChatMessage;
 
 /// 对一组（projection 后的）消息做 microcompact：role=tool 且 content > 阈值 → 截断。

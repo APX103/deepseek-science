@@ -55,7 +55,14 @@ impl Tool for GeneratePlanTool {
             return Ok(ToolOutput::err("plan must have at least one step"));
         }
         let plan = PlanState {
-            steps: a.steps.into_iter().map(|s| PlanStep { title: s.title, status: "pending".into() }).collect(),
+            steps: a
+                .steps
+                .into_iter()
+                .map(|s| PlanStep {
+                    title: s.title,
+                    status: "pending".into(),
+                })
+                .collect(),
             approved: false,
             research_question: a.research_question,
         };
@@ -90,7 +97,11 @@ impl Tool for UpdateStepStatusTool {
             return Ok(ToolOutput::err("no plan; call generate_plan first"));
         };
         if a.step_id >= plan.steps.len() {
-            return Ok(ToolOutput::err(format!("step_id {} out of range ({} steps)", a.step_id, plan.steps.len())));
+            return Ok(ToolOutput::err(format!(
+                "step_id {} out of range ({} steps)",
+                a.step_id,
+                plan.steps.len()
+            )));
         }
         plan.steps[a.step_id].status = a.status.clone();
         Ok(ToolOutput::ok(format!("step {} → {}", a.step_id, a.status)))

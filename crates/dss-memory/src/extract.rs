@@ -78,7 +78,12 @@ pub fn parse_emit_memories(text: &str) -> Vec<String> {
     let Ok(parsed) = serde_json::from_str::<MemOps>(json_str) else {
         return Vec::new();
     };
-    parsed.append.into_iter().take(5).map(|s| s.chars().take(1000).collect()).collect()
+    parsed
+        .append
+        .into_iter()
+        .take(5)
+        .map(|s| s.chars().take(1000).collect())
+        .collect()
 }
 
 #[cfg(test)]

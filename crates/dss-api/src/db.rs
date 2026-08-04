@@ -25,7 +25,10 @@ pub async fn ensure_default_project(pool: &DbPool) -> Result<ProjectRow, DbError
     with_conn(pool, |c| repo::ensure_default_project(c)).await
 }
 
-pub async fn list_projects(pool: &DbPool, include_archived: bool) -> Result<Vec<ProjectRow>, DbError> {
+pub async fn list_projects(
+    pool: &DbPool,
+    include_archived: bool,
+) -> Result<Vec<ProjectRow>, DbError> {
     with_conn(pool, move |c| repo::list_projects(c, include_archived)).await
 }
 
@@ -33,8 +36,15 @@ pub async fn get_project(pool: &DbPool, id: String) -> Result<Option<ProjectRow>
     with_conn(pool, move |c| repo::get_project(c, &id)).await
 }
 
-pub async fn create_project(pool: &DbPool, name: String, description: Option<String>) -> Result<ProjectRow, DbError> {
-    with_conn(pool, move |c| repo::create_project(c, &name, description.as_deref())).await
+pub async fn create_project(
+    pool: &DbPool,
+    name: String,
+    description: Option<String>,
+) -> Result<ProjectRow, DbError> {
+    with_conn(pool, move |c| {
+        repo::create_project(c, &name, description.as_deref())
+    })
+    .await
 }
 
 pub async fn update_project(
@@ -45,12 +55,22 @@ pub async fn update_project(
     last_session_id: Option<String>,
 ) -> Result<ProjectRow, DbError> {
     with_conn(pool, move |c| {
-        repo::update_project(c, &id, name.as_deref(), description.as_deref(), last_session_id.as_deref())
+        repo::update_project(
+            c,
+            &id,
+            name.as_deref(),
+            description.as_deref(),
+            last_session_id.as_deref(),
+        )
     })
     .await
 }
 
-pub async fn set_project_archived(pool: &DbPool, id: String, archived: bool) -> Result<ProjectRow, DbError> {
+pub async fn set_project_archived(
+    pool: &DbPool,
+    id: String,
+    archived: bool,
+) -> Result<ProjectRow, DbError> {
     with_conn(pool, move |c| repo::set_project_archived(c, &id, archived)).await
 }
 
@@ -58,7 +78,10 @@ pub async fn delete_project(pool: &DbPool, id: String, force: bool) -> Result<()
     with_conn(pool, move |c| repo::delete_project(c, &id, force)).await
 }
 
-pub async fn get_project_detail(pool: &DbPool, id: String) -> Result<(ProjectRow, Vec<SessionRow>), DbError> {
+pub async fn get_project_detail(
+    pool: &DbPool,
+    id: String,
+) -> Result<(ProjectRow, Vec<SessionRow>), DbError> {
     with_conn(pool, move |c| repo::get_project_detail(c, &id)).await
 }
 
@@ -87,6 +110,21 @@ pub async fn list_session_rows(pool: &DbPool) -> Result<Vec<SessionRow>, DbError
 
 pub async fn set_session_title(pool: &DbPool, id: String, title: String) -> Result<(), DbError> {
     with_conn(pool, move |c| repo::set_session_title(c, &id, &title)).await
+}
+
+pub async fn set_session_plan(
+    pool: &DbPool,
+    id: String,
+    plan_data: Option<String>,
+) -> Result<(), DbError> {
+    with_conn(pool, move |c| {
+        repo::set_session_plan(c, &id, plan_data.as_deref())
+    })
+    .await
+}
+
+pub async fn get_session_plan(pool: &DbPool, id: String) -> Result<Option<String>, DbError> {
+    with_conn(pool, move |c| repo::get_session_plan(c, &id)).await
 }
 
 pub async fn delete_session_row(pool: &DbPool, id: String) -> Result<(), DbError> {

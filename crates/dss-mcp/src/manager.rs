@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::client::{McpError, MCPClient, McpTool};
+use crate::client::{MCPClient, McpError, McpTool};
 
 /// 一个已管理的 server：连接后的 client + 缓存的工具列表。
 struct ManagedServer {
@@ -24,7 +24,9 @@ pub struct MCPServerManager {
 
 impl MCPServerManager {
     pub fn new() -> Self {
-        Self { servers: Mutex::new(HashMap::new()) }
+        Self {
+            servers: Mutex::new(HashMap::new()),
+        }
     }
 
     /// 连接一个 MCP server。idempotent：已存在则返回 true；连接失败返回 false（不抛）。
@@ -47,7 +49,11 @@ impl MCPServerManager {
         };
         servers.insert(
             name.to_string(),
-            Arc::new(Mutex::new(ManagedServer { client, tools_cache: tools, url: url.to_string() })),
+            Arc::new(Mutex::new(ManagedServer {
+                client,
+                tools_cache: tools,
+                url: url.to_string(),
+            })),
         );
         tracing::info!(server = %name, "MCP server connected");
         true
@@ -79,10 +85,18 @@ impl MCPServerManager {
     }
 
     /// 调用某 server 的某工具。
-    pub async fn call_tool(&self, server: &str, tool: &str, args: serde_json::Value) -> Result<String, McpError> {
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<String, McpError> {
         let srv = {
             let servers = self.servers.lock().await;
-            servers.get(server).cloned().ok_or_else(|| McpError::Invalid(format!("server {server} not connected")))?
+            servers
+                .get(server)
+                .cloned()
+                .ok_or_else(|| McpError::Invalid(format!("server {server} not connected")))?
         };
         let s = srv.lock().await;
         s.client.call_tool(tool, args).await
@@ -97,7 +111,11 @@ impl MCPServerManager {
             name: name.to_string(),
             url: s.url.clone(),
             connected: s.client.is_connected(),
-            tools: s.tools_cache.iter().map(|t| (t.name.clone(), t.description.clone())).collect(),
+            tools: s
+                .tools_cache
+                .iter()
+                .map(|t| (t.name.clone(), t.description.clone()))
+                .collect(),
         })
     }
 

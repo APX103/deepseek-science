@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use dss_compact::CompactionState;
 use dss_llm::ChatMessage;
+use dss_tools::PlanState;
 
 use crate::frame::Frame;
 
@@ -17,6 +18,8 @@ pub struct Session {
     pub compaction: CompactionState,
     /// 决策门计数态（P2b-gates）。
     pub gate_state: GateState,
+    /// plan 模式状态（P6）；跨 run 持久化到 sessions.plan_data。
+    pub plan: Option<PlanState>,
 }
 
 /// Runner 决策门的跨轮计数（modules.md §4；阈值见 runner）。
@@ -43,6 +46,7 @@ impl Session {
             messages: Vec::new(),
             compaction: CompactionState::new(),
             gate_state: GateState::default(),
+            plan: None,
         }
     }
 }

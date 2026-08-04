@@ -1,7 +1,7 @@
 # 交接说明（HANDOFF）
 
 > 写给接手 Agent：本文是当前进度、环境事实、剩余 TODO 与工作规则的唯一入口。先读完本文，再按「下一步」行动。
-> 更新日期：2026-08-03（P4a 完成）。
+> 更新日期：2026-08-04（P0–P8 + F2 + P5b 已实现；本轮修复 plan 持久化、harness_notice 落库、前端 tool_result 映射等）。
 
 ---
 
@@ -37,13 +37,17 @@
 | **F2（日志系统）** | ✅ 完成 | 新增 `dss-observability`（LogStore）；`dss-db` 加 logs 表+repo；`dss-api` build_state 写 system startup 日志、stream_sse 写 agent run_start/run_end 日志、GET/DELETE /api/logs + /api/logs/{id} 端点；前端 listLogs/getLog/clearLogs 切真实。**curl 实测**：startup + agent run_start/run_end 日志可见、按 session 过滤。计划：`docs/plans/F2-logging.md` |
 | **P7（MCP）** | ✅ 完成 | 新增 `dss-mcp`（streamable HTTP+SSE JSON-RPC client：initialize/notifications/initialized/tools/list/tools/call，SSE 聚合解析；MCPServerManager add/list/call）；`dss-tools` McpDynamicTool + 动态挂载 mcp__{server}__{tool}；`dss-core` Settings 加 mcp_servers；`dss-api` 启动连接+挂载、GET /api/mcp/{name}/tools。**集成测试**：内嵌 MCP echo server 全流程；**37 测试全绿**（5 mcp）。计划：`docs/plans/P7-mcp.md` |
 | **P6a（plan 工具）** | ✅ 部分 | `generate_plan`/`update_step_status` 工具 + ToolContext.plan + PlanState；Runner plan_mode 接入（plan 检测转 AwaitingPlanApproval + PlanUpdate 事件 + plan denial 门≤3）；dss-api 传 plan_mode。**curl 实测**：plan_mode 生成计划→plan_update→awaiting plan_approval。37 测试全绿。审批闭环（/approve）+ verify/delegate 留 P6b。计划：`docs/plans/P6a-plan.md` |
-| **P6（完整）** | ✅ 完成 | P6a plan + P6b：plan 审批闭环（POST /approve）+ delegate/submit_output（子 agent 单次 LLM 调用，深度上限 2）+ verify（terminal barrier reviewer，veto ≤1）。**curl 全验证**：approve→200→continue、delegate 子任务返回结构化结果、terminal barrier 正常对话 pass。**40 测试全绿**（3 verify）。 |
+| **P6（完整）** | ✅ 完成（本轮加固） | P6a plan + P6b：plan 审批闭环（POST /approve）+ delegate/submit_output + verify（terminal barrier reviewer，veto ≤1）。**本轮修复**：plan 状态跨 run 持久化到 `sessions.plan_data`；approve 后写入 approved 标志并注入计划上下文。**curl 全验证**：approve→200→continue、delegate 子任务返回结构化结果、terminal barrier 正常对话 pass。**40 测试全绿**（3 verify）。 |
 | **P8 Tauri 壳** | ✅ 完成 | `src-tauri/`（独立 workspace）：main.rs 找端口→spawn dss-backend→轮询 health→注入端口→关窗杀进程；tauri.conf.json + 图标。**cargo build 通过**；`cargo tauri build` 出 .app 待用户执行。计划：`docs/plans/P8-tauri.md` |
 | **P5b 论文编排链** | ✅ 完成 | 充实 paper-writing skill（完整 6 步编排：clarify→survey→bib→tex→compile→report，含 LaTeX 模板+bibtex 格式+编译容错）。**端到端实测**：agent 找 skill→写 references.bib（10 条真实引用）→写 main.tex（完整论文结构）→Tectonic 编译→main.pdf（42KB）编译无错。 |
 | **GUI 测试方案** | ✅ 文档 | `docs/plans/gui-test-guide.md`：10 个前端测试点（T1-T10），含操作/预期/截图检查/排查办法。供能读图的 agent（CodeX）或人工执行。 |
 | skills/templates 真实端点 | ✅ 完成 | GET /api/skills、/api/templates、/api/templates/{id}（dss-api/meta.rs，include_dir!）；前端 listSkills/listTemplates/getTemplate 切真实。curl 实测真实数据。 |
 
-**roadmap 全阶段已完成**：P0-P8 + F2 + P5b + P2b-gates + 前端接 P3。**40 测试全绿**。唯一剩余：`cargo tauri build` 出完整 .app/.dmg（命令已就绪，需用户执行）、CodeX/人工执行 GUI 测试（`docs/plans/gui-test-guide.md`）。
+**roadmap 主线已完成**：P0-P8 + F2 + P5b + P2b-gates + 前端接 P3。**40 测试全绿**。剩余收尾项：
+- 前端仍有 Files/Artifacts/Compile/runOnce 走 mock（后端端点已存在，前端未接线）。
+- Settings/MCP 列表前端仍用 localStorage（后端无对应管理端点）。
+- `cargo tauri build` 出完整 .app/.dmg 需用户本地执行。
+- CodeX/人工执行 GUI 测试（`docs/plans/gui-test-guide.md`）。
 
 ## 3. 环境事实（不要重新踩坑）
 
@@ -54,18 +58,17 @@
 - **端口**：后端默认 17896；曾因被占用了 17897 验证——起服务前先 `lsof -i :17896` 或直接 curl 确认占用者是谁。
 - **数据目录**：`~/.deepseek-science`（P0 首跑已建空骨架）。注意 `~/.deepseek` 是别的工具的目录，**不要动**。
 - **已知无害项**：前端 console 有 React Router future-flag 警告（原有）；浏览器 localStorage 有测试残留的 `dss_*` keys（要纯净态就清掉）。
-- **git**：本项目尚未 `git init`，未做任何 git 操作。是否初始化由用户决定。
+- **git**：项目已 `git init` 并有多条提交；是否 push 由用户决定。
 
-## 4. 下一步（按序做，每阶段验收通过再进下一个）
+## 4. 下一步（按优先级）
 
-**P1（含前端接通）、P2a、P2b-tools、P3 均已完成并验收**。接手者从 **P4** 或 **P2b-gates** 开始。
+**主线已实现到 P8**；后续是收尾/加固，不再按 roadmap 顺序推进：
 
-**三个待确认/已知事项**：
-1. **前端 GUI 端到端**（P2a）：IAB 自动化无法驱动 React 受控输入，代码已 `bun build` 通过 + 后端 curl 全事件链已验。建议用真实浏览器手动发一条工具 prompt 确认 live 工具卡片/AskUserPanel 渲染。P3 后端持久化已全验，前端会话列表/恢复接线尚未做（前端目前仍是 mock store 驱动）。
-2. **web_search**（P2b-tools）：DDG 在本机出口 IP 被反爬拦截。换出口或搜索源（见 D-F08）后即可用。
-3. **前端接 P3**：P3 后端已提供 sessions/projects 全套端点 + 持久化，但前端 `store.ts`/页面仍主要读 mock 数据（localStorage）。把前端切到真实后端 API（GET /api/sessions、GET /api/sessions/{sid} 恢复、projects 列表）是一个有价值的后续工作（可作为 F1 收尾或独立小阶段）。
-
-**之后按 `docs/roadmap.md` 顺序**：P4（记忆与 Compact）→ P5（skills 与论文链）→ P6（verify 与子 agent，届时落 frames 表，见 D-F09）→ P7（MCP）→ P8（Tauri 打包）→ F2（日志后端+前端接通）。P2b-gates（max_tokens 续传/empty-retry/检索熔断，**需先搭 FakeLLM 测试基建**）可在 P4 后任意时点插入。每阶段的目标、交付物、验收点都在 roadmap.md 对应小节，**严格以那里的验收点为准**。
+1. **前端 mock 清理**：Files/Artifacts/Compile/runOnce 接真实后端（`listFiles/readFile`、`/compile`、`stream-sse` 已存在，前端未调用）。
+2. **Settings/MCP 管理端点**（可选）：若需要前端与后端共享 settings/MCP server 配置，需补后端 CRUD 端点并替换 localStorage。
+3. **Tauri 打包验证**：执行 `cargo tauri build`，确认 .app/.dmg 能正常拉起后端+前端。
+4. **GUI 人工测试**：按 `docs/plans/gui-test-guide.md` T1-T10 逐项验证，重点检查多轮工具、会话恢复、plan 审批、PDF 预览。
+5. **P9+ 增强方向**：沙箱化 bash/python、Deepseek 深度集成、文献知识库、学科插件等，按 `docs/roadmap.md` 与 `docs/enhancements.md` 排期。
 
 ## 5. 工作规则（必须遵守）
 

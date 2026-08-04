@@ -49,9 +49,18 @@ async fn handle_jsonrpc(State(st): State<Arc<ServerState>>, Json(req): Json<Valu
             }
         })),
         "tools/call" => {
-            let name = req.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
-            let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("(empty)");
+            let name = req
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = req
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(json!({}));
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(empty)");
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": req.get("id").cloned().unwrap_or(Value::Null),
@@ -71,7 +80,9 @@ async fn handle_jsonrpc(State(st): State<Arc<ServerState>>, Json(req): Json<Valu
 
 async fn spawn_echo_server() -> (String, Arc<ServerState>) {
     let st = Arc::new(ServerState::default());
-    let app = Router::new().route("/", post(handle_jsonrpc)).with_state(st.clone());
+    let app = Router::new()
+        .route("/", post(handle_jsonrpc))
+        .with_state(st.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -110,7 +121,10 @@ async fn manager_add_and_call() {
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].0, "echo");
 
-    let out = mgr.call_tool("echo", "echo", json!({ "text": "world" })).await.unwrap();
+    let out = mgr
+        .call_tool("echo", "echo", json!({ "text": "world" }))
+        .await
+        .unwrap();
     assert!(out.contains("world"));
 
     let info = mgr.server_info("echo").await.unwrap();

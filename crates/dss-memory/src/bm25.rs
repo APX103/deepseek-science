@@ -16,8 +16,8 @@ const STOPWORDS_EN: &[&str] = &[
 
 /// 中文停用词（精简）。
 const STOPWORDS_ZH: &[&str] = &[
-    "的", "了", "是", "在", "我", "你", "他", "她", "它", "们", "和", "与", "或", "也", "都",
-    "这", "那", "有", "为", "以", "及", "等",
+    "的", "了", "是", "在", "我", "你", "他", "她", "它", "们", "和", "与", "或", "也", "都", "这",
+    "那", "有", "为", "以", "及", "等",
 ];
 
 /// 分词：CJK 每字成 token；英文按非字母数字分割；去停用词。
@@ -53,7 +53,9 @@ pub fn tokenize(text: &str) -> Vec<String> {
 fn is_cjk(ch: char) -> bool {
     let c = ch as u32;
     // CJK 统一表意 + 扩展 A + 常用中日韩。
-    (0x4E00..=0x9FFF).contains(&c) || (0x3400..=0x4DBF).contains(&c) || (0x3000..=0x303F).contains(&c)
+    (0x4E00..=0x9FFF).contains(&c)
+        || (0x3400..=0x4DBF).contains(&c)
+        || (0x3000..=0x303F).contains(&c)
 }
 
 /// BM25 召回：从候选记忆里按 query 排序，返回带分数的列表（分数 > 0）。

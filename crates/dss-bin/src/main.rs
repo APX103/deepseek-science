@@ -37,7 +37,10 @@ async fn main() -> Result<()> {
 
             let state = dss_api::build_state(settings).await;
 
-            let addr = format!("{}:{}", state.settings.server.host, state.settings.server.port);
+            let addr = format!(
+                "{}:{}",
+                state.settings.server.host, state.settings.server.port
+            );
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .with_context(|| format!("failed to bind {addr}"))?;

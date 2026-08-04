@@ -43,7 +43,10 @@ impl CompactionState {
 
     /// 折叠区间覆盖的日志消息数。
     pub fn folded_message_count(&self) -> usize {
-        self.folds.iter().map(|f| f.end_idx.saturating_sub(f.start_idx)).sum()
+        self.folds
+            .iter()
+            .map(|f| f.end_idx.saturating_sub(f.start_idx))
+            .sum()
     }
 }
 
@@ -81,7 +84,9 @@ mod tests {
     use super::*;
 
     fn msgs(n: usize) -> Vec<ChatMessage> {
-        (0..n).map(|i| ChatMessage::user(format!("msg{i}"))).collect()
+        (0..n)
+            .map(|i| ChatMessage::user(format!("msg{i}")))
+            .collect()
     }
 
     #[test]
@@ -94,7 +99,12 @@ mod tests {
     fn projection_folds_middle_chunk_into_summary() {
         let m = msgs(10); // 索引 0..10
         let mut st = CompactionState::new();
-        st.record_fold(Fold { start_idx: 2, end_idx: 7, summary: "SUMMARY".into(), level: 1 });
+        st.record_fold(Fold {
+            start_idx: 2,
+            end_idx: 7,
+            summary: "SUMMARY".into(),
+            level: 1,
+        });
         let view = projection(&m, &st);
         // [0,2) 2 条 + summary 1 条 + [7,10) 3 条 = 6
         assert_eq!(view.len(), 6);
@@ -110,8 +120,18 @@ mod tests {
     fn projection_multiple_folds_preserve_order() {
         let m = msgs(10);
         let mut st = CompactionState::new();
-        st.record_fold(Fold { start_idx: 1, end_idx: 3, summary: "S1".into(), level: 1 });
-        st.record_fold(Fold { start_idx: 6, end_idx: 9, summary: "S2".into(), level: 1 });
+        st.record_fold(Fold {
+            start_idx: 1,
+            end_idx: 3,
+            summary: "S1".into(),
+            level: 1,
+        });
+        st.record_fold(Fold {
+            start_idx: 6,
+            end_idx: 9,
+            summary: "S2".into(),
+            level: 1,
+        });
         let view = projection(&m, &st);
         // msg0, S1, msg3,msg4,msg5, S2, msg9 = 7
         assert_eq!(view.len(), 7);

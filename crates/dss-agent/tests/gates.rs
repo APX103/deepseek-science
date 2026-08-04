@@ -1,9 +1,7 @@
 //! P2b-gates 集成测试：流式 FakeLLM 驱动 Runner 走各决策门。
 
 use dss_agent::{Runner, Session, MAX_ITERATIONS};
-use dss_llm::{
-    BoxedEventStream, ChatRequest, LlmClient, LlmError, StreamEvent, Usage,
-};
+use dss_llm::{BoxedEventStream, ChatRequest, LlmClient, LlmError, StreamEvent, Usage};
 use dss_tools::{builtin, ToolContext, ToolRegistry};
 use futures::future::BoxFuture;
 use futures::stream;
@@ -32,10 +30,11 @@ impl LlmClient for StreamFakeLlm {
     }
     fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
         let mut turns = self.turns.lock().unwrap();
-        let turn = turns
-            .first()
-            .cloned()
-            .unwrap_or(ScriptedTurn { texts: vec![], finish_reason: None, tool_calls: vec![] });
+        let turn = turns.first().cloned().unwrap_or(ScriptedTurn {
+            texts: vec![],
+            finish_reason: None,
+            tool_calls: vec![],
+        });
         // 注意：不 pop（多轮场景下每轮消费一个；这里用「peek + 调用方控制」）。
         // 为简单：实际 pop（每次 chat_stream 消费一个 turn）。
         if !turns.is_empty() {
@@ -55,8 +54,13 @@ impl LlmClient for StreamFakeLlm {
                 arguments: Some(args.clone()),
             })));
         }
-        events.push(Ok(StreamEvent::Usage(Usage { input_tokens: 1, output_tokens: 1 })));
-        events.push(Ok(StreamEvent::Finish { reason: turn.finish_reason }));
+        events.push(Ok(StreamEvent::Usage(Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        })));
+        events.push(Ok(StreamEvent::Finish {
+            reason: turn.finish_reason,
+        }));
 
         let stream = Box::pin(stream::iter(events)) as BoxedEventStream;
         Box::pin(async move { Ok(stream) })
@@ -124,7 +128,11 @@ async fn natural_completion_with_content() {
 #[tokio::test]
 async fn empty_retry_then_fails_after_cap() {
     // 连续 4 轮空响应（无 text、无 tool、finish=stop）→ 第 4 次超 cap(3) → error。
-    let empty = ScriptedTurn { texts: vec![], finish_reason: Some("stop".into()), tool_calls: vec![] };
+    let empty = ScriptedTurn {
+        texts: vec![],
+        finish_reason: Some("stop".into()),
+        tool_calls: vec![],
+    };
     let turns = vec![empty.clone(), empty.clone(), empty.clone(), empty.clone()];
     let (kind, _iters) = run_agent(turns, None).await;
     assert_eq!(kind, dss_agent::CompleteKind::Error);
@@ -133,11 +141,19 @@ async fn empty_retry_then_fails_after_cap() {
 #[tokio::test]
 async fn empty_retry_recovers_when_content_arrives() {
     // 2 轮空 + 第 3 轮有内容 → natural（empty_retry 不超 cap）。
-    let empty = ScriptedTurn { texts: vec![], finish_reason: Some("stop".into()), tool_calls: vec![] };
+    let empty = ScriptedTurn {
+        texts: vec![],
+        finish_reason: Some("stop".into()),
+        tool_calls: vec![],
+    };
     let turns = vec![
         empty.clone(),
         empty.clone(),
-        ScriptedTurn { texts: vec!["now I respond".into()], finish_reason: Some("stop".into()), tool_calls: vec![] },
+        ScriptedTurn {
+            texts: vec!["now I respond".into()],
+            finish_reason: Some("stop".into()),
+            tool_calls: vec![],
+        },
     ];
     let (kind, iters) = run_agent(turns, None).await;
     assert_eq!(kind, dss_agent::CompleteKind::Natural);
@@ -147,8 +163,18 @@ async fn empty_retry_recovers_when_content_arrives() {
 #[tokio::test]
 async fn max_tokens_length_terminates_at_cap() {
     // 连续 5 轮 finish=length → 第 5 次终止（MaxIters）。
-    let length = ScriptedTurn { texts: vec!["partial...".into()], finish_reason: Some("length".into()), tool_calls: vec![] };
-    let turns = vec![length.clone(), length.clone(), length.clone(), length.clone(), length.clone()];
+    let length = ScriptedTurn {
+        texts: vec!["partial...".into()],
+        finish_reason: Some("length".into()),
+        tool_calls: vec![],
+    };
+    let turns = vec![
+        length.clone(),
+        length.clone(),
+        length.clone(),
+        length.clone(),
+        length.clone(),
+    ];
     let (kind, _iters) = run_agent(turns, None).await;
     assert_eq!(kind, dss_agent::CompleteKind::MaxIters);
 }

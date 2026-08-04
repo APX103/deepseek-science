@@ -103,7 +103,8 @@ pub async fn build_state(settings: Settings) -> AppState {
     for srv in mcp_cfg.iter().filter(|s| s.enabled) {
         if mcp.add_server(&srv.name, &srv.url).await {
             if let Some(mcp_tools) = mcp.list_tools(&srv.name).await {
-                let count = dss_tools::builtin::mcp::register_mcp_tools(&mut tools, &srv.name, &mcp_tools);
+                let count =
+                    dss_tools::builtin::mcp::register_mcp_tools(&mut tools, &srv.name, &mcp_tools);
                 tracing::info!(server = %srv.name, tools = count, "MCP tools mounted");
             }
         }
@@ -118,10 +119,7 @@ pub async fn build_state(settings: Settings) -> AppState {
             session_id: None,
             frame_id: None,
             iteration: None,
-            message: format!(
-                "dss-backend started (model={})",
-                settings.llm.model
-            ),
+            message: format!("dss-backend started (model={})", settings.llm.model),
             detail: Some(serde_json::json!({
                 "version": dss_api_crate_version(),
                 "data_dir": settings.data_dir.display().to_string(),

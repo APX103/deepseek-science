@@ -93,26 +93,17 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(projects::unarchive_project),
         )
         // memories
-        .route(
-            "/api/memories",
-            get(memories::list_memories),
-        )
+        .route("/api/memories", get(memories::list_memories))
         .route(
             "/api/memories/{mid}",
             axum::routing::delete(memories::delete_memory),
         )
         // logs
-        .route(
-            "/api/logs",
-            get(logs::list_logs).delete(logs::delete_logs),
-        )
+        .route("/api/logs", get(logs::list_logs).delete(logs::delete_logs))
         .route("/api/logs/{id}", get(logs::get_log))
         // skills / templates
         .route("/api/skills", get(meta::list_skills))
-        .route(
-            "/api/templates",
-            get(meta::list_templates),
-        )
+        .route("/api/templates", get(meta::list_templates))
         .route("/api/templates/{id}", get(meta::get_template))
         // MCP
         .route("/api/mcp/{name}/tools", get(mcp_endpoints::mcp_tools))

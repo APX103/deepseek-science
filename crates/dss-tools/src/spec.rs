@@ -66,11 +66,17 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
     }
 
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self {
+            content: content.into(),
+            is_error: true,
+        }
     }
 }
 

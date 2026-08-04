@@ -37,7 +37,9 @@ pub async fn list_projects(
 ) -> Result<Json<Vec<dss_db::repo::ProjectRow>>, (StatusCode, Json<Value>)> {
     // 默认项目置顶由 repo SQL 的 ORDER BY (id='proj_default') 保证。
     let include = q.archived.unwrap_or(false);
-    let rows = dbq::list_projects(&state.db, include).await.map_err(map_db_err)?;
+    let rows = dbq::list_projects(&state.db, include)
+        .await
+        .map_err(map_db_err)?;
     Ok(Json(rows))
 }
 
@@ -75,9 +77,15 @@ pub async fn patch_project(
     Path(pid): Path<String>,
     Json(req): Json<PatchProjectReq>,
 ) -> Result<Json<dss_db::repo::ProjectRow>, (StatusCode, Json<Value>)> {
-    let row = dbq::update_project(&state.db, pid, req.name, req.description, req.last_session_id)
-        .await
-        .map_err(map_db_err)?;
+    let row = dbq::update_project(
+        &state.db,
+        pid,
+        req.name,
+        req.description,
+        req.last_session_id,
+    )
+    .await
+    .map_err(map_db_err)?;
     Ok(Json(row))
 }
 
@@ -86,7 +94,10 @@ pub async fn archive_project(
     State(state): State<AppState>,
     Path(pid): Path<String>,
 ) -> Result<Json<dss_db::repo::ProjectRow>, (StatusCode, Json<Value>)> {
-    dbq::set_project_archived(&state.db, pid, true).await.map_err(map_db_err).map(Json)
+    dbq::set_project_archived(&state.db, pid, true)
+        .await
+        .map_err(map_db_err)
+        .map(Json)
 }
 
 /// `POST /api/projects/{pid}/unarchive`。
@@ -94,7 +105,10 @@ pub async fn unarchive_project(
     State(state): State<AppState>,
     Path(pid): Path<String>,
 ) -> Result<Json<dss_db::repo::ProjectRow>, (StatusCode, Json<Value>)> {
-    dbq::set_project_archived(&state.db, pid, false).await.map_err(map_db_err).map(Json)
+    dbq::set_project_archived(&state.db, pid, false)
+        .await
+        .map_err(map_db_err)
+        .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -110,7 +124,9 @@ pub async fn delete_project(
     Query(q): Query<DeleteQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let force = q.force.unwrap_or(false);
-    dbq::delete_project(&state.db, pid, force).await.map_err(map_db_err)?;
+    dbq::delete_project(&state.db, pid, force)
+        .await
+        .map_err(map_db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -119,6 +135,8 @@ pub async fn get_project(
     State(state): State<AppState>,
     Path(pid): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (proj, sessions) = dbq::get_project_detail(&state.db, pid).await.map_err(map_db_err)?;
+    let (proj, sessions) = dbq::get_project_detail(&state.db, pid)
+        .await
+        .map_err(map_db_err)?;
     Ok(Json(json!({ "project": proj, "sessions": sessions })))
 }

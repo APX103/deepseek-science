@@ -32,6 +32,9 @@ pub struct ChatMessage {
     /// role=tool 时可选的工具名（OpenAI 协议非必需，但便于日志）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 内部 harness 提示标记；不发往 LLM，仅用于落库/恢复时区分系统提示。
+    #[serde(skip)]
+    pub harness_notice: bool,
 }
 
 impl ChatMessage {
@@ -42,6 +45,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            harness_notice: false,
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
@@ -51,6 +55,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            harness_notice: false,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -60,6 +65,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            harness_notice: false,
         }
     }
     /// assistant 携带工具调用（content 为空）。
@@ -70,16 +76,22 @@ impl ChatMessage {
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             name: None,
+            harness_notice: false,
         }
     }
     /// role=tool 的工具结果消息。
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>, name: Option<String>) -> Self {
+    pub fn tool(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
         Self {
             role: "tool".into(),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name,
+            harness_notice: false,
         }
     }
 }
@@ -149,7 +161,11 @@ pub struct ToolDef {
 }
 
 impl ToolDef {
-    pub fn function(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
         Self {
             kind: "function".to_string(),
             function: ToolFunction {
@@ -221,10 +237,7 @@ pub trait LlmClient: Send + Sync {
 
     /// 流式对话。返回事件流；`[DONE]` 或流结束后自然终止。
     /// 注意：**已 yield 内容后不重试**（调用方负责错误处理）。
-    fn chat_stream(
-        &self,
-        req: ChatRequest,
-    ) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>>;
+    fn chat_stream(&self, req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>>;
 
     fn model(&self) -> &str;
 }

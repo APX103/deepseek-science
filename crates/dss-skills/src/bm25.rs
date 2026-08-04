@@ -67,7 +67,12 @@ pub fn bm25_ranks(skills: &[Skill], query: &str) -> Vec<(usize, f64)> {
         scores[i] = s;
     }
 
-    let mut ranked: Vec<(usize, f64)> = scores.iter().copied().enumerate().filter(|(_, s)| *s > 0.0).collect();
+    let mut ranked: Vec<(usize, f64)> = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked
 }
@@ -81,7 +86,9 @@ pub fn jaccard_ranks(skills: &[Skill], query: &str) -> Vec<(usize, f64)> {
     let mut ranked = Vec::new();
     for (i, s) in skills.iter().enumerate() {
         let d: std::collections::HashSet<String> =
-            tokenize(&format!("{} {}", s.name, s.description)).into_iter().collect();
+            tokenize(&format!("{} {}", s.name, s.description))
+                .into_iter()
+                .collect();
         let inter = q.intersection(&d).count() as f64;
         let union = q.union(&d).count() as f64;
         if union == 0.0 {
@@ -126,7 +133,12 @@ mod tests {
     use super::*;
 
     fn mk(name: &str, desc: &str) -> Skill {
-        Skill { name: name.into(), description: desc.into(), source: "test".into(), body: String::new() }
+        Skill {
+            name: name.into(),
+            description: desc.into(),
+            source: "test".into(),
+            body: String::new(),
+        }
     }
 
     #[test]

@@ -20,9 +20,9 @@ pub type ConnObj = deadpool_sqlite::Connection;
 /// （foreign_keys/busy_timeout 按连接生效；WAL 持久化到文件头）。
 pub fn open_pool(data_dir: &Path) -> Result<Pool, DbError> {
     let cfg = Config::new(data_dir.join("dss.db"));
-    let builder = cfg.builder(Runtime::Tokio1).map_err(|e| {
-        DbError::Other(format!("pool builder: {e}"))
-    })?;
+    let builder = cfg
+        .builder(Runtime::Tokio1)
+        .map_err(|e| DbError::Other(format!("pool builder: {e}")))?;
     let pool = builder
         .post_create(Hook::async_fn(|conn, _meta| {
             Box::pin(async move {

@@ -62,6 +62,9 @@ pub async fn delete_memory(
     match state.memory.delete(id.clone()).await {
         Ok(_) => Ok(StatusCode::NO_CONTENT),
         Err(dss_db::DbError::NotFound(m)) => Err(json_error(StatusCode::NOT_FOUND, &m)),
-        Err(e) => Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }

@@ -69,9 +69,14 @@ pub async fn create_session(
         ));
     }
 
-    let model = req.model.clone().unwrap_or_else(|| state.settings.llm.model.clone());
+    let model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.settings.llm.model.clone());
     // 落 DB（project_id 缺省 → 不绑定，或后续 default）。
-    let project_id = req.project_id.or(Some(dss_db::DEFAULT_PROJECT_ID.to_string()));
+    let project_id = req
+        .project_id
+        .or(Some(dss_db::DEFAULT_PROJECT_ID.to_string()));
     let row = dbq::create_session_row(
         &state.db,
         sid.clone(),
@@ -84,10 +89,11 @@ pub async fn create_session(
 
     let session = Session::new(sid.clone(), workspace);
     let frame_id = session.frame.id.clone();
-    state.sessions.lock().await.insert(
-        sid.clone(),
-        Arc::new(ActiveSession::new(session, 0)),
-    );
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(sid.clone(), Arc::new(ActiveSession::new(session, 0)));
 
     tracing::info!(sid = %sid, "session created");
     Ok(Json(CreateSessionResp {
@@ -155,7 +161,9 @@ pub async fn get_session(
         _ => return Err(json_error(StatusCode::NOT_FOUND, "session not found")),
     };
 
-    let msgs = dbq::list_messages(&state.db, sid.clone()).await.map_err(map_db_err)?;
+    let msgs = dbq::list_messages(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?;
     let messages: Vec<Value> = msgs
         .into_iter()
         .map(|m| {
@@ -186,7 +194,9 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Path(sid): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
-    dbq::delete_session_row(&state.db, sid.clone()).await.map_err(map_db_err)?;
+    dbq::delete_session_row(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?;
     // workspace 目录
     let ws = state.settings.data_dir.join("workspaces").join(&sid);
     if ws.exists() {
@@ -218,26 +228,39 @@ pub async fn approve_plan(
         return Err(json_error(StatusCode::NOT_FOUND, "session not found"));
     };
 
-    // 从内存 session 拿 plan（P6a 在 ToolContext.plan 里，但 run 结束后 ctx 销毁；
-    // 这里从 session 的 frame status 判断是否在 awaiting，然后返回 approved=true）。
-    {
-        let s = active.session.lock().await;
+    // 从内存 session 拿 plan 并标记 approved。
+    let steps = {
+        let mut s = active.session.lock().await;
         if s.frame.status != FrameStatus::AwaitingPlanApproval {
             return Err(json_error(
                 StatusCode::CONFLICT,
                 "session is not awaiting plan approval",
             ));
         }
-    }
-
-    // 重开 frame 为 Processing（让后续 run 能继续）。
-    {
+        let Some(ref mut plan) = s.plan else {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "no plan to approve; generate a plan first",
+            ));
+        };
+        plan.approved = true;
+        let steps_json: Vec<serde_json::Value> = plan
+            .steps
+            .iter()
+            .map(|step| json!({ "title": step.title, "status": step.status }))
+            .collect();
+        // 持久化 approved plan。
+        let plan_data = serde_json::to_string(plan).ok();
+        drop(s);
+        let _ = dbq::set_session_plan(&state.db, sid.clone(), plan_data).await;
+        // 重开 frame 为 Processing（让后续 run 能继续）。
         let mut s = active.session.lock().await;
         s.frame.set_status(FrameStatus::Processing);
-    }
+        steps_json
+    };
 
     tracing::info!(sid = %sid, "plan approved");
-    Ok(Json(json!({ "approved": true, "steps": [] })))
+    Ok(Json(json!({ "approved": true, "steps": steps })))
 }
 
 #[derive(Deserialize)]
@@ -294,18 +317,25 @@ pub async fn compile(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(180), cmd.output()).await {
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(180), cmd.output()).await
+    {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return Ok(Json(CompileResult {
-                success: false, pdf_path: None, size_kb: 0,
-                message: format!("tectonic spawn failed: {e}"), errors: vec![],
+                success: false,
+                pdf_path: None,
+                size_kb: 0,
+                message: format!("tectonic spawn failed: {e}"),
+                errors: vec![],
             }));
         }
         Err(_) => {
             return Ok(Json(CompileResult {
-                success: false, pdf_path: None, size_kb: 0,
-                message: "tectonic timed out (180s)".into(), errors: vec![],
+                success: false,
+                pdf_path: None,
+                size_kb: 0,
+                message: "tectonic timed out (180s)".into(),
+                errors: vec![],
             }));
         }
     };
@@ -326,7 +356,13 @@ pub async fn compile(
         }))
     } else {
         let log_excerpt: String = format!("{stdout}\n--- stderr ---\n{stderr}")
-            .chars().rev().take(3000).collect::<String>().chars().rev().collect();
+            .chars()
+            .rev()
+            .take(3000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         Ok(Json(CompileResult {
             success: false,
             pdf_path: None,
@@ -352,6 +388,8 @@ async fn restore_session(state: &AppState, sid: &str) -> Result<(), dss_db::DbEr
         });
         // 强制以 DB 的 role 为准（防 content 内 role 与行不一致）。
         cm.role = m.role;
+        // 恢复 harness_notice 标记（该字段不在 content JSON 中序列化，以 DB 列为准）。
+        cm.harness_notice = m.harness_notice;
         messages.push(cm);
     }
     let count = messages.len();
@@ -363,9 +401,18 @@ async fn restore_session(state: &AppState, sid: &str) -> Result<(), dss_db::DbEr
         session.frame.task_summary = t;
     }
     session.frame.set_status(FrameStatus::Completed);
+    // 恢复 plan 状态（P6）。
+    if let Ok(Some(json)) = dbq::get_session_plan(&state.db, sid.to_string()).await {
+        if let Ok(plan) = serde_json::from_str::<dss_tools::PlanState>(&json) {
+            session.plan = Some(plan);
+        }
+    }
 
     let mut map = state.sessions.lock().await;
-    map.insert(sid.to_string(), Arc::new(ActiveSession::new(session, count)));
+    map.insert(
+        sid.to_string(),
+        Arc::new(ActiveSession::new(session, count)),
+    );
     // LRU 驱逐（仅内存）。
     if map.len() > MAX_ACTIVE_SESSIONS {
         if let Some(first) = map.keys().next().cloned() {
@@ -393,7 +440,8 @@ pub async fn stream_sse(
     State(state): State<AppState>,
     Path(sid): Path<String>,
     Json(req): Json<RunReq>,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
+{
     // 内存无则先恢复（DB 有）。
     if !state.sessions.lock().await.contains_key(&sid) {
         restore_session(&state, &sid).await.map_err(map_db_err)?;
@@ -431,16 +479,41 @@ pub async fn stream_sse(
 
     tokio::spawn(async move {
         let mut session = session;
+
+        // 若 session 有已批准计划，在 run 开始时注入上下文，让 agent 按步骤执行。
+        if let Some(plan) = session.plan.as_ref().filter(|p| p.approved) {
+            let summary = format!(
+                "[已批准的计划]\n{}",
+                plan.steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| format!("{}. {} ({})", i + 1, s.title, s.status))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let mut m = ChatMessage::system(summary);
+            m.harness_notice = true;
+            session.messages.push(m);
+        }
+
+        let initial_plan = session.plan.clone();
         let ctx = {
             // 复制全局 catalog（builtin+global），再叠加 project 源（workspace/.deepseek-science/skills）。
             let mut cat = (*state.catalog).clone();
-            cat.load_dir(&dss_skills::project_skills_dir(&session.workspace), "project");
+            cat.load_dir(
+                &dss_skills::project_skills_dir(&session.workspace),
+                "project",
+            );
             let mut tc = ToolContext::new(session.workspace.clone())
                 .with_skill_catalog(cat)
-                .with_mcp_arc(state.mcp.clone());
+                .with_mcp_arc(state.mcp.clone())
+                .with_plan(initial_plan);
             // 注入 LLM（delegate 工具用）。
             if let Some(client) = &llm {
-                tc = tc.with_llm(client.clone() as std::sync::Arc<dyn dss_llm::LlmClient>, model.clone());
+                tc = tc.with_llm(
+                    client.clone() as std::sync::Arc<dyn dss_llm::LlmClient>,
+                    model.clone(),
+                );
             }
             tc
         };
@@ -510,14 +583,17 @@ pub async fn stream_sse(
         };
 
         // —— 增量持久化本次 run 新增的消息（session.messages 里 DB 还没有的部分）——
-        let prev = active.persisted_count.load(std::sync::atomic::Ordering::Relaxed);
+        let prev = active
+            .persisted_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         let new_msgs_count = session.messages.len().saturating_sub(prev);
         if new_msgs_count > 0 {
             let to_persist: Vec<(String, String, bool)> = session.messages[prev..]
                 .iter()
                 .map(|m| {
-                    let content_json = serde_json::to_string(m).unwrap_or_else(|_| String::from("\"\""));
-                    (m.role.clone(), content_json, false)
+                    let content_json =
+                        serde_json::to_string(m).unwrap_or_else(|_| String::from("\"\""));
+                    (m.role.clone(), content_json, m.harness_notice)
                 })
                 .collect();
             if let Err(e) = dbq::append_messages_batch(&db, sid_clone.clone(), to_persist).await {
@@ -538,6 +614,16 @@ pub async fn stream_sse(
             }
         }
 
+        // —— 同步 plan 状态回 session 并持久化 ——
+        session.plan = ctx.plan.lock().await.clone();
+        let plan_json = session
+            .plan
+            .as_ref()
+            .and_then(|p| serde_json::to_string(p).ok());
+        if let Err(e) = dbq::set_session_plan(&db, sid_clone.clone(), plan_json).await {
+            tracing::warn!(error = %e, sid = %sid_clone, "persist plan failed");
+        }
+
         tracing::info!(
             kind = ?outcome.kind,
             iterations = outcome.iterations,
@@ -546,21 +632,29 @@ pub async fn stream_sse(
         );
 
         // —— agent 日志：run_end ——
-        let _ = state.logs.append(dss_observability::LogEntry {
-            level: if outcome.kind == dss_agent::CompleteKind::Error { "error" } else { "info" }.into(),
-            source: "agent".into(),
-            kind: "run_end".into(),
-            session_id: Some(sid.clone()),
-            frame_id: Some(session.frame.id.clone()),
-            iteration: Some(outcome.iterations as i64),
-            message: format!("run ended: {:?}", outcome.kind),
-            detail: Some(serde_json::json!({
-                "kind": format!("{:?}", outcome.kind),
-                "iterations": outcome.iterations,
-                "input_tokens": outcome.usage.input_tokens,
-                "output_tokens": outcome.usage.output_tokens,
-            })),
-        }).await;
+        let _ = state
+            .logs
+            .append(dss_observability::LogEntry {
+                level: if outcome.kind == dss_agent::CompleteKind::Error {
+                    "error"
+                } else {
+                    "info"
+                }
+                .into(),
+                source: "agent".into(),
+                kind: "run_end".into(),
+                session_id: Some(sid.clone()),
+                frame_id: Some(session.frame.id.clone()),
+                iteration: Some(outcome.iterations as i64),
+                message: format!("run ended: {:?}", outcome.kind),
+                detail: Some(serde_json::json!({
+                    "kind": format!("{:?}", outcome.kind),
+                    "iterations": outcome.iterations,
+                    "input_tokens": outcome.usage.input_tokens,
+                    "output_tokens": outcome.usage.output_tokens,
+                })),
+            })
+            .await;
 
         // —— 记忆抽取（fire-and-forget，后台异步，不阻塞、错误只 warn）——
         if let Some(client) = llm_for_extract.as_ref() {
@@ -570,10 +664,16 @@ pub async fn stream_sse(
             let pid_c = project_id.clone();
             let client_c = client.clone();
             tokio::spawn(async move {
-                match dss_memory::extract::extract(client_c.as_ref(), &model_c, &msgs_snapshot).await {
+                match dss_memory::extract::extract(client_c.as_ref(), &model_c, &msgs_snapshot)
+                    .await
+                {
                     Ok(items) if !items.is_empty() => {
                         for body in items {
-                            let scope = if pid_c.is_none() { Some("profile".into()) } else { Some("project".into()) };
+                            let scope = if pid_c.is_none() {
+                                Some("profile".into())
+                            } else {
+                                Some("project".into())
+                            };
                             if let Err(e) = memory_c.append(body, scope, pid_c.clone()).await {
                                 tracing::warn!(error = %e, "memory append failed");
                             }

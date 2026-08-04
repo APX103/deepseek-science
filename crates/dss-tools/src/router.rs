@@ -36,7 +36,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
@@ -51,7 +53,10 @@ impl ToolRegistry {
 
     /// 给 LLM 的全部工具定义。
     pub fn definitions(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| ToolDef::from(t.spec())).collect()
+        self.tools
+            .values()
+            .map(|t| ToolDef::from(t.spec()))
+            .collect()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -87,7 +92,11 @@ impl ToolRouter {
             let ctx = ctx.clone();
             set.spawn(async move {
                 let Some(tool) = tool_opt else {
-                    return to_result(&call.id, Err(ToolError::NotFound(call.name.clone())), &call.name);
+                    return to_result(
+                        &call.id,
+                        Err(ToolError::NotFound(call.name.clone())),
+                        &call.name,
+                    );
                 };
                 let fut = tool.call(&ctx, call.input.clone());
                 match tokio::time::timeout(Self::PER_CALL_TIMEOUT, fut).await {

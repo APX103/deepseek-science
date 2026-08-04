@@ -71,14 +71,17 @@ pub async fn list_templates() -> Json<Vec<TemplateInfo>> {
 }
 
 /// `GET /api/templates/{id}`：模板 .tex 纯文本。
-pub async fn get_template(
-    Path(id): Path<String>,
-) -> Result<String, (StatusCode, Json<Value>)> {
+pub async fn get_template(Path(id): Path<String>) -> Result<String, (StatusCode, Json<Value>)> {
     let f = TEMPLATES
         .files()
         .find(|f| f.path().file_stem().and_then(|s| s.to_str()) == Some(id.as_str()))
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "template not found"))?;
     std::str::from_utf8(f.contents())
         .map(|s| s.to_string())
-        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("template utf8: {e}")))
+        .map_err(|e| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("template utf8: {e}"),
+            )
+        })
 }

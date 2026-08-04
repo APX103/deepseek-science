@@ -40,12 +40,10 @@ impl Tool for BashTool {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| ToolError::Timeout(timeout_secs))??;
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+                .await
+                .map_err(|_| ToolError::Timeout(timeout_secs))??;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

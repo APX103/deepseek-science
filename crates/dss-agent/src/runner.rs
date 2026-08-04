@@ -15,11 +15,13 @@ use crate::session::Session;
 fn to_llm_tool_defs(reg: &ToolRegistry) -> Vec<dss_llm::ToolDef> {
     reg.definitions()
         .into_iter()
-        .map(|td| dss_llm::ToolDef::function(
-            td.function.name,
-            td.function.description,
-            td.function.parameters,
-        ))
+        .map(|td| {
+            dss_llm::ToolDef::function(
+                td.function.name,
+                td.function.description,
+                td.function.parameters,
+            )
+        })
         .collect()
 }
 
@@ -56,9 +58,10 @@ fn is_retrieval_tool(name: &str) -> bool {
 }
 
 /// 构造一条 harness-notice 系统消息（内部调度提示，LLM 可见）。
-/// P2b-gates 暂作为普通 system 消息注入；harness_notice 显式标记留后续（P3 已有该列）。
 fn harness_notice(text: &str) -> ChatMessage {
-    ChatMessage::system(text)
+    let mut m = ChatMessage::system(text);
+    m.harness_notice = true;
+    m
 }
 
 /// 一次 run 的结果（事件已发出；outcome 供调用方记录）。
@@ -93,10 +96,13 @@ impl Runner {
     ) -> RunOutcome {
         session.frame.task_summary = truncate_chars(prompt, 80);
 
-        if !send(tx, AgentEvent::Start {
-            frame_id: session.frame.id.clone(),
-            task_summary: session.frame.task_summary.clone(),
-        })
+        if !send(
+            tx,
+            AgentEvent::Start {
+                frame_id: session.frame.id.clone(),
+                task_summary: session.frame.task_summary.clone(),
+            },
+        )
         .await
         {
             return cancel(session);
@@ -131,9 +137,14 @@ impl Runner {
 
             // —— Rolling Compact：每轮 LLM 前压缩（短对话不触发，行为不变）——
             let cw = context_window;
-            let compact_outcome =
-                dss_compact::maybe_compact(&session.messages, &mut session.compaction, llm, model, cw)
-                    .await;
+            let compact_outcome = dss_compact::maybe_compact(
+                &session.messages,
+                &mut session.compaction,
+                llm,
+                model,
+                cw,
+            )
+            .await;
             if compact_outcome.folded {
                 tracing::info!(
                     folds_added = compact_outcome.folds_added,
@@ -154,8 +165,16 @@ impl Runner {
             let stream = match llm.chat_stream(req).await {
                 Ok(s) => s,
                 Err(e) => {
-                    return fail(session, tx, iterations, final_text, usage, e.to_string(), None)
-                        .await;
+                    return fail(
+                        session,
+                        tx,
+                        iterations,
+                        final_text,
+                        usage,
+                        e.to_string(),
+                        None,
+                    )
+                    .await;
                 }
             };
 
@@ -228,17 +247,21 @@ impl Runner {
                         session.messages.push(ChatMessage::assistant(&final_text));
                     }
                     session.frame.set_status(FrameStatus::Completed);
-                    let _ = send(tx, AgentEvent::Complete {
-                        kind: CompleteKind::MaxIters,
-                        final_text: final_text.clone(),
-                        awaiting: None,
-                        error: Some("reached max_tokens continuation cap (5)".into()),
-                        usage,
-                        iterations,
-                        frame_status: session.frame.status,
-                        pending_ask: None,
-                        plan: None,
-                    }).await;
+                    let _ = send(
+                        tx,
+                        AgentEvent::Complete {
+                            kind: CompleteKind::MaxIters,
+                            final_text: final_text.clone(),
+                            awaiting: None,
+                            error: Some("reached max_tokens continuation cap (5)".into()),
+                            usage,
+                            iterations,
+                            frame_status: session.frame.status,
+                            pending_ask: None,
+                            plan: None,
+                        },
+                    )
+                    .await;
                     return RunOutcome {
                         kind: CompleteKind::MaxIters,
                         final_text,
@@ -267,138 +290,150 @@ impl Runner {
                 let assistant_msg = if text_buf.is_empty() {
                     ChatMessage::assistant_tool_calls(finalized.clone())
                 } else {
-                // 带文字 + tool_calls 的 assistant 消息。
-                let mut m = ChatMessage::assistant_tool_calls(finalized.clone());
-                m.content = Some(text_buf.clone());
-                m
-            };
-            session.messages.push(assistant_msg);
+                    // 带文字 + tool_calls 的 assistant 消息。
+                    let mut m = ChatMessage::assistant_tool_calls(finalized.clone());
+                    m.content = Some(text_buf.clone());
+                    m
+                };
+                session.messages.push(assistant_msg);
 
-            // 推 tool_calls 事件给前端。
-            let views: Vec<ToolCallView> = finalized
-                .iter()
-                .map(|tc| ToolCallView {
-                    id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    input: parse_arguments(&tc.function.arguments),
-                })
-                .collect();
-            if !send(tx, AgentEvent::ToolCalls { calls: views }).await {
-                return cancel(session);
-            }
+                // 推 tool_calls 事件给前端。
+                let views: Vec<ToolCallView> = finalized
+                    .iter()
+                    .map(|tc| ToolCallView {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input: parse_arguments(&tc.function.arguments),
+                    })
+                    .collect();
+                if !send(tx, AgentEvent::ToolCalls { calls: views }).await {
+                    return cancel(session);
+                }
 
-            // —— 执行工具（并发 + 30s 超时）——
-            let pending: Vec<PendingToolCall> = finalized
-                .iter()
-                .map(|tc| PendingToolCall {
-                    id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    input: parse_arguments(&tc.function.arguments),
-                })
-                .collect();
-            let results =
-                ToolRouter::execute_tool_calls(tools, ctx, pending).await;
+                // —— 执行工具（并发 + 30s 超时）——
+                let pending: Vec<PendingToolCall> = finalized
+                    .iter()
+                    .map(|tc| PendingToolCall {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input: parse_arguments(&tc.function.arguments),
+                    })
+                    .collect();
+                let results = ToolRouter::execute_tool_calls(tools, ctx, pending).await;
 
-            // 推 tool_results 事件给前端。
-            let result_views: Vec<ToolResultView> =
-                results.iter().cloned().map(ToolResultView::from).collect();
-            if !send(tx, AgentEvent::ToolResults { results: result_views }).await {
-                return cancel(session);
-            }
+                // 推 tool_results 事件给前端。
+                let result_views: Vec<ToolResultView> =
+                    results.iter().cloned().map(ToolResultView::from).collect();
+                if !send(
+                    tx,
+                    AgentEvent::ToolResults {
+                        results: result_views,
+                    },
+                )
+                .await
+                {
+                    return cancel(session);
+                }
 
-            // —— 结果入历史（role=tool，配对 tool_call_id）——
-            for r in &results {
-                session.messages.push(ChatMessage::tool(
-                    &r.tool_use_id,
-                    &r.content,
-                    // tool 名：从 finalized 里按 id 反查（便于日志，OpenAI 非必需）。
-                    finalized
-                        .iter()
-                        .find(|tc| tc.id == r.tool_use_id)
-                        .map(|tc| tc.function.name.clone()),
-                ));
-            }
+                // —— 结果入历史（role=tool，配对 tool_call_id）——
+                for r in &results {
+                    session.messages.push(ChatMessage::tool(
+                        &r.tool_use_id,
+                        &r.content,
+                        // tool 名：从 finalized 里按 id 反查（便于日志，OpenAI 非必需）。
+                        finalized
+                            .iter()
+                            .find(|tc| tc.id == r.tool_use_id)
+                            .map(|tc| tc.function.name.clone()),
+                    ));
+                }
 
-            // 累计 usage 文字（后续多轮的 text 保留为最终回复）。
-            if !text_buf.is_empty() {
-                final_text = text_buf;
-            }
+                // 累计 usage 文字（后续多轮的 text 保留为最终回复）。
+                if !text_buf.is_empty() {
+                    final_text = text_buf;
+                }
 
-            // —— ask_user 检测：挂起则转 AwaitingUserResponse 退出 ——
-            let pending_ask_guard = ctx.pending_ask.lock().await;
-            if let Some(ask) = pending_ask_guard.clone() {
+                // —— ask_user 检测：挂起则转 AwaitingUserResponse 退出 ——
+                let pending_ask_guard = ctx.pending_ask.lock().await;
+                if let Some(ask) = pending_ask_guard.clone() {
+                    drop(pending_ask_guard);
+                    // 清空挂起（下次 run 会重新挂）。
+                    *ctx.pending_ask.lock().await = None;
+                    session.frame.set_status(FrameStatus::AwaitingUserResponse);
+
+                    let event = AgentEvent::Complete {
+                        kind: CompleteKind::Awaiting,
+                        final_text: final_text.clone(),
+                        awaiting: Some("user_response".to_string()),
+                        error: None,
+                        usage,
+                        iterations,
+                        frame_status: session.frame.status,
+                        pending_ask: Some(ask),
+                        plan: None,
+                    };
+                    let _ = send(tx, event).await;
+                    return RunOutcome {
+                        kind: CompleteKind::Awaiting,
+                        final_text,
+                        usage,
+                        iterations,
+                    };
+                }
                 drop(pending_ask_guard);
-                // 清空挂起（下次 run 会重新挂）。
-                *ctx.pending_ask.lock().await = None;
-                session.frame.set_status(FrameStatus::AwaitingUserResponse);
 
-                let event = AgentEvent::Complete {
-                    kind: CompleteKind::Awaiting,
-                    final_text: final_text.clone(),
-                    awaiting: Some("user_response".to_string()),
-                    error: None,
-                    usage,
-                    iterations,
-                    frame_status: session.frame.status,
-                    pending_ask: Some(ask),
-                    plan: None,
-                };
-                let _ = send(tx, event).await;
-                return RunOutcome {
-                    kind: CompleteKind::Awaiting,
-                    final_text,
-                    usage,
-                    iterations,
-                };
-            }
-            drop(pending_ask_guard);
-
-            // —— plan 检测：plan_mode 且 ctx.plan 有未批准 plan → 转 AwaitingPlanApproval ——
-            if plan_mode {
-                let plan_guard = ctx.plan.lock().await;
-                if let Some(plan) = plan_guard.clone() {
-                    if !plan.approved {
-                        drop(plan_guard);
-                        // 推 plan_update 事件给前端。
-                        let _ = send(tx, AgentEvent::PlanUpdate { plan: plan.clone() }).await;
-                        session.frame.set_status(FrameStatus::AwaitingPlanApproval);
-                        let _ = send(tx, AgentEvent::Complete {
-                            kind: CompleteKind::Awaiting,
-                            final_text: final_text.clone(),
-                            awaiting: Some("plan_approval".to_string()),
-                            error: None,
-                            usage,
-                            iterations,
-                            frame_status: session.frame.status,
-                            pending_ask: None,
-                            plan: Some(plan),
-                        }).await;
-                        return RunOutcome {
-                            kind: CompleteKind::Awaiting,
-                            final_text,
-                            usage,
-                            iterations,
-                        };
+                // —— plan 检测：plan_mode 且 ctx.plan 有未批准 plan → 转 AwaitingPlanApproval ——
+                if plan_mode {
+                    let plan_guard = ctx.plan.lock().await;
+                    if let Some(plan) = plan_guard.clone() {
+                        if !plan.approved {
+                            drop(plan_guard);
+                            // 推 plan_update 事件给前端。
+                            let _ = send(tx, AgentEvent::PlanUpdate { plan: plan.clone() }).await;
+                            session.frame.set_status(FrameStatus::AwaitingPlanApproval);
+                            let _ = send(
+                                tx,
+                                AgentEvent::Complete {
+                                    kind: CompleteKind::Awaiting,
+                                    final_text: final_text.clone(),
+                                    awaiting: Some("plan_approval".to_string()),
+                                    error: None,
+                                    usage,
+                                    iterations,
+                                    frame_status: session.frame.status,
+                                    pending_ask: None,
+                                    plan: Some(plan),
+                                },
+                            )
+                            .await;
+                            return RunOutcome {
+                                kind: CompleteKind::Awaiting,
+                                final_text,
+                                usage,
+                                iterations,
+                            };
+                        }
                     }
                 }
-            }
 
-            // —— 检索熔断（modules.md：连续纯检索 ≥6 轮强制写作）——
-            let all_retrieval = finalized.iter().all(|tc| is_retrieval_tool(&tc.function.name));
-            if all_retrieval {
-                session.gate_state.retrieval_streak += 1;
-            } else {
-                session.gate_state.retrieval_streak = 0;
-            }
-            if session.gate_state.retrieval_streak >= RETRIEVAL_CIRCUIT_BREAKER {
-                session.messages.push(harness_notice(
+                // —— 检索熔断（modules.md：连续纯检索 ≥6 轮强制写作）——
+                let all_retrieval = finalized
+                    .iter()
+                    .all(|tc| is_retrieval_tool(&tc.function.name));
+                if all_retrieval {
+                    session.gate_state.retrieval_streak += 1;
+                } else {
+                    session.gate_state.retrieval_streak = 0;
+                }
+                if session.gate_state.retrieval_streak >= RETRIEVAL_CIRCUIT_BREAKER {
+                    session.messages.push(harness_notice(
                     "你已经连续多轮只做检索/阅读，没有产出实际内容。请停止搜索，基于已获取的信息开始写作/回答。",
                 ));
-                session.gate_state.retrieval_streak = 0;
-            }
+                    session.gate_state.retrieval_streak = 0;
+                }
 
-            // 否则继续下一轮 LLM。
-            debug!(iteration = iterations, "tool loop continues");
+                // 否则继续下一轮 LLM。
+                debug!(iteration = iterations, "tool loop continues");
             } else {
                 // —— 无 tool_use 且非 length：natural completion + empty-retry 门 ——
                 if text_buf.trim().is_empty() {
@@ -406,9 +441,15 @@ impl Runner {
                     session.gate_state.empty_retry_count += 1;
                     if session.gate_state.empty_retry_count > EMPTY_RETRY_CAP {
                         return fail(
-                            session, tx, iterations, final_text, usage,
-                            "empty response retry cap exceeded (3)".to_string(), None,
-                        ).await;
+                            session,
+                            tx,
+                            iterations,
+                            final_text,
+                            usage,
+                            "empty response retry cap exceeded (3)".to_string(),
+                            None,
+                        )
+                        .await;
                     }
                     session.messages.push(harness_notice(
                         "你的上一条回复为空。请基于上下文给出实际回复；若任务已完成请明确说明。",
@@ -425,11 +466,19 @@ impl Runner {
                         session.gate_state.plan_denial_count += 1;
                         if session.gate_state.plan_denial_count > PLAN_DENIAL_CAP {
                             return fail(
-                                session, tx, iterations, final_text, usage,
-                                "plan mode requires a plan (denial cap exceeded)".to_string(), None,
-                            ).await;
+                                session,
+                                tx,
+                                iterations,
+                                final_text,
+                                usage,
+                                "plan mode requires a plan (denial cap exceeded)".to_string(),
+                                None,
+                            )
+                            .await;
                         }
-                        session.messages.push(ChatMessage::assistant(text_buf.clone().as_str()));
+                        session
+                            .messages
+                            .push(ChatMessage::assistant(text_buf.clone().as_str()));
                         session.messages.push(harness_notice(
                             "你处于 plan 模式但还没生成计划。请调用 generate_plan 工具给出步骤计划，再继续。",
                         ));
@@ -441,14 +490,21 @@ impl Runner {
 
                 // —— terminal barrier（P6b verify）：自然完成时 review；veto 则再修一轮（≤1 次）——
                 if session.gate_state.veto_count < VETO_CAP {
-                    if let Some(verdict) = dss_verify::terminal_barrier(llm, model, prompt, &final_text).await {
+                    if let Some(verdict) =
+                        dss_verify::terminal_barrier(llm, model, prompt, &final_text).await
+                    {
                         if !verdict.pass && !verdict.findings.is_empty() {
                             session.gate_state.veto_count += 1;
                             tracing::info!(findings = ?verdict.findings, "terminal barrier veto");
                             session.messages.push(ChatMessage::assistant(&final_text));
                             let notice = format!(
                                 "reviewer 发现以下问题，请修复后重新给出最终回复：\n{}",
-                                verdict.findings.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+                                verdict
+                                    .findings
+                                    .iter()
+                                    .map(|f| format!("- {f}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
                             );
                             session.messages.push(harness_notice(&notice));
                             continue;
@@ -459,17 +515,21 @@ impl Runner {
                 session.messages.push(ChatMessage::assistant(&final_text));
                 session.frame.set_status(FrameStatus::Completed);
 
-                let _ = send(tx, AgentEvent::Complete {
-                    kind: CompleteKind::Natural,
-                    final_text: final_text.clone(),
-                    awaiting: None,
-                    error: None,
-                    usage,
-                    iterations,
-                    frame_status: session.frame.status,
-                    pending_ask: None,
-                    plan: None,
-                }).await;
+                let _ = send(
+                    tx,
+                    AgentEvent::Complete {
+                        kind: CompleteKind::Natural,
+                        final_text: final_text.clone(),
+                        awaiting: None,
+                        error: None,
+                        usage,
+                        iterations,
+                        frame_status: session.frame.status,
+                        pending_ask: None,
+                        plan: None,
+                    },
+                )
+                .await;
                 return RunOutcome {
                     kind: CompleteKind::Natural,
                     final_text,

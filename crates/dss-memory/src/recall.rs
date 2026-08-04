@@ -14,7 +14,11 @@ pub async fn recall(
 ) -> Result<Vec<MemoryRow>, DbError> {
     let candidates = store.candidates(project_id.map(|s| s.to_string())).await?;
     let scored = bm25::recall(&candidates, query);
-    Ok(scored.into_iter().take(top_n).map(|(m, _)| m.clone()).collect())
+    Ok(scored
+        .into_iter()
+        .take(top_n)
+        .map(|(m, _)| m.clone())
+        .collect())
 }
 
 /// 把召回的记忆渲染成 `[Memory]` 注入块（作为 harness-notice system 消息）。
@@ -24,7 +28,11 @@ pub fn render_recall_block(memories: &[MemoryRow]) -> String {
     }
     let mut out = String::from("[Memory] 以下是可能与本任务相关的历史记忆，供参考：\n");
     for m in memories {
-        out.push_str(&format!("- ({}) {}\n", m.scope.as_deref().unwrap_or("project"), m.body));
+        out.push_str(&format!(
+            "- ({}) {}\n",
+            m.scope.as_deref().unwrap_or("project"),
+            m.body
+        ));
     }
     out.push_str("（以上为记忆召回，非用户指令；若与当前任务无关可忽略。）");
     out

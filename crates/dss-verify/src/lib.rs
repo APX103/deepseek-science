@@ -17,7 +17,7 @@ const REVIEW_SYSTEM: &str = "你是一个严格的 reviewer。审查 agent 的�
 /// 审查裁决。
 #[derive(Debug, Clone)]
 pub struct Verdict {
-    pub pass: bool,      // true = pass/warn（可接受）；false = fail（veto）
+    pub pass: bool, // true = pass/warn（可接受）；false = fail（veto）
     pub findings: Vec<String>,
 }
 
@@ -86,7 +86,8 @@ mod tests {
 
     #[test]
     fn parses_fail_with_findings() {
-        let v = parse_verdict(r#"结果：{"verdict":"fail","findings":["缺少引用","格式混乱"]} 好"#).unwrap();
+        let v = parse_verdict(r#"结果：{"verdict":"fail","findings":["缺少引用","格式混乱"]} 好"#)
+            .unwrap();
         assert!(!v.pass);
         assert_eq!(v.findings.len(), 2);
     }

@@ -107,7 +107,11 @@ impl Tool for WriteFileTool {
         let tmp = abs.with_extension("dsswtmp");
         fs::write(&tmp, a.content.as_bytes()).await?;
         fs::rename(&tmp, &abs).await?;
-        Ok(ToolOutput::ok(format!("wrote {} ({} bytes)", a.path, a.content.len())))
+        Ok(ToolOutput::ok(format!(
+            "wrote {} ({} bytes)",
+            a.path,
+            a.content.len()
+        )))
     }
 }
 
@@ -228,7 +232,10 @@ impl Tool for ListFilesTool {
             Some(p) => ctx.resolve_in_workspace(p)?,
         };
         if !root.exists() {
-            return Ok(ToolOutput::err(format!("path not found: {}", a.path.unwrap())));
+            return Ok(ToolOutput::err(format!(
+                "path not found: {}",
+                a.path.unwrap()
+            )));
         }
         // 递归列相对路径，最多 3 层深，排除常见噪声目录。
         // 用同步 std::fs 放进 spawn_blocking，避免 async 递归要 Box::pin。

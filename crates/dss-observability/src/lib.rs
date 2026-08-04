@@ -35,7 +35,10 @@ impl LogStore {
 
     /// 写一条日志（异步、conn.interact）。
     pub async fn append(&self, entry: LogEntry) -> Result<i64, DbError> {
-        let detail_str = entry.detail.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default());
+        let detail_str = entry
+            .detail
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
         let conn = self.pool.get().await.map_err(DbError::Pool)?;
         conn.interact(move |c| {
             dss_db::repo::append_log(
@@ -54,10 +57,7 @@ impl LogStore {
         .map_err(|e| DbError::Other(format!("log append interact: {e:?}")))?
     }
 
-    pub async fn list(
-        &self,
-        f: dss_db::repo::LogFilter,
-    ) -> Result<(Vec<LogRow>, i64), DbError> {
+    pub async fn list(&self, f: dss_db::repo::LogFilter) -> Result<(Vec<LogRow>, i64), DbError> {
         let conn = self.pool.get().await.map_err(DbError::Pool)?;
         conn.interact(move |c| dss_db::repo::list_logs(c, &f))
             .await

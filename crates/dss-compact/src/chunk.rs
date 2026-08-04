@@ -96,7 +96,11 @@ pub fn pick_next_chunk(
         }
     }
     // 不到 MIN_CHUNK_TOKENS：P4a 仍返回这段（调用方按 chunk_tokens < MIN_CHUNK_TOKENS 不触发）。
-    if end > start { Some((start, end)) } else { None }
+    if end > start {
+        Some((start, end))
+    } else {
+        None
+    }
 }
 
 /// 第一个未被任何 fold 覆盖的日志索引。
@@ -152,7 +156,12 @@ mod tests {
             msgs.push(big_msg(5000));
         }
         let mut st = CompactionState::new();
-        st.record_fold(Fold { start_idx: 0, end_idx: 3, summary: "s".into(), level: 1 });
+        st.record_fold(Fold {
+            start_idx: 0,
+            end_idx: 3,
+            summary: "s".into(),
+            level: 1,
+        });
         st.l1_summary_count = 3;
         // head：3 条 5000 token = 15000，但 head_floor=56000 → 不触发
         assert!(!should_trigger_l2(&msgs, &st, cw));
@@ -167,7 +176,12 @@ mod tests {
     fn pick_next_chunk_respects_existing_folds() {
         let msgs = vec![big_msg(5000), big_msg(5000), big_msg(5000)];
         let mut st = CompactionState::new();
-        st.record_fold(Fold { start_idx: 0, end_idx: 1, summary: "s".into(), level: 1 });
+        st.record_fold(Fold {
+            start_idx: 0,
+            end_idx: 1,
+            summary: "s".into(),
+            level: 1,
+        });
         let (s, e) = pick_next_chunk(&msgs, &st).unwrap();
         assert_eq!(s, 1);
         assert!(e >= 2);

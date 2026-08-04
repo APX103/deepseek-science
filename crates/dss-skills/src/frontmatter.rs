@@ -27,7 +27,9 @@ pub fn parse_skill(content: &str, source: &str) -> Option<Skill> {
     }
     let content = content.trim_start_matches('\u{feff}');
     // 必须以 `---` 起始。
-    let after = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n"))?;
+    let after = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
     // 找闭合 `---`（独占一行）。
     let end = find_frontmatter_end(after)?;
     let fm = &after[..end];
@@ -115,7 +117,8 @@ mod tests {
     #[test]
     fn skips_indented_metadata_block() {
         // 缩进的 metadata 块里的 name 不应遮蔽顶层 name。
-        let md = "---\nname: top\nmetadata:\n  name: should-be-ignored\ndescription: d\n---\nbody\n";
+        let md =
+            "---\nname: top\nmetadata:\n  name: should-be-ignored\ndescription: d\n---\nbody\n";
         let s = parse_skill(md, "test").expect("parse");
         assert_eq!(s.name, "top");
     }

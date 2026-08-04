@@ -62,7 +62,12 @@ pub async fn maybe_compact(
             Ok(s) if !s.trim().is_empty() => s,
             _ => break,
         };
-        state.record_fold(Fold { start_idx: start, end_idx: end, summary, level: 1 });
+        state.record_fold(Fold {
+            start_idx: start,
+            end_idx: end,
+            summary,
+            level: 1,
+        });
         folds_added += 1;
     }
 
@@ -92,13 +97,19 @@ mod lib_tests {
     struct NoLlm;
     #[async_trait::async_trait]
     impl LlmClient for NoLlm {
-        async fn chat(&self, _: dss_llm::ChatRequest) -> Result<dss_llm::LlmResponse, dss_llm::LlmError> {
-            Err(dss_llm::LlmError::NotConfigured("NoLlm should not be called".into()))
+        async fn chat(
+            &self,
+            _: dss_llm::ChatRequest,
+        ) -> Result<dss_llm::LlmResponse, dss_llm::LlmError> {
+            Err(dss_llm::LlmError::NotConfigured(
+                "NoLlm should not be called".into(),
+            ))
         }
         fn chat_stream(
             &self,
             _: dss_llm::ChatRequest,
-        ) -> futures::future::BoxFuture<'_, Result<dss_llm::BoxedEventStream, dss_llm::LlmError>> {
+        ) -> futures::future::BoxFuture<'_, Result<dss_llm::BoxedEventStream, dss_llm::LlmError>>
+        {
             Box::pin(async { Err(dss_llm::LlmError::NotConfigured("NoLlm no stream".into())) })
         }
         fn model(&self) -> &str {

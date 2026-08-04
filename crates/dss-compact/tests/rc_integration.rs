@@ -45,14 +45,20 @@ async fn maybe_compact_folds_l1_and_projection_shrinks() {
     let log_len_before = messages.len();
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let llm = FakeLlm { calls: calls.clone(), summary_text: "SUMMARY".into() };
+    let llm = FakeLlm {
+        calls: calls.clone(),
+        summary_text: "SUMMARY".into(),
+    };
 
     let mut state = CompactionState::new();
     let outcome = maybe_compact(&messages, &mut state, &llm, "fake-llm", cw).await;
 
     // 应触发至少 1 次 fold（调用了 summarize）。
     assert!(outcome.folded, "expected at least one L1 fold");
-    assert!(calls.load(Ordering::Relaxed) >= 1, "summarizer should be called");
+    assert!(
+        calls.load(Ordering::Relaxed) >= 1,
+        "summarizer should be called"
+    );
 
     // append-only：日志长度不变。
     assert_eq!(messages.len(), log_len_before);
@@ -79,7 +85,10 @@ async fn short_conversation_does_not_call_llm() {
     // 短对话：未过触发阈值 → 不调 LLM、不 fold。
     let messages = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
     let calls = Arc::new(AtomicUsize::new(0));
-    let llm = FakeLlm { calls: calls.clone(), summary_text: "S".into() };
+    let llm = FakeLlm {
+        calls: calls.clone(),
+        summary_text: "S".into(),
+    };
     let mut state = CompactionState::new();
     let outcome = maybe_compact(&messages, &mut state, &llm, "fake-llm", 500_000).await;
     assert!(!outcome.folded);

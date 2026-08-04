@@ -6,7 +6,7 @@
 pub mod client;
 pub mod manager;
 
-pub use client::{McpError, MCPClient, McpTool};
+pub use client::{MCPClient, McpError, McpTool};
 pub use manager::{MCPServerManager, ServerInfo};
 
 /// 动态挂载的工具名：mcp__{server}__{tool}。

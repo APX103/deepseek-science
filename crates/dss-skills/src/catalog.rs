@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::bm25;
 use crate::frontmatter::parse_skill;
 use crate::skill::{Skill, SkillHit};
-use crate::bm25;
 
 /// 嵌入的内置 skills（编译期打进二进制）。
 static BUILTIN_SKILLS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/skills");
@@ -22,7 +22,9 @@ pub struct SkillCatalog {
 
 impl SkillCatalog {
     pub fn new() -> Self {
-        Self { skills: HashMap::new() }
+        Self {
+            skills: HashMap::new(),
+        }
     }
 
     /// 从一个源目录加载（递归找 SKILL.md）。
@@ -74,12 +76,20 @@ impl Default for SkillCatalog {
     }
 }
 
-fn load_builtin_recursive(dir: &include_dir::Dir, source: &'static str, out: &mut HashMap<String, Skill>) {
+fn load_builtin_recursive(
+    dir: &include_dir::Dir,
+    source: &'static str,
+    out: &mut HashMap<String, Skill>,
+) {
     for entry in dir.entries() {
         match entry {
             include_dir::DirEntry::Dir(d) => load_builtin_recursive(d, source, out),
             include_dir::DirEntry::File(f) => {
-                if f.path().file_name().map(|n| n == "SKILL.md").unwrap_or(false) {
+                if f.path()
+                    .file_name()
+                    .map(|n| n == "SKILL.md")
+                    .unwrap_or(false)
+                {
                     if let Ok(content) = std::str::from_utf8(f.contents()) {
                         if let Some(skill) = parse_skill(content, source) {
                             out.insert(skill.name.clone(), skill);

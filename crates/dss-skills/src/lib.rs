@@ -7,5 +7,7 @@ pub mod catalog;
 pub mod frontmatter;
 pub mod skill;
 
-pub use catalog::{global_skills_dir, project_skills_dir, render_skill_body, seed_builtin_to_global, SkillCatalog};
+pub use catalog::{
+    global_skills_dir, project_skills_dir, render_skill_body, seed_builtin_to_global, SkillCatalog,
+};
 pub use skill::{Skill, SkillHit};

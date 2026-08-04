@@ -9,8 +9,7 @@ use crate::constants::{
 };
 use dss_llm::{ChatMessage, ChatRequest, LlmClient, LlmError};
 
-const SUMMARY_SYSTEM: &str =
-    "你是一个上下文压缩助手。把下面这段对话历史压缩成一段紧凑的摘要，\
+const SUMMARY_SYSTEM: &str = "你是一个上下文压缩助手。把下面这段对话历史压缩成一段紧凑的摘要，\
      保留：用户意图、已做的关键决策、工具调用结果要点、未解决的问题、重要文件/数据引用。\
      不要编造，不要加新信息。直接输出摘要正文，不要解释。";
 
@@ -43,7 +42,13 @@ pub async fn summarize_chunk(
         let prompt = format!(
             "目标长度约 {target_chars} 字符。\n\n=== 待压缩历史 ===\n{body}\n=== 结束 ===\n\n请输出摘要："
         );
-        let req = ChatRequest::new(model, vec![ChatMessage::system(SUMMARY_SYSTEM), ChatMessage::user(&prompt)]);
+        let req = ChatRequest::new(
+            model,
+            vec![
+                ChatMessage::system(SUMMARY_SYSTEM),
+                ChatMessage::user(&prompt),
+            ],
+        );
         let resp = llm.chat(req).await?;
         let candidate = resp.text;
         let candidate_chars = candidate.chars().count();

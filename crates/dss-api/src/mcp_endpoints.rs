@@ -25,10 +25,7 @@ struct McpToolItem {
 }
 
 /// `GET /api/mcp/{name}/tools`。
-pub async fn mcp_tools(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Json<Value> {
+pub async fn mcp_tools(State(state): State<AppState>, Path(name): Path<String>) -> Json<Value> {
     match state.mcp.server_info(&name).await {
         Some(info) => Json(serde_json::json!({
             "name": info.name,

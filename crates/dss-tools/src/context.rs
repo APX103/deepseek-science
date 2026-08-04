@@ -98,6 +98,12 @@ impl ToolContext {
         self
     }
 
+    /// 注入已有的 plan 状态（P6：跨 run 恢复/同步）。
+    pub fn with_plan(self, plan: Option<PlanState>) -> Self {
+        *self.plan.blocking_lock() = plan;
+        self
+    }
+
     /// 把相对 path 解析到 workspace 内的绝对路径，做路径穿越防护。
     /// 返回 Err 表示逃逸 workspace。
     pub fn resolve_in_workspace(&self, rel: &str) -> Result<PathBuf, crate::error::ToolError> {
