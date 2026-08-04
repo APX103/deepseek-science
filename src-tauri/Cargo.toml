@@ -1,0 +1,21 @@
+[package]
+name = "deepseek-science"
+version = "0.1.0"
+description = "Deepseek Science - 本地优先的科研 AI 工作台"
+authors = ["DSS"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+# 保持 Tauri 应用独立于主 workspace（它有自己的依赖树）。
+[workspace]

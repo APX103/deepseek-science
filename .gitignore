@@ -1,5 +1,7 @@
 # Rust
 /target
+/src-tauri/target
+/src-tauri/gen
 **/*.rs.bk
 
 # Node / 前端
