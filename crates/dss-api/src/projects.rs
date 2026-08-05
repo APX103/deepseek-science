@@ -48,6 +48,8 @@ pub struct CreateProjectReq {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    agent_context: Option<String>,
 }
 
 /// `POST /api/projects`：建项目 proj_<8hex>。
@@ -55,7 +57,7 @@ pub async fn create_project(
     State(state): State<AppState>,
     Json(req): Json<CreateProjectReq>,
 ) -> Result<(StatusCode, Json<dss_db::repo::ProjectRow>), (StatusCode, Json<Value>)> {
-    let row = dbq::create_project(&state.db, req.name, req.description)
+    let row = dbq::create_project(&state.db, req.name, req.description, req.agent_context)
         .await
         .map_err(map_db_err)?;
     Ok((StatusCode::CREATED, Json(row)))
@@ -67,6 +69,8 @@ pub struct PatchProjectReq {
     name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    agent_context: Option<String>,
     #[serde(default)]
     last_session_id: Option<String>,
 }
@@ -82,6 +86,7 @@ pub async fn patch_project(
         pid,
         req.name,
         req.description,
+        req.agent_context,
         req.last_session_id,
     )
     .await

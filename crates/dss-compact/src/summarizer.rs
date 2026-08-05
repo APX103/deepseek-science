@@ -50,7 +50,9 @@ pub async fn summarize_chunk(
             ],
         );
         let resp = llm.chat(req).await?;
-        let candidate = resp.text;
+        // OUTPUT_CEILING is a local invariant, not merely a prompt suggestion: providers can
+        // ignore requested lengths, and an oversized summary would defeat hard-wall compaction.
+        let candidate: String = resp.text.chars().take(OUTPUT_CEILING).collect();
         let candidate_chars = candidate.chars().count();
         // 更新 best（取较长者，作为退化回退点）。
         match &best {

@@ -346,6 +346,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dss-a2a"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "chrono",
+ "dss-core",
+ "futures",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "dss-agent"
 version = "0.1.0"
 dependencies = [
@@ -371,6 +389,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "dss-a2a",
  "dss-agent",
  "dss-compact",
  "dss-core",
@@ -388,6 +407,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower-http",
  "tracing",
  "uuid",
@@ -398,9 +418,13 @@ name = "dss-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "dss-api",
  "dss-core",
+ "dss-llm",
+ "libc",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -528,10 +552,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dss-a2a",
  "dss-core",
  "dss-llm",
  "dss-mcp",
  "dss-skills",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,11 +1,14 @@
 // 中间对话流：空态欢迎区 / 消息流 + 失败横幅 + 流式渲染区 + 底部输入框。
 // 发送走 store 流式 buffer（connectSSE 由 WorkbenchPage 接线）；离线时输入框禁用。
-import { useMemo, useState } from 'react'
-import type { ContentBlock, Message } from '../../types'
+import { useEffect, useRef, useState } from 'react'
+import type { ContentBlock, Message, Plan, SessionRun } from '../../types'
 import type { StreamBuffer } from '../../store'
 import { useApp } from '../../App'
+import { planStatusLabel } from '../../api/planExecution'
+import { sanitizeAssistantDisplayText } from '../../api/assistantProtocol'
+import AgentMarkdown from './AgentMarkdown'
 import ToolCallCard from './ToolCallCard'
-import { IconBook, IconChevronRight, IconPlus, IconRefresh, IconSend, IconStop } from '../icons'
+import { IconChevronRight, IconSend, IconStop } from '../icons'
 
 interface Props {
   messages: Message[]
@@ -13,6 +16,15 @@ interface Props {
   failed?: boolean
   /** 当前会话的流式 buffer（无则为 undefined） */
   stream?: StreamBuffer
+  plan: Plan | null
+  awaitingPlan: boolean
+  canExecutePlan: boolean
+  approvingPlan: boolean
+  planError?: string | null
+  planMode: boolean
+  onPlanModeChange: (enabled: boolean) => void
+  onApprovePlan: () => void
+  onExecutePlan: () => void
   onSend: (text: string) => void
   onStop: () => void
 }
@@ -20,19 +32,55 @@ interface Props {
 type ToolUse = Extract<ContentBlock, { type: 'tool_use' }>
 type ToolResult = Extract<ContentBlock, { type: 'tool_result' }>
 
-export default function ChatArea({ messages, failed, stream, onSend, onStop }: Props) {
+export default function ChatArea({
+  messages,
+  failed,
+  stream,
+  plan,
+  awaitingPlan,
+  canExecutePlan,
+  approvingPlan,
+  planError,
+  planMode,
+  onPlanModeChange,
+  onApprovePlan,
+  onExecutePlan,
+  onSend,
+  onStop,
+}: Props) {
   const running = stream?.running ?? false
+  const stopping = stream?.stopping ?? false
+  const hasPersistedFailure = hasPersistedRunFailure(messages)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const followTailRef = useRef(true)
 
-  if (messages.length === 0 && !stream) {
+  useEffect(() => {
+    if (!followTailRef.current) return
+    const frame = window.requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ block: 'end' })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [messages.length, stream?.thinking.length, stream?.text.length, stream?.toolCalls.length])
+
+  if (messages.length === 0 && !stream && !awaitingPlan) {
     // 新会话空态：居中欢迎区 + 大输入框
     return (
       <div className="flex min-w-0 flex-1 flex-col items-center justify-center px-6">
         <h1 className="text-[20px] font-semibold text-ink">有什么可以帮你？</h1>
         <div className="mt-6 w-full max-w-xl">
-          <Composer large running={running} onSend={onSend} onStop={onStop} />
+          <Composer
+            large
+            running={running}
+            stopping={stopping}
+            planMode={planMode}
+            onPlanModeChange={onPlanModeChange}
+            onSend={onSend}
+            onStop={onStop}
+          />
           <BackendHint />
         </div>
-        <p className="mt-3 text-[12px] text-ink3">@ for artifacts · # for sessions · / for skills · ⌘K to search</p>
+        <p className="mt-3 text-[12px] text-ink3">可开启 Plan，让 Agent 先提交研究计划供你批准。</p>
       </div>
     )
   }
@@ -40,16 +88,28 @@ export default function ChatArea({ messages, failed, stream, onSend, onStop }: P
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       {/* 消息流 */}
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-y-auto"
+        onScroll={() => {
+          const element = scrollRef.current
+          if (!element) return
+          followTailRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96
+        }}
+      >
         <div className="mx-auto max-w-2xl space-y-4 px-6 py-6">
           {messages.map((m, i) => (
-            <MessageView key={i} message={m} />
+            <MessageView
+              key={`${m.source_run_id ?? 'live'}:${m.source_seq ?? i}`}
+              message={m}
+            />
           ))}
 
-          {/* 流式渲染区：thinking 折叠块 + 工具卡片 + text 打字机 */}
-          {stream && (stream.running || stream.stopped) && (
+          {/* 当前 iteration；已完成的迭代已按真实顺序提交到 messages。 */}
+          {stream?.running && (
             <div className="space-y-2">
               {stream.thinking && <ThinkingBlock text={stream.thinking} running={stream.running} />}
+              {stream.text && <AgentMarkdown content={stream.text} />}
               {stream.toolCalls.map((c) => (
                 <ToolCallCard
                   key={c.id}
@@ -61,55 +121,43 @@ export default function ChatArea({ messages, failed, stream, onSend, onStop }: P
                   }
                 />
               ))}
-              {stream.text && <p className="whitespace-pre-wrap text-[13px] leading-[1.6] text-ink">{stream.text}</p>}
               {stream.running && !stream.thinking && !stream.text && stream.toolCalls.length === 0 && (
-                <p className="text-[12px] text-ink3">思考中…</p>
+                <p className="text-[12px] text-ink3">{stream.stopping ? '停止中…' : '思考中…'}</p>
               )}
-              {stream.stopped && <p className="text-[11px] text-ink3">已停止</p>}
             </div>
           )}
 
-          {/* ask_user 阻塞面板：run 挂起等用户回复 */}
-          {stream && !stream.running && stream.kind === 'awaiting' && stream.pendingAsk && (
-            <AskUserPanel ask={stream.pendingAsk} />
+          {plan && (
+            <PlanPanel
+              plan={plan}
+              awaitingApproval={awaitingPlan}
+              executionReady={canExecutePlan}
+              running={running}
+              approving={approvingPlan}
+              error={planError}
+              onApprove={onApprovePlan}
+              onExecute={onExecutePlan}
+            />
           )}
 
-          {/* 流式错误横幅（沿用 Agent Failed 样式） */}
-          {stream?.error && <ErrorBanner message={stream.error} />}
-
-          {/* complete 后的 usage 行 */}
-          {stream && !stream.running && !stream.error && stream.usage && (
-            <p className="text-[11px] text-ink3">
-              tokens: {stream.usage.input_tokens} in / {stream.usage.output_tokens} out · {stream.iterations}{' '}
-              iteration{stream.iterations > 1 ? 's' : ''}
-            </p>
+          {failed && !hasPersistedFailure && !stream?.running && (
+            <ErrorBanner message="该会话执行失败。请检查后端日志或修改输入后重新发送。" />
           )}
-
-          {failed && (
-            <>
-              <ErrorBanner message={`400 {"error":{"message":"The input you provided is invalid","type":"input_invalid"}}`} />
-
-              {/* This session was interrupted */}
-              <div className="flex items-center justify-between rounded-md border border-border bg-surface px-3 py-2">
-                <span className="text-[12px] text-ink2">This session was interrupted.</span>
-                <button className="btn-outline py-1 text-[12px]">
-                  <IconRefresh width={12} height={12} /> Resume
-                </button>
-              </div>
-
-              {/* Notebook 条 */}
-              <button className="flex w-full items-center gap-2 rounded-md border border-border bg-surface px-3 py-2 text-[12px] text-ink2 hover:bg-surface2">
-                <IconBook width={13} height={13} /> Notebook
-              </button>
-            </>
-          )}
+          <div ref={bottomRef} aria-hidden="true" />
         </div>
       </div>
 
       {/* 底部输入框 */}
       <div className="shrink-0 border-t border-border px-6 py-3">
         <div className="mx-auto max-w-2xl">
-          <Composer running={running} onSend={onSend} onStop={onStop} />
+          <Composer
+            running={running}
+            stopping={stopping}
+            planMode={planMode}
+            onPlanModeChange={onPlanModeChange}
+            onSend={onSend}
+            onStop={onStop}
+          />
           <BackendHint />
         </div>
       </div>
@@ -117,7 +165,7 @@ export default function ChatArea({ messages, failed, stream, onSend, onStop }: P
   )
 }
 
-/** Agent Failed 红条（mock 失败横幅与流式 error 事件共用）。 */
+/** Agent Failed 红条（流式或持久化失败态共用）。 */
 function ErrorBanner({ message }: { message: string }) {
   return (
     <div className="rounded-md border border-danger/30 bg-dangerSoft p-3">
@@ -152,9 +200,77 @@ function AskUserPanel({ ask }: { ask: import('../../types').PendingAsk }) {
   )
 }
 
+function PlanPanel({
+  plan,
+  awaitingApproval,
+  executionReady,
+  running,
+  approving,
+  error,
+  onApprove,
+  onExecute,
+}: {
+  plan: Plan
+  awaitingApproval: boolean
+  executionReady: boolean
+  running: boolean
+  approving: boolean
+  error?: string | null
+  onApprove: () => void
+  onExecute: () => void
+}) {
+  return (
+    <section className="rounded-md border border-brand/40 bg-brandSoft p-3" aria-label="Research plan">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-[13px] font-medium text-ink">研究计划</h2>
+        <span className="text-[11px] text-brand">
+          {planStatusLabel(plan, awaitingApproval, running)}
+        </span>
+      </div>
+      <ol className="mt-2 space-y-1.5">
+        {plan.steps.map((step, index) => (
+          <li key={`${index}:${step.title}`} className="flex items-start gap-2 text-[12px] text-ink2">
+            <span
+              className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
+                step.status === 'failed'
+                  ? 'bg-danger'
+                  : step.status === 'done'
+                    ? 'bg-success'
+                    : step.status === 'running'
+                      ? 'bg-brand'
+                      : 'bg-ink3'
+              }`}
+            />
+            <span className="min-w-0 flex-1 whitespace-pre-wrap">{step.title}</span>
+            <span className="shrink-0 text-[10px] text-ink3">{step.status}</span>
+          </li>
+        ))}
+      </ol>
+      {awaitingApproval && !plan.approved && (
+        <div className="mt-3 border-t border-brand/20 pt-3">
+          <p className="text-[11px] text-ink2">批准后，Agent 会按此计划立即开始执行。</p>
+          <button className="btn-primary mt-2" disabled={approving} onClick={onApprove}>
+            {approving ? '批准中…' : '批准并执行'}
+          </button>
+        </div>
+      )}
+      {executionReady && (
+        <div className="mt-3 border-t border-brand/20 pt-3">
+          <p className="text-[11px] text-ink2">计划已安全保存。若上次启动失败，可从这里继续。</p>
+          <button className="btn-primary mt-2" onClick={onExecute}>
+            执行计划/重试
+          </button>
+        </div>
+      )}
+      {error && <p className="mt-2 text-[11px] text-danger">{error}</p>}
+    </section>
+  )
+}
+
 /** thinking 增量：可折叠块，默认收起。 */
-function ThinkingBlock({ text, running }: { text: string; running: boolean }) {
+export function ThinkingBlock({ text, running }: { text: string; running: boolean }) {
   const [open, setOpen] = useState(false)
+  const displayText = sanitizeAssistantDisplayText(text)
   return (
     <div className="rounded-md border border-border bg-surface">
       <button
@@ -166,7 +282,7 @@ function ThinkingBlock({ text, running }: { text: string; running: boolean }) {
       </button>
       {open && (
         <div className="max-h-64 overflow-y-auto whitespace-pre-wrap border-t border-border px-3 py-2 text-[12px] leading-relaxed text-ink2">
-          {text}
+          {displayText}
         </div>
       )}
     </div>
@@ -193,11 +309,14 @@ function BackendHint() {
 interface ComposerProps {
   large?: boolean
   running: boolean
+  stopping: boolean
+  planMode: boolean
+  onPlanModeChange: (enabled: boolean) => void
   onSend: (text: string) => void
   onStop: () => void
 }
 
-function Composer({ large, running, onSend, onStop }: ComposerProps) {
+function Composer({ large, running, stopping, planMode, onPlanModeChange, onSend, onStop }: ComposerProps) {
   const { backend } = useApp()
   const [value, setValue] = useState('')
   const ready = backend.online && backend.llmConfigured
@@ -222,18 +341,31 @@ function Composer({ large, running, onSend, onStop }: ComposerProps) {
           }
         }}
         placeholder={
-          ready ? 'Ask anything — @ for artifacts, # for sessions, / for skills, ⌘K to search…' : '后端未连接…'
+          ready ? '描述你的科研问题、数据和期望产物…' : '后端未连接…'
         }
         className="w-full resize-none bg-transparent px-3 pt-2.5 text-[13px] outline-none placeholder:text-ink3 disabled:opacity-50"
       />
       <div className="flex items-center gap-1 px-2 pb-2">
-        <button className="btn-ghost rounded p-1.5" title="添加（TODO）">
-          <IconPlus width={14} height={14} />
-        </button>
         <div className="ml-auto flex items-center gap-2">
-          <button className="btn-ghost py-1 text-[12px]">Default</button>
+          <button
+            type="button"
+            className={`rounded px-2 py-1 text-[12px] ${
+              planMode ? 'bg-brandSoft font-medium text-brand' : 'btn-ghost'
+            }`}
+            aria-pressed={planMode}
+            disabled={running}
+            title="先生成研究计划，批准后再执行"
+            onClick={() => onPlanModeChange(!planMode)}
+          >
+            {planMode ? 'Plan on' : 'Plan off'}
+          </button>
           {running ? (
-            <button className="btn-outline rounded p-1.5" title="停止" onClick={onStop}>
+            <button
+              className="btn-outline rounded p-1.5 disabled:opacity-40"
+              title={stopping ? '正在停止' : '停止'}
+              disabled={stopping}
+              onClick={onStop}
+            >
               <IconStop width={13} height={13} />
             </button>
           ) : (
@@ -255,36 +387,111 @@ function Composer({ large, running, onSend, onStop }: ComposerProps) {
 function MessageView({ message }: { message: Message }) {
   if (message.role === 'user') {
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-lg bg-brandSoft px-3.5 py-2 text-[13px] text-ink">
-          {typeof message.content === 'string' ? message.content : null}
+      <div className="space-y-2">
+        <div className="flex justify-end">
+          <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-brandSoft px-3.5 py-2 text-[13px] text-ink">
+            {typeof message.content === 'string' ? message.content : null}
+          </div>
         </div>
+        {message.run && <RunFooter run={message.run} />}
       </div>
     )
   }
 
-  const blocks = useMemo(() => (typeof message.content === 'string' ? null : pairTools(message.content)), [message])
+  const blocks = typeof message.content === 'string' ? null : pairTools(message.content)
 
   if (!blocks) {
-    return <div className="text-[13px] text-ink">{message.content as string}</div>
+    return (
+      <div>
+        <AgentMarkdown content={message.content as string} />
+        {message.run ? <RunFooter run={message.run} /> : message.usage && <MessageUsage usage={message.usage} />}
+      </div>
+    )
   }
 
   return (
     <div className="space-y-2">
       {blocks.map((b, i) => {
         if (b.kind === 'text') {
-          return (
-            <p key={i} className="text-[13px] leading-[1.6] text-ink">
-              {b.text}
-            </p>
-          )
+          return <AgentMarkdown key={i} content={b.text} />
         }
         if (b.kind === 'thinking') {
           return <ThinkingBlock key={i} text={b.text} running={false} />
         }
         return <ToolCallCard key={b.call.id} call={b.call} result={b.result} />
       })}
+      {message.run ? <RunFooter run={message.run} /> : message.usage && <MessageUsage usage={message.usage} />}
     </div>
+  )
+}
+
+function MessageUsage({ usage }: { usage: NonNullable<Message['usage']> }) {
+  return (
+    <p className="mt-1 text-[10px] text-ink3">
+      tokens: {usage.input_tokens} in / {usage.output_tokens} out
+    </p>
+  )
+}
+
+export function RunFooter({ run }: { run: SessionRun }) {
+  if (run.kind === 'max_iters') {
+    const detail = run.error ? `\n详细信息：${run.error}` : ''
+    return (
+      <div className="space-y-1.5">
+        <ErrorBanner message={`执行预算已耗尽，以上输出可能不完整。${detail}`} />
+        <RunMetrics run={run} />
+      </div>
+    )
+  }
+  if (run.status === 'failed' || run.kind === 'error' || run.error) {
+    return (
+      <div className="space-y-1.5">
+        <ErrorBanner message={run.error ?? 'Agent 执行失败，后端未返回详细原因。'} />
+        <RunMetrics run={run} />
+      </div>
+    )
+  }
+  if (run.kind === 'awaiting' && run.pending_ask) {
+    return (
+      <div className="space-y-1.5">
+        <AskUserPanel ask={run.pending_ask} />
+        <RunMetrics run={run} />
+      </div>
+    )
+  }
+  return <RunMetrics run={run} />
+}
+
+function RunMetrics({ run }: { run: SessionRun }) {
+  const status =
+    run.kind === 'max_iters'
+      ? '达到迭代上限'
+      : run.status === 'failed' || run.kind === 'error' || run.error
+        ? '执行失败'
+        : run.kind === 'cancelled'
+          ? '已停止'
+          : run.kind === 'awaiting'
+            ? run.awaiting === 'plan_approval'
+              ? '等待计划批准'
+              : run.awaiting === 'plan_execution'
+                ? '等待执行计划'
+                : '等待你的回复'
+            : '已完成'
+  return (
+    <p className="mt-1 text-[10px] text-ink3" data-run-id={run.run_id} data-run-kind={run.kind}>
+      {status} · tokens: {run.usage.input_tokens} in / {run.usage.output_tokens} out ·{' '}
+      {run.iterations} iteration{run.iterations === 1 ? '' : 's'}
+    </p>
+  )
+}
+
+export function hasPersistedRunFailure(messages: Message[]): boolean {
+  return messages.some(
+    (message) =>
+      message.run?.status === 'failed' ||
+      message.run?.kind === 'error' ||
+      message.run?.kind === 'max_iters' ||
+      !!message.run?.error,
   )
 }
 

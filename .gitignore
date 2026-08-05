@@ -8,12 +8,46 @@
 frontend/node_modules
 frontend/dist
 frontend/.vite
+*.tsbuildinfo
+
+# Python 工具缓存（测试脚本使用 uv/ruff；源码脚本本身要入库）
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# 本地环境与凭据（示例文件允许入库）
+.env
+.env.*
+!.env.example
+!.env.*.example
+/settings.json
+/config.toml
+/.settings.json.*.tmp
 
 # 本地运行时数据（不入库；数据目录在 ~/.deepseek-science，但项目内若有同名也忽略）
 *.db
 *.db-shm
 *.db-wal
-workspaces/
+/workspaces/
+/logs/
+/trace/
+*.log
+/outputs/
+/.agent-log/
+
+# 测试覆盖率 / profiling 产物
+/coverage/
+frontend/coverage/
+htmlcov/
+.coverage
+.coverage.*
+lcov.info
+*.profraw
+*.profdata
 
 # 编辑器 / 系统
 .vscode/

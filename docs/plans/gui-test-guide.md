@@ -2,7 +2,31 @@
 
 > 本文档列出所有需要浏览器验证的前端功能点。后端均已 curl 验证、tsc build 通过,但浏览器渲染需人工/读图 agent 确认。
 >
-> **执行前准备**:起后端 `DEEPSEEK_API_KEY=$(grep api_key ~/.deepseek/config.toml | sed 's/.*= *"([^"]+)".*/\1/') ./target/debug/dss-backend serve --port 17896` + 前端 `cd frontend && bun run dev`(5173)。浏览器打开 `http://localhost:5173/`。
+> **强制数据隔离**：任何 GUI、真实模型、打包 App 或 Computer Use 验收都不得使用默认的
+> `~/.deepseek-science`。先创建一次性数据目录，并在整个后端/App 进程生命周期内显式设置
+> `DSS_DATA_DIR`。测试结束后只清理这个已记录的精确目录。禁止把验收会话写入生产 `Default`
+> 项目，也禁止通过抓取其他配置文件的方式在命令行暴露 API key。
+>
+> 开发模式示例：
+>
+> ```bash
+> DSS_TEST_DATA_DIR="$(mktemp -d /private/tmp/deepseek-science-gui.XXXXXX)"
+> chmod 700 "$DSS_TEST_DATA_DIR"
+> DSS_DATA_DIR="$DSS_TEST_DATA_DIR" ./target/debug/dss-backend serve --port 17896
+> ```
+>
+> 另一个终端运行 `cd frontend && bun run dev`，浏览器打开 `http://localhost:5173/`。需要真实模型时，
+> 只在这个隔离实例的 Settings 中配置。测试报告必须记录隔离目录，并在退出后确认其已清理。
+>
+> 打包 App 必须通过仓库的一次性隔离启动器运行；启动器会创建 0700 数据目录、可选地以
+> 0600 复制 settings、等待 App 退出、核对生产数据库哈希，并清理隔离目录：
+>
+> ```bash
+> ./scripts/launch-isolated-app-e2e.sh \
+>   --app "/absolute/path/Deepseek Science.app"
+> ```
+>
+> 真实模型验收可额外传入 `--settings /absolute/path/settings.json`；脚本不会打印凭据内容。
 
 ---
 

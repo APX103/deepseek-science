@@ -11,8 +11,14 @@ path = "src/main.rs"
 [dependencies]
 dss-core = { path = "../dss-core" }
 dss-api = { path = "../dss-api" }
+dss-llm = { path = "../dss-llm" }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

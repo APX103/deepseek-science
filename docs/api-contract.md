@@ -27,7 +27,45 @@
 | GET | `/api/health` | `{status:"ok", version}` |
 | GET | `/api/config` | 当前生效配置（llm_configured/model/base_url/context_window/has_mcp/mcp_count/api_keys_configured/default_workspace/host/port） |
 | GET | `/api/settings` | AppSettings（API key 已脱敏） |
-| POST | `/api/settings` | 合并保存 AppSettings（需 ≥1 启用的 provider） |
+| POST | `/api/settings` | 以 `revision` 做 CAS 后合并保存 AppSettings；陈旧快照返回 409 |
+
+`AppSettings.a2a_agents` 是最多 16 项的数组。每项可编辑字段为
+`id/name/endpoint/enabled/timeout_seconds/bearer_token?/clear_bearer_token?`；GET 只返回
+`bearer_token_masked`，绝不返回明文凭据。诊断字段为
+`status/last_error/last_refreshed_at/tool_name/card_summary`。保存使用与 LLM 相同的私密原子
+`settings.json` 事务并立即替换一个 LLM+A2A 运行时快照；已经开始的 run 继续使用旧快照。
+空 token 默认保留同 endpoint 的既有凭据，只有显式 `clear_bearer_token=true` 才清除；修改
+endpoint 时旧凭据绝不自动转发。GET 返回的 `revision` 必须原样带回 POST，防止两个设置窗口互相覆盖。
+
+### A2A client
+
+- 本应用只实现 client，不暴露 inbound A2A server。
+- 每个启用项在后续 run 中映射为一个稳定的 `a2a_agent_*` 工具；Plan mode 只看到能力目录，审批前仍由硬门禁止执行。
+- 保存时 best-effort 拉取 Agent Card；每次工具调用前必须再次对配置 origin 的
+  `/.well-known/agent-card.json` 做条件 GET。刷新失败时本次调用 fail closed。
+- 支持 A2A v1.0/v0.3 的 JSON-RPC 与 HTTP+JSON。动态工具显式区分：默认 `send`
+  （`SendMessage` 后在本次预算内轮询）、`submit`（只发送一次并立即返回/检查点远端非终态
+  Task handle）、`get_task`（只执行幂等 `GetTask`，绝不重放 Message）以及 `cancel_task`
+  （显式请求取消）。因此长任务可在另一轮、App 重启或按 session id 恢复后继续查询。
+  `INPUT_REQUIRED`/`AUTH_REQUIRED` 是可续接的 `task_interrupted`，不是完成或失败：本地工具结果
+  `is_error=false` 并保留 `task_id/context_id/state`；满足输入/认证要求后，用同一工具发送携带该
+  Task handle 的 follow-up Message 续接，单纯查看状态仍使用 `get_task`。旧版已落库的
+  `kind=task, success=false` 中断 envelope 会按标准 state 兼容识别。
+  每个 user run 最多允许一次发送 Message 的副作用；一旦该 run 已执行 `get_task/cancel_task`，只允许
+  对刚观察到的 `INPUT_REQUIRED/AUTH_REQUIRED` 使用相同 `task_id` 续接，禁止纠错循环另起新 Task。
+  网络结果不确定时同样不自动重试 Send，因为新的 message id 无法保证远端幂等。
+  工具结果只承诺保存客户端实际收到的全部完整响应，不声称重建轮询间隔内的服务端瞬时事件。
+- 工具结果 `content` 是 schema 为 `dss.a2a.tool-result.v1` 的 JSON：包括调用时 Card
+  快照、action、稳定 message/request id、按 `sequence` 排列的全部已接收 wire body、终态和警告。
+  这个 schema 是 Deepseek Science 的本地显示/持久化 envelope，不是 A2A wire 扩展，也不会发送给
+  远端。A2A v1 没有标准 thinking/tool-call 字段；客户端只展示远端实际返回的标准
+  Message/Task/TaskStatus/Artifact/Part 与完整原始 frame。
+- 远端 Card/输出是非可信外部数据；URL part 不自动抓取，Markdown 不执行 HTML。请求不跟随重定向，Card 声明的调用 URL 必须同源；响应受单项/总量和超时上限约束。
+- 一个工具批次交付后，assistant tool-call、全部配对结果、当前 plan/pending-ask 与 provisional run
+  元数据先在同一 SQLite 事务中增量检查点，再继续下一次 LLM 请求；最终状态在原 run 行上原子收口。
+  因此最终回答尚未生成时退出也可按 session id 恢复已经完成的 A2A 工具卡。长任务应优先
+  `submit`，让 Task handle 在第一次短调用返回时尽快落库；后续每个 `get_task` 结果继续作为独立工具卡
+  落库。单次 `send/get_task` 调用内部尚未返回的中间轮询帧不单独建事件流。
 
 ### 记忆
 | GET | `/api/memories?entity=` | 列记忆 |
@@ -48,12 +86,12 @@
 | POST | `/api/projects/{pid}/archive` | 软删（默认项目 400） |
 | POST | `/api/projects/{pid}/unarchive` | 恢复 |
 | DELETE | `/api/projects/{pid}?force=false` | 永久删（有 session 且非 force → 409） |
-| GET | `/api/projects/{pid}` | 项目详情 + 会话列表 |
+| GET | `/api/projects/{pid}` | 项目详情 + `discoverable=1` 的会话列表 |
 
 ### Sessions
-| GET | `/api/sessions` | 会话列表（带 `live: bool`） |
+| GET | `/api/sessions` | 可发现会话列表（带 `live: bool`；排除 archived project 和 `discoverable=0`） |
 | POST | `/api/sessions` | 建会话（sid=`uuid4()[:12]`，复制模板 `template.tex`→`main.tex`，返回 `{id, frame_id, mcp_tools, model, workspace}`） |
-| GET | `/api/sessions/{sid}` | 会话状态（live 走内存，否则从 DB 恢复） |
+| GET | `/api/sessions/{sid}` | 按精确 ID 取会话状态（含 `discoverable=0`；live 走内存，否则从 DB 恢复） |
 | DELETE | `/api/sessions/{sid}` | 删会话（DB + workspace + MCP 清理） |
 
 ### Files
@@ -130,6 +168,9 @@
 - `{type:"text", text}`
 - `{type:"tool_use", id, name, input}`
 - `{type:"tool_result", tool_use_id, content, is_error}`
+
+A2A 不另建一条不可恢复的 UI 数据通道。其版本化 JSON 原样存放在上述
+`tool_result.content`，所以实时 SSE 和按 session id 恢复使用同一份 canonical 数据；前端只做专用呈现，未知 schema 退回通用工具卡。
 
 ### harness_notice 持久化与往返（关键）
 

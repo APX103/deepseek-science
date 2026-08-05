@@ -1,7 +1,6 @@
-// Skills 设置弹层：左侧导航（Capabilities / Workspace），右侧 skill 开关列表。纯前端态。
-import { useState } from 'react'
+// Skills 设置弹层：skill 列表来自后端；开关仅为当前弹窗的临时状态。
+import { useEffect, useState } from 'react'
 import { listSkills } from '../api/client'
-import { mockSkills } from '../mock/data'
 import type { Skill } from '../types'
 import Modal from './Modal'
 import Toggle from './Toggle'
@@ -44,14 +43,25 @@ interface Props {
 
 export default function SkillsModal({ onClose }: Props) {
   const [nav, setNav] = useState('skills')
-  const [skills, setSkills] = useState<Skill[]>(() => {
-    // 第一版走 mock；接口形状即 listSkills()（TODO: 接后端后换 useEffect 拉取）
-    void listSkills
-    return mockSkills
-  })
+  const [skills, setSkills] = useState<Skill[] | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [q, setQ] = useState('')
 
-  const filtered = skills.filter((s) => s.name.toLowerCase().includes(q.trim().toLowerCase()))
+  const load = async () => {
+    setSkills(null)
+    setLoadError(null)
+    try {
+      setSkills(await listSkills())
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  const filtered = (skills ?? []).filter((s) => s.name.toLowerCase().includes(q.trim().toLowerCase()))
 
   return (
     <Modal onClose={onClose} width="max-w-2xl">
@@ -85,7 +95,7 @@ export default function SkillsModal({ onClose }: Props) {
           {nav === 'skills' ? (
             <>
               <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-                <span className="text-[13px] font-medium">All ({skills.length})</span>
+                <span className="text-[13px] font-medium">All ({skills?.length ?? '…'})</span>
                 <div className="ml-auto flex items-center gap-2 rounded-md border border-border px-2 py-1">
                   <IconSearch width={12} height={12} className="text-ink3" />
                   <input
@@ -96,28 +106,53 @@ export default function SkillsModal({ onClose }: Props) {
                   />
                   <kbd className="text-[11px] text-ink3">⌘K</kbd>
                 </div>
-                <button className="btn-primary">
+                <button className="btn-primary" disabled title="后端暂不支持从此处添加 skill">
                   <IconPlus width={12} height={12} /> Add skill
                 </button>
               </div>
+              <div className="border-b border-border bg-surface2 px-4 py-2 text-[11px] text-ink2">
+                开关仅在当前弹窗内临时生效；后端暂不支持保存启用状态，关闭弹窗后会恢复。
+              </div>
               <div className="flex-1 overflow-y-auto px-4 py-2">
                 <div className="py-1 text-[11px] font-medium text-ink3">Research skills</div>
-                <ul className="divide-y divide-border">
-                  {filtered.map((s) => (
-                    <li key={s.name} className="flex items-center gap-3 py-2.5">
-                      <div className="min-w-0 flex-1">
-                        <div className="text-[13px] font-medium text-ink">{s.name}</div>
-                        <div className="truncate text-[12px] text-ink2">{s.description}</div>
-                      </div>
-                      <Toggle
-                        checked={s.enabled}
-                        onChange={(v) =>
-                          setSkills((xs) => xs.map((x) => (x.name === s.name ? { ...x, enabled: v } : x)))
-                        }
-                      />
-                    </li>
-                  ))}
-                </ul>
+                {!skills && !loadError && (
+                  <div className="py-10 text-center text-[12px] text-ink3">加载中…</div>
+                )}
+                {loadError && (
+                  <div className="card space-y-3 p-4 text-[12px]">
+                    <p role="alert" className="text-danger">
+                      Skills 加载失败：{loadError}
+                    </p>
+                    <button className="btn-outline" onClick={() => void load()}>
+                      重试
+                    </button>
+                  </div>
+                )}
+                {skills && (
+                  <ul className="divide-y divide-border">
+                    {filtered.map((s) => (
+                      <li key={s.name} className="flex items-center gap-3 py-2.5">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[13px] font-medium text-ink">{s.name}</div>
+                          <div className="truncate text-[12px] text-ink2">{s.description}</div>
+                        </div>
+                        <Toggle
+                          checked={s.enabled}
+                          onChange={(v) =>
+                            setSkills((xs) =>
+                              xs?.map((x) => (x.name === s.name ? { ...x, enabled: v } : x)) ?? null,
+                            )
+                          }
+                        />
+                      </li>
+                    ))}
+                    {filtered.length === 0 && (
+                      <li className="py-10 text-center text-[12px] text-ink3">
+                        {skills.length === 0 ? '后端未发现可用 skill。' : '没有匹配的 skill。'}
+                      </li>
+                    )}
+                  </ul>
+                )}
               </div>
             </>
           ) : (

@@ -35,7 +35,7 @@ impl Tool for GeneratePlanTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "generate_plan".into(),
-            description: "Generate a step-by-step plan for the task. Use in plan mode. Each step has a title. After this, the run pauses for user approval before execution.".into(),
+            description: "Generate a concise, result-oriented plan for the task. Use in plan mode. Prefer 3-6 steps that preserve the user's constraints, include the smallest decisive validation and an explicit stop/verification step, and avoid cleanup-only work. After this, the run pauses for user approval before execution.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -79,7 +79,7 @@ impl Tool for UpdateStepStatusTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "update_step_status".into(),
-            description: "Update the status of a plan step by its 0-based index. status: pending|running|done|failed.".into(),
+            description: "Update the status of a plan step by its 0-based index. status: pending|running|done|failed. Mark done only after the supporting successful tool evidence is already in history; do not batch this call with the execution that is supposed to prove completion.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

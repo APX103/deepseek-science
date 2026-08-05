@@ -1,73 +1,100 @@
-// PDF 预览弹层：点 artifact 卡片打开。第一版用占位排版模拟 PDF 渲染（不接 pdfjs）。
+// PDF 预览弹层：鉴权读取当前会话 workspace 中的真实 PDF，再用临时 Blob URL 展示。
+import { useEffect, useState } from 'react'
+import { readFileBlob } from '../api/client'
 import type { Artifact } from '../types'
-import { IconDownload, IconX } from './icons'
+import { IconDownload, IconExpand, IconX } from './icons'
 
 interface Props {
+  sid: string
   artifact: Artifact
   onClose: () => void
 }
 
-export default function PdfPreviewModal({ artifact, onClose }: Props) {
+export default function PdfPreviewModal({ sid, artifact, onClose }: Props) {
+  const [src, setSrc] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const name = artifact.path.split('/').pop() || 'artifact.pdf'
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl: string | null = null
+    setSrc(null)
+    setError(null)
+
+    void readFileBlob(sid, artifact.path)
+      .then((blob) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setSrc(objectUrl)
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause))
+      })
+
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [artifact.path, sid])
+
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-bg" onMouseDown={onClose}>
-      {/* 顶栏 */}
       <div
         className="flex h-11 shrink-0 items-center gap-3 border-b border-border px-4"
-        onMouseDown={(e) => e.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
       >
-        <span className="font-mono text-[13px] text-ink2">{artifact.path}</span>
-        <span className="text-[12px] text-ink3">{(artifact.size / 1024).toFixed(0)} KB</span>
-        <div className="ml-auto flex items-center gap-1">
-          <button className="btn-ghost rounded p-1.5" title="下载（TODO）">
-            <IconDownload width={14} height={14} />
-          </button>
+        <span className="min-w-0 truncate font-mono text-[13px] text-ink2">{artifact.path}</span>
+        <span className="shrink-0 text-[12px] text-ink3">{formatSize(artifact.size)}</span>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {src ? (
+            <>
+              <a
+                href={src}
+                target="_blank"
+                rel="noreferrer"
+                className="btn-ghost rounded p-1.5"
+                title="在新窗口打开"
+                aria-label="在新窗口打开 PDF"
+              >
+                <IconExpand width={14} height={14} />
+              </a>
+              <a
+                href={src}
+                download={name}
+                className="btn-ghost rounded p-1.5"
+                title="下载 PDF"
+                aria-label="下载 PDF"
+              >
+                <IconDownload width={14} height={14} />
+              </a>
+            </>
+          ) : null}
           <button className="btn-ghost rounded p-1.5" onClick={onClose} aria-label="关闭">
             <IconX width={14} height={14} />
           </button>
         </div>
       </div>
 
-      {/* 页面区：灰底 + 白色纸张占位排版 */}
-      <div
-        className="flex flex-1 justify-center overflow-y-auto bg-surface py-8"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <div className="h-fit w-[640px] shrink-0 rounded-sm border border-border bg-bg px-14 py-12 shadow-subtle">
-          <h1 className="text-center text-[20px] font-semibold leading-[1.3]">
-            新型绿色无铅钙钛矿材料
-            <br />
-            在太阳电池领域的应用研究进展
-          </h1>
-          <p className="mt-3 text-center text-[13px] text-ink2">综述</p>
-          <p className="text-center text-[12px] text-ink3">2026年7月</p>
-
-          <PlaceholderParagraph title="摘要" lines={5} />
-          <PlaceholderParagraph title="1 引言" lines={7} />
-          <PlaceholderParagraph title="2 Sn 基钙钛矿" lines={4} />
-          <PlaceholderParagraph title="2.1 结构与光电性质" lines={6} />
-
-          <p className="mt-8 text-center text-[11px] text-ink3">
-            占位预览 — 后续版本接入 Tectonic 编译产物 + pdfjs 渲染
-          </p>
-        </div>
+      <div className="min-h-0 flex-1 bg-surface p-3" onMouseDown={(event) => event.stopPropagation()}>
+        {src ? (
+          <iframe
+            key={src}
+            title={`PDF preview: ${artifact.path}`}
+            src={src}
+            className="h-full w-full rounded-sm border border-border bg-bg shadow-subtle"
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center rounded-sm border border-border bg-bg text-[13px] text-ink3">
+            {error ?? '正在安全加载 PDF…'}
+          </div>
+        )}
       </div>
     </div>
   )
 }
 
-function PlaceholderParagraph({ title, lines }: { title: string; lines: number }) {
-  return (
-    <div className="mt-6">
-      <h2 className="text-[14px] font-semibold">{title}</h2>
-      <div className="mt-2 space-y-1.5">
-        {Array.from({ length: lines }).map((_, i) => (
-          <div
-            key={i}
-            className="h-2 rounded-sm bg-surface2"
-            style={{ width: i === lines - 1 ? '62%' : '100%' }}
-          />
-        ))}
-      </div>
-    </div>
-  )
+function formatSize(size: number): string {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }

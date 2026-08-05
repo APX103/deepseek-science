@@ -24,6 +24,7 @@
 | [技术栈选型](docs/tech-stack.md) | 后端 Rust crate、前端栈、Tauri 壳的选型论证与备选 |
 | [模块详细设计](docs/modules.md) | agent kernel / tools / skills / mcp / memory / compact / verify 逐模块 |
 | [API 契约](docs/api-contract.md) | HTTP/SSE 端点、事件流格式 |
+| [被调用的 A2A Agent 实现说明](docs/a2a-agent-implementation-guide.md) | 第三方 Agent 如何实现发现、调用、长任务、恢复、取消与安全接入 |
 | [数据模型与存储](docs/data-model.md) | SQLite schema、消息/会话/记忆/artifact 模型、迁移 |
 | [增强方向设计预留](docs/enhancements.md) | Deepseek 集成 / 实验数据分析 / 文献知识图谱 / 长程自主研究 |
 | [学科扩展插件体系](docs/domain-plugins.md) | 跨学科数据处理与可视化的插件化机制 + 调研清单 |

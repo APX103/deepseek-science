@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::context::ToolContext;
 use crate::error::ToolError;
@@ -64,6 +65,18 @@ pub struct ToolOutput {
     pub is_error: bool,
 }
 
+/// Whether a tool may share one model-declared tool-call batch with other calls.
+///
+/// Most local tools use ordered execution. Remote delegation is a different durability
+/// boundary: once its complete result arrives, the Runner must be able to checkpoint it
+/// without waiting for another potentially slow call from the same assistant turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolBatchPolicy {
+    #[default]
+    Ordered,
+    Exclusive,
+}
+
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
@@ -85,6 +98,19 @@ impl ToolOutput {
 pub trait Tool: Send + Sync {
     /// 返回工具说明（每次构造，避免 const 限制；JSON Schema 体量小，开销可忽略）。
     fn spec(&self) -> ToolSpec;
+
+    /// Router-level timeout for this invocation. Tools with a user-selectable
+    /// timeout override this so the outer guard does not cut off their own
+    /// documented execution window.
+    fn timeout(&self, _args: &Value) -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// Exclusive tools must be the only call in a model-declared batch. The Runner rejects an
+    /// entire mixed batch before executing anything, preserving one result for every call.
+    fn batch_policy(&self) -> ToolBatchPolicy {
+        ToolBatchPolicy::Ordered
+    }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError>;
 }

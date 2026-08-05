@@ -6,7 +6,8 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::Error;
 use crate::paths;
@@ -14,7 +15,8 @@ use crate::paths;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 17896;
 pub const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
-pub const DEFAULT_LLM_MODEL: &str = "deepseek-chat";
+pub const DEFAULT_LLM_MODEL: &str = "deepseek-v4-flash";
+pub const DEFAULT_A2A_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -23,10 +25,58 @@ pub struct Settings {
     pub data_dir_is_default: bool,
     pub server: ServerSettings,
     pub llm: LlmSettings,
+    /// LLM fields whose effective values came from process environment variables.
+    pub llm_env_overrides: LlmEnvOverrides,
     /// 日志级别 filter（`DSS_LOG`/`RUST_LOG` 之外来自配置文件的兜底）。
     pub log_level: Option<String>,
     /// MCP server 配置（P7）：启动时尝试连接。
     pub mcp_servers: Vec<McpServerConfig>,
+    /// 远端 A2A Agent 配置。这里只保存客户端连接信息；本应用不暴露 A2A server。
+    pub a2a_agents: Vec<A2aAgentConfig>,
+}
+
+/// 一个用户显式信任并配置的远端 A2A Agent。
+///
+/// `bearer_token` 仅写入权限受限的 settings.json；自定义 Debug 永不输出明文。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct A2aAgentConfig {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+impl Default for A2aAgentConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            endpoint: String::new(),
+            enabled: true,
+            bearer_token: None,
+            timeout_seconds: DEFAULT_A2A_TIMEOUT_SECONDS,
+        }
+    }
+}
+
+impl std::fmt::Debug for A2aAgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A2aAgentConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .field("enabled", &self.enabled)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 /// MCP server 配置。
@@ -88,6 +138,22 @@ impl LlmSettings {
     }
 }
 
+/// Process environment variables that currently take precedence over persisted LLM fields.
+/// Values are deliberately represented only as booleans so credentials cannot leak through
+/// status APIs or debug output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmEnvOverrides {
+    pub base_url: bool,
+    pub model: bool,
+    pub api_key: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedLlmSettings {
+    pub llm: LlmSettings,
+    pub env_overrides: LlmEnvOverrides,
+}
+
 /// 配置文件的部分表示：所有字段可选，用于分层合并。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -100,6 +166,9 @@ struct FileSettings {
     log_level: Option<String>,
     #[serde(default)]
     mcp_servers: Vec<McpServerConfig>,
+    /// `Option` is intentional: an explicit `[]` in the higher-priority file clears
+    /// inherited Agents, while an absent field leaves the lower layer untouched.
+    a2a_agents: Option<Vec<A2aAgentConfig>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,10 +191,153 @@ impl Settings {
     pub fn load() -> Result<Self, Error> {
         let (data_dir, data_dir_is_default) = paths::resolve_data_dir()?;
 
+        Self::load_from_data_dir(data_dir, data_dir_is_default)
+    }
+
+    /// Reload only the effective LLM settings for this process' existing data directory.
+    ///
+    /// This follows the exact same file layering and environment-variable precedence as a
+    /// backend restart, without changing startup-only server, logging, or MCP state.
+    pub fn reload_llm(&self) -> Result<LlmSettings, Error> {
+        Self::load_from_data_dir(self.data_dir.clone(), self.data_dir_is_default)
+            .map(|settings| settings.llm)
+    }
+
+    /// Reload the editable file-backed LLM fallback without applying process environment
+    /// overrides. Settings UIs must display this view so saving an unrelated field cannot
+    /// accidentally copy an environment-owned runtime value into `settings.json`.
+    pub fn reload_persisted_llm(&self) -> Result<LlmSettings, Error> {
+        let settings_json = self.data_dir.join("settings.json");
+        let candidate = if settings_json.is_file() {
+            let text = std::fs::read_to_string(&settings_json)?;
+            serde_json::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?
+        } else {
+            serde_json::json!({})
+        };
+        self.resolve_persisted_candidate_llm(candidate)
+    }
+
+    /// Reload the editable file-backed A2A Agent list without any network access.
+    pub fn reload_persisted_a2a_agents(&self) -> Result<Vec<A2aAgentConfig>, Error> {
+        let settings_json = self.data_dir.join("settings.json");
+        let candidate = if settings_json.is_file() {
+            let text = std::fs::read_to_string(&settings_json)?;
+            serde_json::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?
+        } else {
+            serde_json::json!({})
+        };
+        self.resolve_persisted_candidate_a2a_agents(candidate)
+    }
+
+    /// Resolve the file-backed LLM fallback represented by a candidate `settings.json`,
+    /// deliberately stopping before environment precedence is applied.
+    pub fn resolve_persisted_candidate_llm(&self, candidate: Value) -> Result<LlmSettings, Error> {
         let mut server = ServerSettings::default();
         let mut llm = LlmSettings::default();
         let mut log_level = None;
         let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
+
+        let config_toml = self.data_dir.join("config.toml");
+        if config_toml.is_file() {
+            let text = std::fs::read_to_string(&config_toml)?;
+            let file: FileSettings = toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: config_toml.clone(),
+                message: e.to_string(),
+            })?;
+            file.apply_to(
+                &mut server,
+                &mut llm,
+                &mut log_level,
+                &mut mcp_servers,
+                &mut a2a_agents,
+            );
+        }
+
+        let settings_json = self.data_dir.join("settings.json");
+        let file: FileSettings =
+            serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?;
+        file.apply_to(
+            &mut server,
+            &mut llm,
+            &mut log_level,
+            &mut mcp_servers,
+            &mut a2a_agents,
+        );
+        Ok(llm)
+    }
+
+    /// Resolve the file-backed A2A list represented by a candidate `settings.json`.
+    /// This mirrors restart layering and deliberately performs no card discovery.
+    pub fn resolve_persisted_candidate_a2a_agents(
+        &self,
+        candidate: Value,
+    ) -> Result<Vec<A2aAgentConfig>, Error> {
+        let mut server = ServerSettings::default();
+        let mut llm = LlmSettings::default();
+        let mut log_level = None;
+        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
+
+        let config_toml = self.data_dir.join("config.toml");
+        if config_toml.is_file() {
+            let text = std::fs::read_to_string(&config_toml)?;
+            let file: FileSettings = toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: config_toml.clone(),
+                message: e.to_string(),
+            })?;
+            file.apply_to(
+                &mut server,
+                &mut llm,
+                &mut log_level,
+                &mut mcp_servers,
+                &mut a2a_agents,
+            );
+        }
+
+        let settings_json = self.data_dir.join("settings.json");
+        let file: FileSettings =
+            serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?;
+        file.apply_to(
+            &mut server,
+            &mut llm,
+            &mut log_level,
+            &mut mcp_servers,
+            &mut a2a_agents,
+        );
+        Ok(a2a_agents)
+    }
+
+    /// Resolve the effective LLM configuration a restart would produce if `candidate` were the
+    /// complete contents of settings.json. This performs all fallible parsing before callers
+    /// durably replace the file.
+    pub fn resolve_candidate_llm(&self, candidate: Value) -> Result<ResolvedLlmSettings, Error> {
+        let mut llm = self.resolve_persisted_candidate_llm(candidate)?;
+        let mut server = ServerSettings::default();
+        let mut log_level = None;
+
+        let env_overrides = apply_process_environment(&mut server, &mut llm, &mut log_level);
+        Ok(ResolvedLlmSettings { llm, env_overrides })
+    }
+
+    fn load_from_data_dir(data_dir: PathBuf, data_dir_is_default: bool) -> Result<Self, Error> {
+        let mut server = ServerSettings::default();
+        let mut llm = LlmSettings::default();
+        let mut log_level = None;
+        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
 
         // config.toml（低优先级文件）
         let config_toml = data_dir.join("config.toml");
@@ -135,7 +347,13 @@ impl Settings {
                 path: config_toml.clone(),
                 message: e.to_string(),
             })?;
-            file.apply_to(&mut server, &mut llm, &mut log_level, &mut mcp_servers);
+            file.apply_to(
+                &mut server,
+                &mut llm,
+                &mut log_level,
+                &mut mcp_servers,
+                &mut a2a_agents,
+            );
         }
 
         // settings.json（高优先级文件）
@@ -147,47 +365,70 @@ impl Settings {
                     path: settings_json.clone(),
                     message: e.to_string(),
                 })?;
-            file.apply_to(&mut server, &mut llm, &mut log_level, &mut mcp_servers);
+            file.apply_to(
+                &mut server,
+                &mut llm,
+                &mut log_level,
+                &mut mcp_servers,
+                &mut a2a_agents,
+            );
         }
 
         // env（最高优先级）
-        if let Some(host) = std::env::var_os("DSS_HOST") {
-            server.host = host.to_string_lossy().into_owned();
-        }
-        if let Ok(port) = std::env::var("DSS_PORT") {
-            if let Ok(port) = port.parse::<u16>() {
-                server.port = port;
-            }
-        }
-        // LLM：DEEPSEEK_API_KEY / DSS_LLM_BASE_URL / DSS_LLM_MODEL 覆盖配置文件。
-        if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-            if !key.is_empty() {
-                llm.api_key = Some(key);
-            }
-        }
-        if let Ok(base_url) = std::env::var("DSS_LLM_BASE_URL") {
-            if !base_url.is_empty() {
-                llm.base_url = base_url;
-            }
-        }
-        if let Ok(model) = std::env::var("DSS_LLM_MODEL") {
-            if !model.is_empty() {
-                llm.model = model;
-            }
-        }
-        if let Ok(level) = std::env::var("DSS_LOG").or_else(|_| std::env::var("RUST_LOG")) {
-            log_level = Some(level);
-        }
+        let llm_env_overrides = apply_process_environment(&mut server, &mut llm, &mut log_level);
 
         Ok(Settings {
             data_dir,
             data_dir_is_default,
             server,
             llm,
+            llm_env_overrides,
             log_level,
             mcp_servers,
+            a2a_agents,
         })
     }
+}
+
+/// Apply process environment precedence and return only provenance, never values.
+fn apply_process_environment(
+    server: &mut ServerSettings,
+    llm: &mut LlmSettings,
+    log_level: &mut Option<String>,
+) -> LlmEnvOverrides {
+    if let Some(host) = std::env::var_os("DSS_HOST") {
+        server.host = host.to_string_lossy().into_owned();
+    }
+    if let Ok(port) = std::env::var("DSS_PORT") {
+        if let Ok(port) = port.parse::<u16>() {
+            server.port = port;
+        }
+    }
+
+    let mut overrides = LlmEnvOverrides::default();
+    // LLM：DEEPSEEK_API_KEY / DSS_LLM_BASE_URL / DSS_LLM_MODEL 覆盖配置文件。
+    if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
+        if !key.is_empty() {
+            overrides.api_key = true;
+            llm.api_key = Some(key);
+        }
+    }
+    if let Ok(base_url) = std::env::var("DSS_LLM_BASE_URL") {
+        if !base_url.is_empty() {
+            overrides.base_url = true;
+            llm.base_url = base_url;
+        }
+    }
+    if let Ok(model) = std::env::var("DSS_LLM_MODEL") {
+        if !model.is_empty() {
+            overrides.model = true;
+            llm.model = model;
+        }
+    }
+    if let Ok(level) = std::env::var("DSS_LOG").or_else(|_| std::env::var("RUST_LOG")) {
+        *log_level = Some(level);
+    }
+    overrides
 }
 
 impl FileSettings {
@@ -197,6 +438,7 @@ impl FileSettings {
         llm: &mut LlmSettings,
         log_level: &mut Option<String>,
         mcp_servers: &mut Vec<McpServerConfig>,
+        a2a_agents: &mut Vec<A2aAgentConfig>,
     ) {
         if let Some(host) = self.server.host {
             server.host = host;
@@ -222,5 +464,60 @@ impl FileSettings {
         if !self.mcp_servers.is_empty() {
             *mcp_servers = self.mcp_servers;
         }
+        if let Some(configured) = self.a2a_agents {
+            *a2a_agents = configured;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{A2aAgentConfig, LlmSettings, Settings, DEFAULT_LLM_MODEL};
+    use std::path::PathBuf;
+
+    #[test]
+    fn llm_defaults_to_current_deepseek_v4_flash_model() {
+        let settings = LlmSettings::default();
+        assert_eq!(DEFAULT_LLM_MODEL, "deepseek-v4-flash");
+        assert_eq!(settings.model, DEFAULT_LLM_MODEL);
+    }
+
+    #[test]
+    fn a2a_debug_never_exposes_bearer_token() {
+        let token = ["fixture", "secret"].join("-");
+        let config = A2aAgentConfig {
+            bearer_token: Some(token.clone()),
+            ..A2aAgentConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(&token));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn higher_priority_explicit_empty_a2a_list_clears_inherited_agents() {
+        let data_dir =
+            std::env::temp_dir().join(format!("dss-a2a-layering-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("create temp settings directory");
+        std::fs::write(
+            data_dir.join("config.toml"),
+            r#"
+[[a2a_agents]]
+id = "inherited"
+name = "Inherited Agent"
+endpoint = "https://agent.example"
+enabled = true
+timeout_seconds = 120
+"#,
+        )
+        .expect("write config.toml");
+        std::fs::write(data_dir.join("settings.json"), r#"{"a2a_agents":[]}"#)
+            .expect("write settings.json");
+
+        let loaded = Settings::load_from_data_dir(PathBuf::from(&data_dir), false)
+            .expect("load layered settings");
+        assert!(loaded.a2a_agents.is_empty());
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

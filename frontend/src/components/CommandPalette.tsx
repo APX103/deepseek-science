@@ -1,9 +1,8 @@
-// ⌘K 全局搜索弹层：静态数据 + 输入过滤。
+// ⌘K 全局搜索弹层：只搜索后端已加载的项目与会话。
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { mockArtifacts } from '../mock/data'
 import { useProjects, useSessions } from '../store'
-import { IconChevronRight, IconFile, IconMessage, IconPlus, IconSearch, IconSettings } from './icons'
+import { IconChevronRight, IconFile, IconMessage, IconSearch } from './icons'
 
 interface Props {
   onClose: () => void
@@ -19,7 +18,6 @@ export default function CommandPalette({ onClose }: Props) {
     const needle = q.trim().toLowerCase()
     const match = (s: string) => !needle || s.toLowerCase().includes(needle)
     return {
-      artifacts: mockArtifacts.filter((a) => match(a.path)),
       sessions: allSessions.filter((s) => match(s.title)),
       projects: projects.filter((p) => match(p.name)),
     }
@@ -55,19 +53,6 @@ export default function CommandPalette({ onClose }: Props) {
         </div>
 
         <div className="max-h-[50vh] overflow-y-auto py-1">
-          {results.artifacts.length > 0 && (
-            <Section label="Recent artifacts">
-              {results.artifacts.map((a) => (
-                <Row
-                  key={a.path}
-                  icon={<IconFile width={14} height={14} />}
-                  title={a.path}
-                  sub={`${(a.size / 1024).toFixed(0)} KB · ${a.origin === 'upload' ? 'uploaded' : 'created'}`}
-                  onClick={onClose}
-                />
-              ))}
-            </Section>
-          )}
           {results.sessions.length > 0 && (
             <Section label="Recent sessions">
               {results.sessions.map((s) => (
@@ -95,9 +80,7 @@ export default function CommandPalette({ onClose }: Props) {
             </Section>
           )}
           <Section label="Commands">
-            <Row icon={<IconPlus width={14} height={14} />} title="New session" sub="Command" onClick={onClose} />
             <Row icon={<IconFile width={14} height={14} />} title="View logs" sub="Command" onClick={goLogs} />
-            <Row icon={<IconSettings width={14} height={14} />} title="Compute monitor" sub="Command" onClick={onClose} />
           </Section>
         </div>
       </div>

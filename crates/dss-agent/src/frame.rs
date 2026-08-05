@@ -11,6 +11,8 @@ pub enum FrameStatus {
     Replaced,
     Cancelled,
     AwaitingPlanApproval,
+    /// The plan is durably approved but execution has not yet been accepted.
+    AwaitingPlanExecution,
     AwaitingUserResponse,
 }
 
@@ -64,5 +66,37 @@ impl Frame {
             return;
         }
         self.status = status;
+    }
+
+    /// Begin a new user turn. A completed/failed/cancelled or awaiting frame
+    /// becomes the parent of a fresh processing frame; an already-processing
+    /// frame (for example immediately after plan approval) is reused.
+    pub fn begin_run(&mut self, task_summary: impl Into<String>) {
+        self.task_summary = task_summary.into();
+        if self.status == FrameStatus::Processing {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.id, uuid::Uuid::new_v4().to_string());
+        self.parent_frame_id = Some(previous);
+        self.status = FrameStatus::Processing;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Frame, FrameStatus};
+
+    #[test]
+    fn begin_run_reopens_terminal_frame_as_new_child() {
+        let mut frame = Frame::new_root("first");
+        let root = frame.root_frame_id.clone();
+        let old_id = frame.id.clone();
+        frame.set_status(FrameStatus::Completed);
+        frame.begin_run("second");
+        assert_eq!(frame.status, FrameStatus::Processing);
+        assert_ne!(frame.id, old_id);
+        assert_eq!(frame.parent_frame_id.as_deref(), Some(old_id.as_str()));
+        assert_eq!(frame.root_frame_id, root);
+        assert_eq!(frame.task_summary, "second");
     }
 }

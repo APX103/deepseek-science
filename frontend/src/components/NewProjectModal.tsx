@@ -1,4 +1,4 @@
-// New Project 弹窗：Name / Description / Agent Context，纯前端态。
+// New Project 弹窗：Name / Description / Agent Context，提交到真实后端。
 import { useState } from 'react'
 import type { Project } from '../types'
 import { createProject } from '../api/client'

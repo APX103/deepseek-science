@@ -6,4 +6,7 @@ pub mod settings;
 pub mod time;
 
 pub use error::Error;
-pub use settings::{LlmSettings, Settings};
+pub use settings::{
+    A2aAgentConfig, LlmEnvOverrides, LlmSettings, ResolvedLlmSettings, Settings,
+    DEFAULT_A2A_TIMEOUT_SECONDS,
+};

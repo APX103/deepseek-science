@@ -269,20 +269,16 @@ mod tests {
     fn parse_plain_json_result() {
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
         let p = parse_response(body, Some("application/json")).unwrap();
-        match p {
-            ResponsePayload::Result(v) => assert_eq!(v["tools"].as_array().unwrap().len(), 0),
-            _ => panic!("expected result"),
-        }
+        let ResponsePayload::Result(v) = p;
+        assert_eq!(v["tools"].as_array().unwrap().len(), 0);
     }
 
     #[test]
     fn parse_sse_takes_last_data() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":2}}\n\n";
         let p = parse_response(body, Some("text/event-stream")).unwrap();
-        match p {
-            ResponsePayload::Result(v) => assert_eq!(v["a"], 2),
-            _ => panic!("expected result"),
-        }
+        let ResponsePayload::Result(v) = p;
+        assert_eq!(v["a"], 2);
     }
 
     #[test]

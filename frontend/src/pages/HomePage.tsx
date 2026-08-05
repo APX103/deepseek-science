@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
   addProject,
+  createSession,
   loadFromBackend,
   removeProject,
   updateProject,
@@ -44,6 +45,7 @@ export default function HomePage() {
   const [showNew, setShowNew] = useState(false)
   const sessions = useSessions()
   const online = useBackendOnline()
+  const [projectOpenError, setProjectOpenError] = useState<string | null>(null)
 
   // 挂载时从后端拉取 projects/sessions。
   useEffect(() => {
@@ -52,6 +54,35 @@ export default function HomePage() {
 
   const failedSession = useMemo(() => sessions.find((s) => s.status === 'failed'), [sessions])
   const failedProject = failedSession && projects.find((p) => p.id === failedSession.project_id)
+
+  const openProject = async (project: (typeof projects)[number]) => {
+    setProjectOpenError(null)
+    const projectSessions = sessions.filter((session) => session.project_id === project.id)
+    const existing =
+      (project.last_session_id
+        ? projectSessions.find((session) => session.id === project.last_session_id)
+        : undefined) ??
+      projectSessions.sort(
+        (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+      )[0]
+    if (existing) {
+      navigate(`/p/${project.id}/s/${existing.id}`)
+      return
+    }
+    if (!online) {
+      setProjectOpenError('后端未连接，暂时无法为该项目创建会话。')
+      return
+    }
+    try {
+      const created = await api.createSessionApi(project.id)
+      const session = createSession(project.id, { id: created.id })
+      navigate(`/p/${project.id}/s/${session.id}`)
+    } catch (error) {
+      setProjectOpenError(
+        `打开项目失败：${error instanceof Error ? error.message : String(error)}。请检查后端日志后重试。`,
+      )
+    }
+  }
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-10">
@@ -103,6 +134,12 @@ export default function HomePage() {
         </Link>
       )}
 
+      {projectOpenError && (
+        <p role="alert" className="mt-4 rounded-md border border-danger/30 bg-dangerSoft px-3 py-2 text-[12px] text-danger">
+          {projectOpenError}
+        </p>
+      )}
+
       {/* 两栏：Projects / Recent sessions */}
       <div className="mt-8 grid grid-cols-1 gap-8 md:grid-cols-2">
         <section>
@@ -114,10 +151,7 @@ export default function HomePage() {
               <div
                 key={p.id}
                 className="group flex cursor-pointer items-center gap-2 px-4 py-3 hover:bg-surface"
-                onClick={() => {
-                  const s = sessions.find((x) => x.project_id === p.id)
-                  if (s) navigate(`/p/${p.id}/s/${s.id}`)
-                }}
+                onClick={() => void openProject(p)}
               >
                 <div className="min-w-0 flex-1">
                   <span className="text-[13px] font-medium text-ink">{p.name}</span>
@@ -160,11 +194,21 @@ export default function HomePage() {
                         icon: <IconTrash width={13} height={13} />,
                         danger: true,
                         onClick: async () => {
+                          const confirmed = window.confirm(
+                            `Delete project “${p.name}”? Only projects with no sessions can be deleted. This action cannot be undone.`,
+                          )
+                          if (!confirmed) return
+                          setProjectOpenError(null)
                           try {
-                            await api.deleteProject(p.id, true)
+                            // Never orphan research sessions behind the user's
+                            // back. Non-empty projects must be archived or have
+                            // their sessions handled explicitly first.
+                            await api.deleteProject(p.id, false)
                             removeProject(p.id)
-                          } catch {
-                            /* ignore */
+                          } catch (error) {
+                            setProjectOpenError(
+                              `删除项目失败：${error instanceof Error ? error.message : String(error)}`,
+                            )
                           }
                         },
                       },
@@ -209,7 +253,15 @@ export default function HomePage() {
         </section>
       </div>
 
-      {showNew && <NewProjectModal onClose={() => setShowNew(false)} onCreated={addProject} />}
+      {showNew && (
+        <NewProjectModal
+          onClose={() => setShowNew(false)}
+          onCreated={(project) => {
+            addProject(project)
+            void openProject(project)
+          }}
+        />
+      )}
     </div>
   )
 }

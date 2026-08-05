@@ -6,10 +6,17 @@
 pub mod builtin;
 pub mod context;
 pub mod error;
+mod process;
 pub mod router;
+mod sandbox;
 pub mod spec;
 
-pub use context::{PendingAsk, PendingAskOption, PlanState, PlanStep, ToolContext};
+pub use context::{
+    HistoryCheckpoint, HistoryCheckpointState, PendingAsk, PendingAskOption, PlanState, PlanStep,
+    SecureWorkspace, ToolContext, WorkspaceEntry,
+};
 pub use error::ToolError;
-pub use router::{parse_arguments, PendingToolCall, ToolRegistry, ToolResult, ToolRouter};
-pub use spec::{Tool, ToolDef, ToolOutput, ToolSpec};
+pub use router::{
+    parse_arguments, PendingToolCall, ToolRegistry, ToolRegistryError, ToolResult, ToolRouter,
+};
+pub use spec::{Tool, ToolBatchPolicy, ToolDef, ToolOutput, ToolSpec};

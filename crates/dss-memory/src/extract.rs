@@ -28,18 +28,7 @@ pub async fn extract(
     model: &str,
     messages: &[ChatMessage],
 ) -> Result<Vec<String>, LlmError> {
-    // 跳过 harness_notice（P4b 暂无显式标记，跳过 role=tool 的工具结果与空内容）。
-    let body: String = messages
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .filter(|m| m.content.as_ref().map(|c| !c.is_empty()).unwrap_or(false))
-        .map(|m| {
-            let role = m.role.as_str();
-            let content = m.content.clone().unwrap_or_default();
-            format!("[{role}] {content}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let body = render_extract_body(messages);
 
     if body.trim().is_empty() {
         return Ok(Vec::new());
@@ -54,6 +43,21 @@ pub async fn extract(
     );
     let resp = llm.chat(req).await?;
     Ok(parse_emit_memories(&resp.text))
+}
+
+fn render_extract_body(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .filter(|m| !m.harness_notice)
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .filter(|m| m.content.as_ref().map(|c| !c.is_empty()).unwrap_or(false))
+        .map(|m| {
+            let role = m.role.as_str();
+            let content = m.content.clone().unwrap_or_default();
+            format!("[{role}] {content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 解析 `emit_memories({...})` 里的 append 列表。容错：找不到则空。
@@ -108,5 +112,20 @@ mod tests {
     #[test]
     fn empty_when_no_marker() {
         assert!(parse_emit_memories("no marker here").is_empty());
+    }
+
+    #[test]
+    fn extract_input_excludes_internal_rejected_drafts() {
+        let mut rejected = ChatMessage::assistant("REJECTED DRAFT SECRET");
+        rejected.harness_notice = true;
+        let body = render_extract_body(&[
+            ChatMessage::user("visible request"),
+            rejected,
+            ChatMessage::assistant("visible revised answer"),
+        ]);
+
+        assert!(body.contains("visible request"));
+        assert!(body.contains("visible revised answer"));
+        assert!(!body.contains("REJECTED DRAFT SECRET"));
     }
 }

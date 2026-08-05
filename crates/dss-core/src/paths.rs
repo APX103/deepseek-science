@@ -31,9 +31,25 @@ pub fn ensure_data_dir(data_dir: &Path, allow_ssd_symlink: bool) -> Result<(), E
         maybe_link_ssd(data_dir)?;
     }
     std::fs::create_dir_all(data_dir)?;
+    set_private_directory_permissions(data_dir)?;
     for sub in DATA_SUBDIRS {
-        std::fs::create_dir_all(data_dir.join(sub))?;
+        let path = data_dir.join(sub);
+        std::fs::create_dir_all(&path)?;
+        set_private_directory_permissions(&path)?;
     }
+    Ok(())
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Research transcripts, generated files, logs, the SQLite database,
+        // and provider credentials all live below this tree.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -88,4 +104,40 @@ fn maybe_link_ssd(data_dir: &Path) -> Result<(), Error> {
 
     std::os::unix::fs::symlink(ssd, data_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn data_tree_is_private_even_with_a_permissive_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "deepseek-science-private-data-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        ensure_data_dir(&root, false).expect("create private data tree");
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for subdir in DATA_SUBDIRS {
+            assert_eq!(
+                std::fs::metadata(root.join(subdir))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -21,6 +21,12 @@ pub struct CompactionOutcome {
     pub folded: bool,
     /// 本次产生的 fold 数。
     pub folds_added: usize,
+    /// 完成后 projection + 本轮保留上下文的估算 token 数。
+    pub projected_tokens: usize,
+    /// 当前模型窗口对应的硬墙。
+    pub hard_wall_tokens: usize,
+    /// summarizer 失败或没有可折叠消息时，结果是否仍超过硬墙。
+    pub hard_wall_exceeded: bool,
 }
 
 /// 主入口：在每轮 LLM 前调用。判断是否触发 L1 → 选 chunk → summarize → 记 fold。
@@ -35,9 +41,26 @@ pub async fn maybe_compact(
     model: &str,
     context_window: usize,
 ) -> CompactionOutcome {
-    let total = tokens::estimate_messages_tokens(messages);
-    if !chunk::is_over_trigger(total, context_window) {
-        return CompactionOutcome::default();
+    maybe_compact_with_reserved_tokens(messages, state, llm, model, context_window, 0).await
+}
+
+/// 与 [`maybe_compact`] 相同，但把本轮不可折叠的 system/memory/tool-schema token
+/// 纳入预算。
+///
+/// Runner 应传入这些消息的 token 数；否则 290k 历史 + 20k 本轮上下文会因为只看
+/// 历史而错过 300k 绝对硬墙。
+pub async fn maybe_compact_with_reserved_tokens(
+    messages: &[ChatMessage],
+    state: &mut CompactionState,
+    llm: &dyn LlmClient,
+    model: &str,
+    context_window: usize,
+    reserved_tokens: usize,
+) -> CompactionOutcome {
+    let hard_wall_tokens = chunk::hard_wall_tokens(context_window);
+    let mut projected_tokens = projection_tokens(messages, state, reserved_tokens);
+    if !chunk::is_over_trigger(projected_tokens, context_window) {
+        return outcome(0, projected_tokens, hard_wall_tokens);
     }
 
     let mut folds_added = 0usize;
@@ -47,10 +70,21 @@ pub async fn maybe_compact(
     let mut guard = 0usize;
     while guard < safety {
         guard += 1;
-        if !chunk::should_trigger_l1(messages, state, context_window) {
+        if !chunk::should_trigger_l1_with_reserved(messages, state, context_window, reserved_tokens)
+        {
             break;
         }
-        let Some((start, end)) = chunk::pick_next_chunk(messages, state) else {
+        // Select enough raw history to get below the target even when the summary reaches its
+        // enforced output ceiling. Message boundaries and tool transactions may make it larger.
+        let reduction_needed =
+            projected_tokens.saturating_sub(chunk::projection_token_target(context_window));
+        let max_summary_tokens = constants::OUTPUT_CEILING / constants::CHARS_PER_TOKEN + 2;
+        let requested_chunk_tokens = reduction_needed
+            .saturating_add(max_summary_tokens)
+            .max(constants::MIN_CHUNK_TOKENS);
+        let Some((start, end)) =
+            chunk::pick_next_chunk_with_min_tokens(messages, state, requested_chunk_tokens)
+        else {
             break;
         };
         let chunk_tokens = tokens::estimate_messages_tokens(&messages[start..end]);
@@ -62,18 +96,51 @@ pub async fn maybe_compact(
             Ok(s) if !s.trim().is_empty() => s,
             _ => break,
         };
-        state.record_fold(Fold {
+        // A provider is free to ignore the requested summary size. Never commit a fold that
+        // grows (or preserves) the projection, otherwise the retry cap merely hides the fact
+        // that the hard wall was not reduced.
+        let summary_tokens = tokens::estimate_message_tokens(&ChatMessage::assistant(&summary));
+        if summary_tokens >= chunk_tokens {
+            break;
+        }
+        let mut next_state = state.clone();
+        next_state.record_fold(Fold {
             start_idx: start,
             end_idx: end,
             summary,
             level: 1,
         });
+        let next_projected_tokens = projection_tokens(messages, &next_state, reserved_tokens);
+        if next_projected_tokens >= projected_tokens {
+            break;
+        }
+        *state = next_state;
         folds_added += 1;
+        projected_tokens = next_projected_tokens;
     }
 
+    outcome(folds_added, projected_tokens, hard_wall_tokens)
+}
+
+fn projection_tokens(
+    messages: &[ChatMessage],
+    state: &CompactionState,
+    reserved_tokens: usize,
+) -> usize {
+    tokens::estimate_messages_tokens(&projection(messages, state)).saturating_add(reserved_tokens)
+}
+
+fn outcome(
+    folds_added: usize,
+    projected_tokens: usize,
+    hard_wall_tokens: usize,
+) -> CompactionOutcome {
     CompactionOutcome {
         folded: folds_added > 0,
         folds_added,
+        projected_tokens,
+        hard_wall_tokens,
+        hard_wall_exceeded: projected_tokens > hard_wall_tokens,
     }
 }
 

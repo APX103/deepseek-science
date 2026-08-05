@@ -1,5 +1,4 @@
-// 日志页：统一日志视图（system + agent 同列表，按 level/source/kind/session/时间过滤）。
-// 数据走 api/client 的 listLogs 桩（localStorage 持久化，首次 mock 播种）。
+// 日志页：统一真实后端日志视图（system + agent 同列表，按多维度过滤）。
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { clearLogs, listLogs } from '../api/client'
@@ -33,8 +32,12 @@ function sinceOf(range: RangeId): string | null {
 }
 
 function fmtTs(ts: string): string {
-  // ISO → "MM-DD HH:MM:SS"
-  return ts.slice(5, 19).replace('T', ' ')
+  const date = new Date(ts)
+  if (Number.isNaN(date.getTime())) return ts
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}:${pad(date.getSeconds())}`
 }
 
 export default function LogsPage() {
@@ -76,7 +79,6 @@ export default function LogsPage() {
     })
 
   const doClear = async () => {
-    // TODO: 接后端 DELETE /api/logs
     await clearLogs()
     setLogs([])
     setConfirmClear(false)

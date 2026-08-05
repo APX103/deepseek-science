@@ -1,4 +1,5 @@
 // 工作台左侧栏：项目名 / New / Search / Customize / Files / Compute / 会话列表（Today 分组）/ 底部主题切换。
+import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { createSessionApi } from '../../api/client'
 import { createSession, useProjects, useSessions } from '../../store'
@@ -29,22 +30,24 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
   const projects = useProjects()
   const project = projects.find((p) => p.id === pid) ?? projects[0]
   const sessions = allSessions.filter((s) => s.project_id === project?.id)
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
 
   const handleNew = async () => {
-    if (!project) return
-    // 后端在线：先 POST /api/sessions 拿真实 sid；失败/离线回退 mock 行为
-    if (backend.online) {
-      try {
-        const { id } = await createSessionApi(project.id)
-        const s = createSession(project.id, { id })
-        navigate(`/p/${project.id}/s/${s.id}`)
-        return
-      } catch {
-        // fall through：后端建会话失败时按 mock 建，保证 UI 演示不崩
-      }
+    if (!project || !backend.online || creating) return
+    setCreating(true)
+    setCreateError(null)
+    try {
+      const { id } = await createSessionApi(project.id)
+      const s = createSession(project.id, { id })
+      navigate(`/p/${project.id}/s/${s.id}`)
+    } catch (error) {
+      setCreateError(
+        `新建会话失败：${error instanceof Error ? error.message : String(error)}。请检查后端日志后重试。`,
+      )
+    } finally {
+      setCreating(false)
     }
-    const s = createSession(project.id) // TODO: 接后端 POST /api/sessions
-    navigate(`/p/${project.id}/s/${s.id}`)
   }
 
   if (!project) return <aside className="shrink-0 border-r border-border bg-surface" style={{ width }} />
@@ -60,11 +63,20 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
 
       {/* 主导航 */}
       <nav className="space-y-0.5 p-2">
-        <NavBtn icon={<IconPlus width={14} height={14} />} label="New" onClick={handleNew} />
+        <NavBtn
+          icon={<IconPlus width={14} height={14} />}
+          label={creating ? 'Creating…' : 'New'}
+          onClick={handleNew}
+          disabled={!backend.online || creating}
+        />
         <NavBtn icon={<IconSearch width={14} height={14} />} label="Search" onClick={openCommandPalette} />
         <NavBtn icon={<IconSliders width={14} height={14} />} label="Customize" onClick={onOpenSkills} />
         <NavBtn icon={<IconFile width={14} height={14} />} label="Files" onClick={onOpenFiles} />
-        <NavBtn icon={<IconCpu width={14} height={14} />} label="Compute" />
+        <NavBtn icon={<IconCpu width={14} height={14} />} label="Compute（尚未开放）" disabled />
+        {!backend.online && (
+          <p className="px-2 pt-1 text-[11px] leading-relaxed text-danger">后端离线，无法新建会话。</p>
+        )}
+        {createError && <p className="px-2 pt-1 text-[11px] leading-relaxed text-danger">{createError}</p>}
       </nav>
 
       {/* 会话列表（Today 分组，新的在顶部） */}
@@ -104,15 +116,18 @@ function NavBtn({
   icon,
   label,
   onClick,
+  disabled,
 }: {
   icon: React.ReactNode
   label: string
   onClick?: () => void
+  disabled?: boolean
 }) {
   return (
     <button
       onClick={onClick}
-      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[13px] text-ink2 hover:bg-surface2 hover:text-ink"
+      disabled={disabled}
+      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[13px] text-ink2 hover:bg-surface2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-45"
     >
       {icon}
       {label}

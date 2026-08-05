@@ -7,12 +7,12 @@
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "cd ../frontend && bun run dev",
-    "beforeBuildCommand": "if [ -d frontend ]; then cd frontend; elif [ -d ../frontend ]; then cd ../frontend; else echo 'frontend dir not found' >&2; exit 1; fi && bun run build"
+    "beforeBuildCommand": "if [ -d crates/dss-bin ]; then cargo build --release --locked --bin dss-backend; elif [ -d ../crates/dss-bin ]; then cargo build --manifest-path ../Cargo.toml --release --locked --bin dss-backend; else echo 'workspace backend crate not found' >&2; exit 1; fi && if [ -d frontend ]; then cd frontend; elif [ -d ../frontend ]; then cd ../frontend; else echo 'frontend dir not found' >&2; exit 1; fi && bun run build"
   },
   "app": {
     "windows": [],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* http://localhost:* data: blob:; media-src 'self' asset: http://asset.localhost data: blob:; frame-src 'self' http://127.0.0.1:* http://localhost:* blob:; worker-src 'self' blob:"
     }
   },
   "bundle": {
@@ -25,7 +25,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../target/release/dss-backend"],
+    "resources": {
+      "../target/release/dss-backend": "dss-backend"
+    },
     "category": "DeveloperTool"
   }
 }

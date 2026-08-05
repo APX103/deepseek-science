@@ -14,6 +14,11 @@ pub fn estimate_message_tokens(msg: &ChatMessage) -> usize {
     if let Some(c) = msg.content.as_ref() {
         chars += c.chars().count();
     }
+    // DeepSeek V4 replays assistant reasoning_content on later turns. Ignoring it here makes
+    // the compaction hard wall substantially undercount the actual provider request.
+    if let Some(reasoning) = msg.reasoning_content.as_ref() {
+        chars += reasoning.chars().count();
+    }
     if let Some(tcs) = msg.tool_calls.as_ref() {
         for tc in tcs.iter() {
             chars += tc.function.name.chars().count();
@@ -50,5 +55,12 @@ mod tests {
     fn message_tokens_includes_content_and_overhead() {
         let m = ChatMessage::user("abcdefgh"); // 8 chars + 8 overhead = 16 / 4 = 4
         assert_eq!(estimate_message_tokens(&m), 4);
+    }
+
+    #[test]
+    fn message_tokens_includes_replayed_reasoning() {
+        let mut message = ChatMessage::assistant("answer");
+        message.reasoning_content = Some("r".repeat(4000));
+        assert!(estimate_message_tokens(&message) >= 1000);
     }
 }

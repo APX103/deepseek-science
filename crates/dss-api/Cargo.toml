@@ -6,6 +6,7 @@ description = "Deepseek Science HTTP/SSE API layer (axum)"
 
 [dependencies]
 dss-core = { path = "../dss-core" }
+dss-a2a = { path = "../dss-a2a" }
 dss-llm = { path = "../dss-llm" }
 dss-agent = { path = "../dss-agent" }
 dss-tools = { path = "../dss-tools" }
@@ -18,6 +19,7 @@ dss-mcp = { path = "../dss-mcp" }
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

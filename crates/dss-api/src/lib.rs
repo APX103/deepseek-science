@@ -7,17 +7,133 @@ pub mod memories;
 pub mod meta;
 pub mod projects;
 pub mod sessions;
+pub mod settings_endpoints;
 pub mod state;
+pub mod workspace_files;
+mod workspace_resolution;
 
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
+use axum::http::{header, uri::Authority, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
 use state::AppState;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 pub use state::build_state;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+const API_TOKEN_HEADER: &str = "x-dss-token";
+const ALLOWED_ORIGINS: [&str; 4] = [
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+];
+
+#[derive(Clone)]
+struct ApiSecurity {
+    token: Option<Arc<str>>,
+}
+
+impl ApiSecurity {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            token: state.api_token.clone(),
+        }
+    }
+}
+
+/// Reject DNS-rebinding/cross-origin traffic before it can reach privileged routes.
+/// Packaged launches additionally require an unguessable per-process capability token.
+async fn enforce_local_api_security(
+    State(security): State<ApiSecurity>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some((status, message)) = security_rejection(&request, &security) {
+        return (status, message).into_response();
+    }
+    next.run(request).await
+}
+
+fn security_rejection(
+    request: &Request,
+    security: &ApiSecurity,
+) -> Option<(StatusCode, &'static str)> {
+    if !has_allowed_host(request.headers()) {
+        return Some((StatusCode::FORBIDDEN, "non-local Host is not allowed"));
+    }
+    if !has_allowed_origin(request.headers()) {
+        return Some((StatusCode::FORBIDDEN, "request Origin is not allowed"));
+    }
+
+    // CORS preflights carry no capability token and cannot invoke an application handler.
+    let token_exempt = request.method() == Method::OPTIONS || request.uri().path() == "/api/health";
+    if token_exempt {
+        return None;
+    }
+
+    let Some(expected) = security.token.as_deref() else {
+        // A directly launched CLI server remains compatible when DSS_API_TOKEN is unset.
+        return None;
+    };
+    let mut supplied = request.headers().get_all(API_TOKEN_HEADER).iter();
+    let valid = supplied
+        .next()
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()))
+        && supplied.next().is_none();
+    (!valid).then_some((StatusCode::UNAUTHORIZED, "missing or invalid API token"))
+}
+
+fn has_allowed_host(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(header::HOST).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    values.next().is_none() && value.to_str().ok().is_some_and(is_loopback_authority)
+}
+
+fn is_loopback_authority(value: &str) -> bool {
+    let Ok(authority) = value.parse::<Authority>() else {
+        return false;
+    };
+    let host = authority.host();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn has_allowed_origin(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(header::ORIGIN).iter();
+    let Some(value) = values.next() else {
+        // Native/CLI clients do not send Origin.
+        return true;
+    };
+    values.next().is_none()
+        && value
+            .to_str()
+            .ok()
+            .is_some_and(|origin| ALLOWED_ORIGINS.contains(&origin))
+}
+
+/// Length-oblivious comparison style: always walks the longest input and folds every byte.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -39,22 +155,55 @@ struct ConfigResponse {
     llm_configured: bool,
     model: String,
     base_url: String,
+    revision: u64,
+    overridden_fields: Vec<&'static str>,
 }
 
 async fn config(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Json<ConfigResponse> {
+    let runtime = state.llm_snapshot().await;
     Json(ConfigResponse {
-        llm_configured: state.llm.is_some(),
-        model: state.settings.llm.model.clone(),
-        base_url: state.settings.llm.base_url.clone(),
+        llm_configured: runtime.is_configured(),
+        model: runtime.settings().model.clone(),
+        base_url: runtime.settings().base_url.clone(),
+        revision: runtime.revision(),
+        overridden_fields: runtime.overridden_fields(),
     })
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // Only the packaged Tauri origin and the two local Vite development
+    // origins may drive this privileged localhost API.
+    let cors = CorsLayer::new()
+        .allow_origin([
+            HeaderValue::from_static("tauri://localhost"),
+            HeaderValue::from_static("http://tauri.localhost"),
+            HeaderValue::from_static("http://localhost:5173"),
+            HeaderValue::from_static("http://127.0.0.1:5173"),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static(API_TOKEN_HEADER),
+        ]);
+
+    let security = ApiSecurity::from_state(&state);
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/config", get(config))
+        .route(
+            "/api/settings",
+            get(settings_endpoints::get_settings).post(settings_endpoints::save_settings),
+        )
         // sessions
         .route(
             "/api/sessions",
@@ -69,12 +218,24 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(sessions::stream_sse),
         )
         .route(
+            "/api/sessions/{sid}/cancel",
+            axum::routing::post(sessions::cancel_run),
+        )
+        .route(
             "/api/sessions/{sid}/compile",
             axum::routing::post(sessions::compile),
         )
         .route(
             "/api/sessions/{sid}/approve",
             axum::routing::post(sessions::approve_plan),
+        )
+        .route(
+            "/api/sessions/{sid}/files",
+            get(workspace_files::list_files),
+        )
+        .route(
+            "/api/sessions/{sid}/files/{*path}",
+            get(workspace_files::read_file).delete(workspace_files::delete_file),
         )
         // projects
         .route(
@@ -111,12 +272,11 @@ pub fn build_router(state: AppState) -> Router {
         // MCP
         .route("/api/mcp/{name}/tools", get(mcp_endpoints::mcp_tools))
         .with_state(state)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(middleware::from_fn_with_state(
+            security,
+            enforce_local_api_security,
+        ))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -148,4 +308,96 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received, draining connections");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn request(path: &str, host: &str, origin: Option<&str>, token: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri(path).header(header::HOST, host);
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        if let Some(token) = token {
+            builder = builder.header(API_TOKEN_HEADER, token);
+        }
+        builder.body(Body::empty()).expect("valid test request")
+    }
+
+    fn rejection_status(request: &Request, token: Option<&str>) -> Option<StatusCode> {
+        let security = ApiSecurity {
+            token: token.map(Arc::<str>::from),
+        };
+        security_rejection(request, &security).map(|(status, _)| status)
+    }
+
+    #[test]
+    fn configured_token_rejects_missing_and_wrong_values_but_accepts_match() {
+        let missing = request("/api/config", "127.0.0.1:17896", None, None);
+        let wrong = request(
+            "/api/config",
+            "127.0.0.1:17896",
+            Some("tauri://localhost"),
+            Some("wrong"),
+        );
+        let valid = request(
+            "/api/config",
+            "localhost:17896",
+            Some("tauri://localhost"),
+            Some("secret-token"),
+        );
+
+        assert_eq!(
+            rejection_status(&missing, Some("secret-token")),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            rejection_status(&wrong, Some("secret-token")),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(rejection_status(&valid, Some("secret-token")), None);
+    }
+
+    #[test]
+    fn health_and_cli_mode_do_not_require_a_token() {
+        let health = request("/api/health", "127.0.0.1:17896", None, None);
+        let cli = request("/api/config", "localhost:17896", None, None);
+
+        assert_eq!(rejection_status(&health, Some("secret-token")), None);
+        assert_eq!(rejection_status(&cli, None), None);
+    }
+
+    #[test]
+    fn malicious_host_and_origin_are_rejected() {
+        let hostile_host = request(
+            "/api/config",
+            "deepseek-science.attacker.invalid",
+            None,
+            Some("secret-token"),
+        );
+        let hostile_origin = request(
+            "/api/config",
+            "127.0.0.1:17896",
+            Some("http://localhost.attacker.invalid"),
+            Some("secret-token"),
+        );
+
+        assert_eq!(
+            rejection_status(&hostile_host, Some("secret-token")),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            rejection_status(&hostile_origin, Some("secret-token")),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn token_comparison_checks_content_and_length() {
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"samf"));
+        assert!(!constant_time_eq(b"same", b"same-longer"));
+    }
 }

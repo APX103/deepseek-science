@@ -32,6 +32,18 @@ pub struct ChatMessage {
     /// role=tool 时可选的工具名（OpenAI 协议非必需，但便于日志）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// DeepSeek reasoning shown in the UI and persisted locally. The HTTP
+    /// client replays it for every DeepSeek V4 assistant history message,
+    /// whose thinking-mode protocol requires it on subsequent requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// Per-assistant-message usage metadata for refresh/restart recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// UI-only tool result state. Persisted locally so a failed tool remains
+    /// failed after reload; the HTTP client omits it from upstream payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// 内部 harness 提示标记；不发往 LLM，仅用于落库/恢复时区分系统提示。
     #[serde(skip)]
     pub harness_notice: bool,
@@ -45,6 +57,9 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+            usage: None,
+            is_error: None,
             harness_notice: false,
         }
     }
@@ -55,6 +70,9 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+            usage: None,
+            is_error: None,
             harness_notice: false,
         }
     }
@@ -65,6 +83,9 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+            usage: None,
+            is_error: None,
             harness_notice: false,
         }
     }
@@ -76,6 +97,9 @@ impl ChatMessage {
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+            usage: None,
+            is_error: None,
             harness_notice: false,
         }
     }
@@ -91,6 +115,9 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name,
+            reasoning_content: None,
+            usage: None,
+            is_error: None,
             harness_notice: false,
         }
     }
@@ -132,6 +159,10 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// DeepSeek V4-only thinking-mode override. `None` preserves the client's
+    /// compatibility-based default; generic OpenAI-compatible providers never
+    /// receive a `thinking` field, even when this is set.
+    pub thinking_enabled: Option<bool>,
     /// 可用工具定义（function-calling）。
     pub tools: Option<Vec<ToolDef>>,
     /// `"auto"` / `"none"` / 指定；None 时不发该字段。
@@ -145,6 +176,7 @@ impl ChatRequest {
             messages,
             max_tokens: None,
             temperature: None,
+            thinking_enabled: None,
             tools: None,
             tool_choice: None,
         }
@@ -186,7 +218,7 @@ pub struct ToolFunction {
 }
 
 /// token 用量（OpenAI `usage.prompt_tokens` / `completion_tokens`）。
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,

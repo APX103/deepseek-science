@@ -1,0 +1,9 @@
+sample,condition,replicate,GeneA,GeneB,GeneC
+C1,control,1,10.0,20.1,5.0
+C2,control,2,10.4,19.8,8.9
+C3,control,3,9.8,20.2,3.1
+C4,control,4,10.2,19.9,7.4
+T1,treatment,1,20.1,20.0,4.8
+T2,treatment,2,19.6,20.3,11.2
+T3,treatment,3,20.5,19.7,2.7
+T4,treatment,4,19.9,20.1,9.6

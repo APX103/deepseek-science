@@ -10,6 +10,8 @@ export interface AppConfig {
   llm_configured: boolean
   model: string
   base_url: string
+  revision: number
+  overridden_fields: LlmOverriddenField[]
   context_window: number
   has_mcp: boolean
   mcp_count: number
@@ -24,14 +26,83 @@ export interface AppSettingsProvider {
   base_url: string
   api_key_masked: string
   enabled: boolean
+  /** 仅在保存设置时发送；GET /settings 永不返回明文 key。 */
+  api_key?: string
   /** 契约外的本地扩展：每个 provider 记录默认模型（Settings 弹层可编辑）。 */
   model?: string
 }
 
+export interface A2aAgentInterfaceSummary {
+  url: string
+  protocol_binding: string
+  protocol_version: string
+}
+
+export interface A2aAgentCardSummary {
+  name: string
+  description: string
+  version: string
+  protocol_version: string
+  skills: string[]
+  supported_interfaces: A2aAgentInterfaceSummary[]
+}
+
+/**
+ * A configured outbound A2A peer. Runtime/card fields are observations from
+ * the backend and are never written back as authoritative configuration.
+ */
+export interface A2aAgentSettings {
+  id: string
+  name: string
+  endpoint: string
+  enabled: boolean
+  timeout_seconds: number
+  bearer_token_masked: string
+  /** Only present in the single outbound settings save containing a new token. */
+  bearer_token?: string
+  /** Outbound-only explicit credential removal; never trusted from a server response. */
+  clear_bearer_token?: boolean
+  status: string
+  last_error?: string | null
+  last_refreshed_at?: string | null
+  tool_name: string
+  card_summary?: A2aAgentCardSummary | null
+}
+
+export interface A2aAgentSettingsUpdate {
+  id: string
+  name: string
+  endpoint: string
+  enabled: boolean
+  timeout_seconds: number
+  bearer_token?: string
+  clear_bearer_token?: boolean
+}
+
+export type LlmOverriddenField = 'api_key' | 'base_url' | 'model'
+
 export interface AppSettings {
   providers: AppSettingsProvider[]
+  /** GET /settings always returns this list; optional keeps older saved mocks loadable. */
+  a2a_agents?: A2aAgentSettings[]
   model: string
   default_workspace: string
+  /** 兼容旧后端；当前热更新成功时为 false。 */
+  restart_required?: boolean
+  /** 运行中 LLM 快照的单调版本。 */
+  revision: number
+  /** 仅暴露覆盖来源，不包含任何环境变量值。 */
+  overridden_fields: LlmOverriddenField[]
+}
+
+/** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */
+export interface AppSettingsUpdate {
+  providers: AppSettingsProvider[]
+  a2a_agents: A2aAgentSettingsUpdate[]
+  model: string
+  default_workspace: string
+  /** Optimistic concurrency guard; stale full-form saves receive HTTP 409. */
+  revision: number
 }
 
 // ---------- MCP ----------
@@ -72,6 +143,8 @@ export interface Project {
   name: string
   description: string
   agent_context: string
+  /** 后端持久化的最近会话；打开项目时应优先恢复它。 */
+  last_session_id: string | null
   session_count: number
   pinned: boolean
   archived: boolean
@@ -106,7 +179,14 @@ export type ContentBlock =
 export interface Message {
   role: 'user' | 'assistant'
   content: string | ContentBlock[]
-  harness_notice?: boolean | null
+  /** 后端持久化的逐条 assistant token 用量，供刷新后恢复展示。 */
+  usage?: Usage | null
+  /** 持久化消息在 session 内覆盖到的最后 seq；仅恢复/挂接 run 元数据使用。 */
+  source_seq?: number
+  /** 新 schema 下消息所属 run；legacy 行可以为空。 */
+  source_run_id?: string | null
+  /** 结束于本消息后的持久化 run 终态。 */
+  run?: SessionRun
 }
 
 export interface PlanStep {
@@ -122,15 +202,39 @@ export interface Plan {
 export interface Artifact {
   path: string
   size: number
-  frame_id: string
+  /** null when the workspace scan has no persisted creation-frame metadata. */
+  frame_id: string | null
   kind: 'markdown' | 'tex' | 'pdf' | 'image' | 'data' | 'other'
-  origin: 'agent' | 'upload'
-  created_at: string
+  /** `unknown` means the file was found by workspace scan; its origin was not persisted. */
+  origin: 'agent' | 'upload' | 'unknown'
+  /** null when the backend has not persisted an artifact creation timestamp. */
+  created_at: string | null
 }
 
 export interface Usage {
   input_tokens: number
   output_tokens: number
+}
+
+/** 一次用户请求的持久化终态；和 canonical messages 一起按 session id 恢复。 */
+export interface SessionRun {
+  run_id: string
+  ordinal: number
+  frame_id: string
+  task_summary: string
+  plan_mode: boolean
+  status: SessionStatus
+  kind: RunKind
+  awaiting: AwaitingKind
+  pending_ask: PendingAsk | null
+  error: string | null
+  usage: Usage
+  iterations: number
+  plan: Plan | null
+  start_seq: number | null
+  end_seq: number | null
+  started_at: string
+  completed_at: string | null
 }
 
 export interface SessionState {
@@ -142,6 +246,7 @@ export interface SessionState {
   plan: Plan | null
   artifacts: Record<string, Artifact>
   messages: Message[]
+  runs: SessionRun[]
 }
 
 // ---------- Files ----------
@@ -153,7 +258,7 @@ export interface WorkspaceFile {
 
 // ---------- Run / Compile ----------
 export type RunKind = 'natural' | 'awaiting' | 'max_iters' | 'error' | 'cancelled'
-export type AwaitingKind = 'user_response' | 'plan_approval' | null
+export type AwaitingKind = 'user_response' | 'plan_approval' | 'plan_execution' | null
 
 /** ask_user 工具挂起的提问（complete.pending_ask）。 */
 export interface PendingAskOption {
@@ -167,8 +272,10 @@ export interface PendingAsk {
 }
 
 export interface RunReq {
+  run_id: string
   prompt: string
   plan_mode?: boolean
+  execute_plan?: boolean
   deep_review?: boolean
 }
 
@@ -202,6 +309,7 @@ export type SSEEvent =
   | { type: 'iteration'; n: number }
   | { type: 'thinking'; text: string }
   | { type: 'text'; text: string }
+  | { type: 'draft_reset'; reason: string }
   | { type: 'tool_calls'; calls: { id: string; name: string; input: Record<string, unknown> }[] }
   | { type: 'tool_results'; results: { tool_use_id: string; content: string; is_error: boolean }[] }
   | { type: 'plan_update'; plan: Plan }
@@ -217,7 +325,7 @@ export type SSEEvent =
       iterations: number
       frame_status: string
       plan?: Plan
-      artifacts: Record<string, Artifact>
+      artifacts?: Record<string, Artifact>
     }
   | { type: 'error'; message: string }
 
@@ -226,6 +334,9 @@ export interface BackendStatus {
   online: boolean
   llmConfigured: boolean
   model?: string
+  baseUrl?: string
+  revision?: number
+  overriddenFields?: LlmOverriddenField[]
 }
 
 // ---------- 日志 ----------

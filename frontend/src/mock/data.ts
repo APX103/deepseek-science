@@ -21,6 +21,7 @@ export const mockProjects: Project[] = [
     name: '钙钛矿太阳电池',
     description: '无铅钙钛矿材料调研与综述写作',
     agent_context: '聚焦 Sn/Sn-Ge 基无铅钙钛矿体系，输出中文学术综述。',
+    last_session_id: null,
     session_count: 1,
     pinned: false,
     archived: false,
@@ -32,6 +33,7 @@ export const mockProjects: Project[] = [
     name: 'Example project',
     description: '示例项目',
     agent_context: '',
+    last_session_id: null,
     session_count: 4,
     pinned: false,
     archived: false,
@@ -186,6 +188,7 @@ export const mockSessionState: SessionState = {
   plan: null,
   artifacts: Object.fromEntries(mockArtifacts.map((a) => [a.path, a])),
   messages: mockMessages,
+  runs: [],
 }
 
 export const mockFiles: WorkspaceFile[] = [
@@ -481,6 +484,8 @@ export const mockSettings: AppSettings = {
   ],
   model: 'deepseek-chat',
   default_workspace: '~/.deepseek-science',
+  revision: 0,
+  overridden_fields: [],
 }
 
 export const mockMcpServers: McpServer[] = [

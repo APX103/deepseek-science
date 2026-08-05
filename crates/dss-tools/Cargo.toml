@@ -6,6 +6,7 @@ description = "Deepseek Science tool system (Tool trait, registry, router, built
 
 [dependencies]
 dss-core = { path = "../dss-core" }
+dss-a2a = { path = "../dss-a2a" }
 dss-skills = { path = "../dss-skills" }
 dss-mcp = { path = "../dss-mcp" }
 dss-llm = { path = "../dss-llm" }
@@ -17,3 +18,4 @@ tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
+libc.workspace = true

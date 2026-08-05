@@ -36,6 +36,11 @@ pub enum AgentEvent {
     Text {
         text: String,
     },
+    /// The streamed thinking/text since the previous reset is an internal draft and must be
+    /// removed from the user-visible buffer before the next iteration starts. Tool events remain.
+    DraftReset {
+        reason: String,
+    },
     /// 一次 assistant 回复里的工具调用批次（前端按 call.id 去重追加）。
     ToolCalls {
         calls: Vec<ToolCallView>,

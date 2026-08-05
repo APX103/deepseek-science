@@ -3,8 +3,12 @@
 
 use dss_db::{
     repo,
-    repo::{MessageRow, ProjectRow, SessionRow},
+    repo::{MessageRow, ProjectRow, RunRow, SessionRow},
     DbError, DbPool,
+};
+
+pub use dss_db::repo::{
+    PersistCheckpointRequest, PersistMessage, PersistRunRequest, PersistRunResult,
 };
 
 /// 取连接并跑一个拿 &Connection 的闭包；interact 内部 spawn_blocking。
@@ -22,7 +26,7 @@ where
 // ---------------- projects ----------------
 
 pub async fn ensure_default_project(pool: &DbPool) -> Result<ProjectRow, DbError> {
-    with_conn(pool, |c| repo::ensure_default_project(c)).await
+    with_conn(pool, repo::ensure_default_project).await
 }
 
 pub async fn list_projects(
@@ -40,9 +44,10 @@ pub async fn create_project(
     pool: &DbPool,
     name: String,
     description: Option<String>,
+    agent_context: Option<String>,
 ) -> Result<ProjectRow, DbError> {
     with_conn(pool, move |c| {
-        repo::create_project(c, &name, description.as_deref())
+        repo::create_project(c, &name, description.as_deref(), agent_context.as_deref())
     })
     .await
 }
@@ -52,6 +57,7 @@ pub async fn update_project(
     id: String,
     name: Option<String>,
     description: Option<String>,
+    agent_context: Option<String>,
     last_session_id: Option<String>,
 ) -> Result<ProjectRow, DbError> {
     with_conn(pool, move |c| {
@@ -60,6 +66,7 @@ pub async fn update_project(
             &id,
             name.as_deref(),
             description.as_deref(),
+            agent_context.as_deref(),
             last_session_id.as_deref(),
         )
     })
@@ -105,11 +112,27 @@ pub async fn get_session_row(pool: &DbPool, id: String) -> Result<Option<Session
 }
 
 pub async fn list_session_rows(pool: &DbPool) -> Result<Vec<SessionRow>, DbError> {
-    with_conn(pool, |c| repo::list_sessions(c)).await
+    with_conn(pool, repo::list_sessions).await
 }
 
 pub async fn set_session_title(pool: &DbPool, id: String, title: String) -> Result<(), DbError> {
     with_conn(pool, move |c| repo::set_session_title(c, &id, &title)).await
+}
+
+pub async fn set_session_status(pool: &DbPool, id: String, status: String) -> Result<(), DbError> {
+    with_conn(pool, move |c| repo::set_session_status(c, &id, &status)).await
+}
+
+pub async fn rebase_session_workspace(
+    pool: &DbPool,
+    id: String,
+    expected_workspace: String,
+    new_workspace: String,
+) -> Result<bool, DbError> {
+    with_conn(pool, move |c| {
+        repo::rebase_session_workspace(c, &id, &expected_workspace, &new_workspace)
+    })
+    .await
 }
 
 pub async fn set_session_plan(
@@ -119,6 +142,18 @@ pub async fn set_session_plan(
 ) -> Result<(), DbError> {
     with_conn(pool, move |c| {
         repo::set_session_plan(c, &id, plan_data.as_deref())
+    })
+    .await
+}
+
+pub async fn set_session_plan_and_status(
+    pool: &DbPool,
+    id: String,
+    plan_data: Option<String>,
+    status: String,
+) -> Result<(), DbError> {
+    with_conn(pool, move |c| {
+        repo::set_session_plan_and_status(c, &id, plan_data.as_deref(), &status)
     })
     .await
 }
@@ -148,6 +183,24 @@ pub async fn append_message(
 
 pub async fn list_messages(pool: &DbPool, session_id: String) -> Result<Vec<MessageRow>, DbError> {
     with_conn(pool, move |c| repo::list_messages(c, &session_id)).await
+}
+
+pub async fn list_runs(pool: &DbPool, session_id: String) -> Result<Vec<RunRow>, DbError> {
+    with_conn(pool, move |c| repo::list_runs(c, &session_id)).await
+}
+
+pub async fn persist_run(
+    pool: &DbPool,
+    request: PersistRunRequest,
+) -> Result<PersistRunResult, DbError> {
+    with_conn(pool, move |c| repo::persist_run(c, &request)).await
+}
+
+pub async fn append_history_checkpoint(
+    pool: &DbPool,
+    request: PersistCheckpointRequest,
+) -> Result<usize, DbError> {
+    with_conn(pool, move |c| repo::append_history_checkpoint(c, &request)).await
 }
 
 /// 批量顺序写入若干消息（一个 interact 任务里，避免多次取连接）。

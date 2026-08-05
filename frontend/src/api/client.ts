@@ -1,23 +1,18 @@
-// API 客户端：projects/sessions/health/config/skills/templates/logs 走真实后端；
-// Settings/MCP 列表仍用 localStorage（后端尚未提供对应端点）；
-// Files/Artifacts/Compile/runOnce 仍 mock（前端未接线）。
+// API 客户端：核心用户路径全部走真实后端；MCP 列表暂保留 localStorage。
 import type {
   AppConfig,
   AppSettings,
+  AppSettingsUpdate,
   Artifact,
   BackendStatus,
-  CompileReq,
-  CompileResult,
-  ContentBlock,
   HealthResponse,
   LogEntry,
   McpServer,
   Memory,
-  Message,
   Plan,
   Project,
   ProjectDetail,
-  RunResult,
+  SessionRun,
   SessionState,
   SessionSummary,
   Skill,
@@ -26,12 +21,15 @@ import type {
   WorkspaceFile,
 } from "../types";
 import {
-  mockArtifacts,
-  mockFiles,
+  attachSessionRuns,
+  restoreVisibleMessages,
+  type PersistedSessionMessage,
+} from "./sessionMessages";
+import { buildRunPayload, type StreamRunOptions } from "./sessionRun";
+import { withApiToken } from "./auth";
+import {
   mockLogs,
   mockMcpServers,
-  mockSettings,
-  mockSkills,
   mockTemplates,
 } from "../mock/data";
 
@@ -49,9 +47,22 @@ export function apiBase(): string {
   return port ? `http://127.0.0.1:${port}/api` : "/api";
 }
 
+function apiToken(): string | undefined {
+  return (window as unknown as { __DSS_API_TOKEN__?: string })
+    .__DSS_API_TOKEN__;
+}
+
+/** Every backend fetch, including streaming and binary files, uses the same capability header. */
+function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, {
+    ...init,
+    headers: withApiToken(apiToken(), init.headers),
+  });
+}
+
 /** 统一 fetch 封装：非 ok 抛错；ok 解 JSON。 */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(`${apiBase()}${path}`, init);
+  const r = await apiFetch(`${apiBase()}${path}`, init);
   if (!r.ok) {
     let msg = `${r.status} ${r.statusText}`;
     try {
@@ -66,7 +77,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T;
 }
 
-/** localStorage 写助手（仅 settings/mcp 仍在本地）。 */
+/** localStorage 写助手（仅 MCP 设置仍在本地）。 */
 function readLS<T>(key: string, seed: T[]): T[] {
   try {
     const raw = localStorage.getItem(key);
@@ -88,16 +99,20 @@ export async function getHealth(): Promise<HealthResponse> {
 }
 
 export async function getConfig(): Promise<AppConfig> {
-  // 后端 GET /api/config 当前返回子集（llm_configured/model/base_url）；补默认值给前端。
+  // 后端 GET /api/config 返回运行中 LLM 快照字段；补其余默认值给前端。
   const c = await request<{
     llm_configured: boolean;
     model: string;
     base_url: string;
+    revision: number;
+    overridden_fields: AppConfig["overridden_fields"];
   }>("/config");
   return {
     llm_configured: c.llm_configured,
     model: c.model,
     base_url: c.base_url,
+    revision: c.revision,
+    overridden_fields: c.overridden_fields,
     context_window: 128_000,
     has_mcp: false,
     mcp_count: 0,
@@ -108,26 +123,18 @@ export async function getConfig(): Promise<AppConfig> {
   };
 }
 
-const SETTINGS_KEY = "dss_settings";
-
 export async function getSettings(): Promise<AppSettings> {
-  // 后端 /api/settings 端点尚未做；暂走 localStorage。
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return JSON.parse(raw) as AppSettings;
-  } catch {
-    // 解析失败则回退 mock
-  }
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(mockSettings));
-  return structuredClone(mockSettings);
+  return request<AppSettings>("/settings");
 }
 
 export async function saveSettings(
-  patch: Partial<AppSettings>,
+  settings: AppSettingsUpdate,
 ): Promise<AppSettings> {
-  const next = { ...(await getSettings()), ...patch };
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
-  return next;
+  return request<AppSettings>("/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
 }
 
 // ---------- MCP ----------
@@ -150,11 +157,7 @@ export async function deleteMemory(_memId: string): Promise<void> {}
 
 // ---------- Skills / 模板 ----------
 export async function listSkills(): Promise<Skill[]> {
-  try {
-    return await request<Skill[]>("/skills");
-  } catch {
-    return mockSkills;
-  }
+  return request<Skill[]>("/skills");
 }
 
 export async function listTemplates(): Promise<TemplateInfo[]> {
@@ -167,7 +170,7 @@ export async function listTemplates(): Promise<TemplateInfo[]> {
 
 export async function getTemplate(templateId: string): Promise<string> {
   try {
-    const r = await fetch(
+    const r = await apiFetch(
       `${apiBase()}/templates/${encodeURIComponent(templateId)}`,
     );
     if (!r.ok) throw new Error(`${r.status}`);
@@ -184,6 +187,7 @@ interface ProjectRowBE {
   id: string;
   name: string;
   description: string | null;
+  agent_context: string | null;
   last_session_id: string | null;
   archived: boolean;
   created_at: string;
@@ -195,7 +199,8 @@ function mapProject(r: ProjectRowBE): Project {
     id: r.id,
     name: r.name,
     description: r.description ?? "",
-    agent_context: "",
+    agent_context: r.agent_context ?? "",
+    last_session_id: r.last_session_id,
     session_count: 0,
     pinned: false,
     archived: r.archived,
@@ -223,6 +228,7 @@ export async function createProject(input: {
     body: JSON.stringify({
       name: input.name,
       description: input.description ?? null,
+      agent_context: input.agent_context ?? null,
     }),
   });
   return mapProject(row);
@@ -240,6 +246,7 @@ export async function updateProject(
       body: JSON.stringify({
         name: patch.name,
         description: patch.description,
+        agent_context: patch.agent_context,
       }),
     },
   );
@@ -302,22 +309,93 @@ interface SessionRowBE {
 }
 
 function mapSession(r: SessionRowBE): SessionSummary {
-  // 后端 status: active/...；前端 SessionStatus: processing|completed|failed|interrupted|awaiting
-  const statusMap: Record<string, SessionSummary["status"]> = {
-    active: "completed",
-    processing: "processing",
-    completed: "completed",
-    failed: "failed",
-    awaiting: "awaiting",
-  };
   return {
     id: r.id,
     project_id: r.project_id ?? "proj_default",
     title: r.title ?? "New session",
-    status: statusMap[r.status] ?? "completed",
+    status: normalizeSessionStatus(r.status),
     live: r.live ?? false,
     created_at: r.created_at,
     updated_at: r.updated_at,
+  };
+}
+
+export function normalizeSessionStatus(status: string): SessionSummary["status"] {
+  const statusMap: Record<string, SessionSummary["status"]> = {
+    active: "processing",
+    processing: "processing",
+    completed: "completed",
+    success: "completed",
+    failed: "failed",
+    error: "failed",
+    errored: "failed",
+    max_iters: "failed",
+    max_iterations: "failed",
+    exhausted: "failed",
+    timeout: "failed",
+    timed_out: "failed",
+    aborted: "failed",
+    awaiting: "awaiting",
+    awaiting_plan_approval: "awaiting",
+    awaiting_plan_execution: "awaiting",
+    awaiting_user_response: "awaiting",
+    cancelled: "interrupted",
+    canceled: "interrupted",
+    interrupted: "interrupted",
+    stopped: "interrupted",
+  };
+  return statusMap[status.trim().toLowerCase()] ?? "failed";
+}
+
+export interface SessionRunBE {
+  run_id: string;
+  ordinal: number;
+  frame_id: string;
+  task_summary: string;
+  plan_mode: boolean;
+  status: string;
+  kind: SessionRun["kind"];
+  awaiting?: SessionRun["awaiting"];
+  pending_ask?: SessionRun["pending_ask"];
+  error?: string | null;
+  usage?: SessionRun["usage"];
+  iterations?: number;
+  plan?: Plan | null;
+  start_seq?: number | null;
+  end_seq?: number | null;
+  started_at: string;
+  completed_at?: string | null;
+}
+
+export function mapSessionRun(run: SessionRunBE): SessionRun {
+  const error =
+    run.error ??
+    (run.kind === "error"
+      ? "Agent 执行失败，后端未返回详细原因。"
+      : run.kind === "max_iters"
+        ? "Agent 达到迭代上限，后端未返回详细原因。"
+        : null);
+  return {
+    run_id: run.run_id,
+    ordinal: run.ordinal,
+    frame_id: run.frame_id,
+    task_summary: run.task_summary,
+    plan_mode: run.plan_mode,
+    status:
+      run.kind === "error" || run.kind === "max_iters" || error
+        ? "failed"
+        : normalizeSessionStatus(run.status),
+    kind: run.kind,
+    awaiting: run.awaiting ?? null,
+    pending_ask: run.pending_ask ?? null,
+    error,
+    usage: run.usage ?? { input_tokens: 0, output_tokens: 0 },
+    iterations: run.iterations ?? 0,
+    plan: run.plan ?? null,
+    start_seq: run.start_seq ?? null,
+    end_seq: run.end_seq ?? null,
+    started_at: run.started_at,
+    completed_at: run.completed_at ?? null,
   };
 }
 
@@ -331,16 +409,19 @@ export async function probeBackend(): Promise<BackendStatus> {
   try {
     const base = apiBase();
     console.log("[probeBackend] probing", base);
-    const h = await fetch(`${base}/health`);
+    const h = await apiFetch(`${base}/health`);
     console.log("[probeBackend] health", h.status);
     if (!h.ok) return { online: false, llmConfigured: false };
-    const c = await fetch(`${base}/config`);
+    const c = await apiFetch(`${base}/config`);
     console.log("[probeBackend] config", c.status);
     const cfg = c.ok ? ((await c.json()) as AppConfig) : null;
     return {
       online: true,
       llmConfigured: cfg?.llm_configured ?? false,
       model: cfg?.model,
+      baseUrl: cfg?.base_url,
+      revision: cfg?.revision,
+      overriddenFields: cfg?.overridden_fields,
     };
   } catch (e) {
     console.error("[probeBackend] failed", e);
@@ -358,7 +439,7 @@ export async function createSessionApi(
   model: string;
   workspace: string;
 }> {
-  const r = await fetch(`${apiBase()}/sessions`, {
+  const r = await apiFetch(`${apiBase()}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId }),
@@ -376,78 +457,31 @@ export async function createSessionApi(
 export async function getSession(sid: string): Promise<SessionState> {
   const data = await request<{
     id: string;
+    frame_id?: string;
     title: string | null;
     workspace: string;
     model: string | null;
     status: string;
     plan_mode: boolean;
+    plan?: Plan | null;
+    artifacts?: Record<string, Artifact>;
     project_id: string | null;
-    messages: { role: string; content: unknown; harness_notice: boolean }[];
+    messages: PersistedSessionMessage[];
+    runs?: SessionRunBE[];
   }>(`/sessions/${encodeURIComponent(sid)}`);
-  // 后端把每条消息存为「OpenAI 协议形态 ChatMessage」对象（{role,content,tool_calls,tool_call_id,name}）。
-  // 转成前端 Message：content 拼 ContentBlock[]（text / tool_use / tool_result），ChatArea pairTools 据此渲染。
-  const messages: Message[] = data.messages.map((m) => {
-    const obj = (m.content ?? {}) as {
-      content?: string | null;
-      tool_calls?: {
-        id: string;
-        function: { name: string; arguments: string };
-      }[];
-      tool_call_id?: string;
-    };
+  const runs = (data.runs ?? []).map(mapSessionRun);
+  const messages = attachSessionRuns(restoreVisibleMessages(data.messages), runs);
 
-    // tool 结果：单独一条 user-role tool_result 块（前端按 tool_use_id 配对）。
-    if (m.role === "tool") {
-      return {
-        role: "user",
-        content: [
-          {
-            type: "tool_result" as const,
-            tool_use_id: obj.tool_call_id ?? "",
-            content: obj.content ?? "",
-            is_error: false,
-          },
-        ],
-        harness_notice: m.harness_notice ? true : null,
-      };
-    }
-
-    const role: "user" | "assistant" = m.role === "user" ? "user" : "assistant";
-    const blocks: ContentBlock[] = [];
-    if (obj.content) blocks.push({ type: "text", text: obj.content });
-    if (obj.tool_calls) {
-      for (const tc of obj.tool_calls) {
-        let input: Record<string, unknown> = {};
-        try {
-          input = JSON.parse(tc.function.arguments || "{}") as Record<
-            string,
-            unknown
-          >;
-        } catch {
-          input = { _raw: tc.function.arguments };
-        }
-        blocks.push({
-          type: "tool_use",
-          id: tc.id,
-          name: tc.function.name,
-          input,
-        });
-      }
-    }
-    // 无文本无工具调用时，content 用空字符串兜底（避免 ContentBlock[] 为空被当 string）。
-    const content: ContentBlock[] | string =
-      blocks.length > 0 ? blocks : (obj.content ?? "");
-    return { role, content, harness_notice: m.harness_notice ? true : null };
-  });
   return {
     id: data.id,
-    frame_id: "",
-    status: "completed",
+    frame_id: data.frame_id ?? "",
+    status: normalizeSessionStatus(data.status),
     task_summary: data.title ?? "",
     plan_mode: data.plan_mode,
-    plan: null,
-    artifacts: {},
+    plan: data.plan ?? null,
+    artifacts: data.artifacts ?? {},
     messages,
+    runs,
   };
 }
 
@@ -457,47 +491,94 @@ export async function deleteSession(sid: string): Promise<void> {
   });
 }
 
+/** 批准当前挂起的研究计划；执行由下一次显式 execute_plan stream 启动。 */
+export async function approvePlan(
+  sid: string,
+): Promise<{ approved: boolean; steps: Plan["steps"] }> {
+  return request<{ approved: boolean; steps: Plan["steps"] }>(
+    `/sessions/${encodeURIComponent(sid)}/approve`,
+    { method: "POST" },
+  );
+}
+
+/** Request cancellation and wait until the backend has released the session.
+ * `cancelled=false` means normal completion already won the race and its SSE
+ * terminal event should be allowed to update the UI. */
+export async function cancelSessionRun(
+  sid: string,
+  runId: string,
+): Promise<{ cancelled: boolean }> {
+  return request<{ cancelled: boolean }>(
+    `/sessions/${encodeURIComponent(sid)}/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    },
+  );
+}
+
 // ---------- Files ----------
-export async function listFiles(_sid: string): Promise<WorkspaceFile[]> {
-  return mockFiles;
+export async function listFiles(sid: string): Promise<WorkspaceFile[]> {
+  const data = await request<{ files: WorkspaceFile[] }>(
+    `/sessions/${encodeURIComponent(sid)}/files`,
+  );
+  return data.files;
 }
 
-export async function readFile(_sid: string, _path: string): Promise<string> {
-  return "";
-}
-
-export async function deleteFile(_sid: string, _path: string): Promise<void> {}
-
-// ---------- Run / Compile ----------
-export async function runOnce(
-  _sid: string,
-  _prompt: string,
-): Promise<RunResult> {
+/**
+ * A workspace directory scan proves only that a file exists. Until artifact
+ * provenance is persisted, it must not be attributed to the current frame,
+ * an upload, or an Agent run.
+ */
+export function workspaceFileToArtifact(file: WorkspaceFile): Artifact {
   return {
-    kind: "natural",
-    final_text: "",
-    awaiting: null,
-    usage: { input_tokens: 0, output_tokens: 0 },
-    iterations: 0,
+    path: file.path,
+    size: file.size,
+    frame_id: null,
+    kind: workspaceArtifactKind(file.path),
+    origin: "unknown",
+    created_at: null,
   };
 }
 
-export async function compileTex(
-  _sid: string,
-  _req: CompileReq,
-): Promise<CompileResult> {
-  return {
-    success: true,
-    pdf_path: "review_leadfree_perovskite.pdf",
-    size_kb: 871,
-    message: "",
-    errors: [],
-    log_excerpt: "",
-  };
+function workspaceArtifactKind(path: string): Artifact["kind"] {
+  const ext = path.split(".").pop()?.toLowerCase();
+  if (ext === "md") return "markdown";
+  if (ext === "tex") return "tex";
+  if (ext === "pdf") return "pdf";
+  if (["png", "jpg", "jpeg", "gif", "svg", "webp"].includes(ext ?? "")) return "image";
+  if (["csv", "tsv", "json", "xlsx", "xls"].includes(ext ?? "")) return "data";
+  return "other";
 }
 
-export async function listArtifacts(_sid: string): Promise<Artifact[]> {
-  return mockArtifacts;
+function encodeWorkspacePath(path: string): string {
+  return path
+    .split("/")
+    .filter((segment) => segment.length > 0)
+    .map(encodeURIComponent)
+    .join("/");
+}
+
+function fileUrl(sid: string, path: string): string {
+  return `${apiBase()}/sessions/${encodeURIComponent(sid)}/files/${encodeWorkspacePath(path)}`;
+}
+
+export async function readFile(sid: string, path: string): Promise<string> {
+  const r = await apiFetch(fileUrl(sid, path));
+  if (!r.ok) throw new Error(`读取文件失败：HTTP ${r.status}`);
+  return r.text();
+}
+
+export async function readFileBlob(sid: string, path: string): Promise<Blob> {
+  const r = await apiFetch(fileUrl(sid, path));
+  if (!r.ok) throw new Error(`读取文件失败：HTTP ${r.status}`);
+  return r.blob();
+}
+
+export async function deleteFile(sid: string, path: string): Promise<void> {
+  const r = await apiFetch(fileUrl(sid, path), { method: "DELETE" });
+  if (!r.ok) throw new Error(`删除文件失败：HTTP ${r.status}`);
 }
 
 export { mockLogs };
@@ -511,6 +592,7 @@ export interface StreamHandlers {
   onIteration?: (n: number) => void;
   onThinking?: (text: string) => void;
   onText?: (text: string) => void;
+  onDraftReset?: (reason: string) => void;
   onToolCalls?: (
     calls: Extract<SSEEvent, { type: "tool_calls" }>["calls"],
   ) => void;
@@ -536,6 +618,9 @@ function dispatchEvent(ev: SSEEvent, h: StreamHandlers) {
       break;
     case "text":
       h.onText?.(ev.text);
+      break;
+    case "draft_reset":
+      h.onDraftReset?.(ev.reason);
       break;
     case "tool_calls":
       h.onToolCalls?.(ev.calls);
@@ -563,13 +648,14 @@ export function connectSSE(
   sid: string,
   prompt: string,
   handlers: StreamHandlers,
+  options: StreamRunOptions = {},
 ): () => void {
   const ctrl = new AbortController();
   let terminated = false; // 收到 complete/error 事件
 
   void (async () => {
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `${apiBase()}/sessions/${encodeURIComponent(sid)}/stream-sse`,
         {
           method: "POST",
@@ -577,7 +663,7 @@ export function connectSSE(
             "Content-Type": "application/json",
             Accept: "text/event-stream",
           },
-          body: JSON.stringify({ prompt }),
+          body: JSON.stringify(buildRunPayload(prompt, options)),
           signal: ctrl.signal,
         },
       );
@@ -607,9 +693,19 @@ export function connectSSE(
             } catch {
               continue; // 忽略无法解析的帧
             }
-            dispatchEvent(ev, handlers);
-            if (ev.type === "complete" || ev.type === "error")
+            if (ev.type === "complete" || ev.type === "error") {
+              // The first terminal frame owns the run. Mark it before invoking
+              // user code so a throwing terminal handler cannot be reported as
+              // a second transport error, then stop reading immediately.
               terminated = true;
+              const cancelReader = reader.cancel().catch(() => {
+                // The peer may already have closed after its terminal frame.
+              });
+              dispatchEvent(ev, handlers);
+              await cancelReader;
+              return;
+            }
+            dispatchEvent(ev, handlers);
           }
         }
       }
@@ -618,7 +714,7 @@ export function connectSSE(
         handlers.onError?.("连接中断：流在未收到 complete 时结束");
       }
     } catch (e) {
-      if (ctrl.signal.aborted) return; // 用户主动停止，不报错
+      if (terminated || ctrl.signal.aborted) return; // 已终止 / 用户主动停止，不报错
       handlers.onError?.(e instanceof Error ? e.message : String(e));
     }
   })();

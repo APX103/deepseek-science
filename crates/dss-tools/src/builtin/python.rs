@@ -1,18 +1,12 @@
-//! python 工具：最小子进程方案（非沙箱）。
-//!
-//! roadmap P2 明确「先用最小子进程方案，沙箱留 P9」。本工具：`python3 -c <code>`，
-//! cwd=workspace，捕获 stdout/stderr，超时 kill，kill_on_drop。
-//! 无 venv 注入、无变量跨调用持久（沙箱化 + 持久 state 是 P9/方向 2.1）。
-
-use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::process::Stdio;
-use tokio::process::Command;
+//! python 工具：解析可信 Python 3 后，在 macOS Seatbelt 工作区沙箱内执行。
 
 use crate::context::ToolContext;
 use crate::error::ToolError;
+use crate::sandbox::run_workspace_python;
 use crate::spec::{parse_args, Tool, ToolOutput, ToolSpec};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 #[derive(Deserialize)]
 struct PythonArgs {
@@ -28,7 +22,7 @@ impl Tool for PythonTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "python".into(),
-            description: "Run Python 3 code and return stdout+stderr and exit code. CWD is the workspace root. State does NOT persist between calls (fresh process each call). Non-zero exit is an error. Default timeout 30s.".into(),
+            description: "Run Python 3 code in a fail-closed macOS workspace sandbox and return stdout+stderr and exit code. The workspace is the only writable area; user files outside it and TCP/loopback network access are denied. HOME/TMPDIR are temporary workspace directories and inherited credentials/PYTHONPATH are cleared. State does NOT persist between calls. Non-zero exit is an error. Default timeout 30s. Start with a small deterministic probe; after an error, diagnose from the actual output and change the method instead of repeating the same code.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -40,26 +34,34 @@ impl Tool for PythonTool {
         }
     }
 
+    fn timeout(&self, args: &Value) -> std::time::Duration {
+        let requested = args
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, 300);
+        // Preserve the requested execution budget even when a compile currently owns the
+        // exclusive workspace guard.
+        std::time::Duration::from_secs(requested.saturating_add(190))
+    }
+
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError> {
         let a: PythonArgs = parse_args(&args)?;
         let timeout_secs = a.timeout.unwrap_or(30).clamp(1, 300);
+        // Python has the same workspace mutation authority as Bash. The shared process guard lets
+        // independent code calls stay parallel while compile/edit/write take exclusive access.
+        let _workspace_guard = ctx.lock_workspace_read().await;
 
-        let mut cmd = Command::new("python3");
-        cmd.arg("-c").arg(&a.code);
-        cmd.current_dir(&ctx.workspace);
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
-                .await
-                .map_err(|_| ToolError::Timeout(timeout_secs))??;
+        let output = run_workspace_python(
+            &ctx.workspace,
+            &a.code,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let code = output.status.code().unwrap_or(-1);
+        let code = output.status.and_then(|status| status.code()).unwrap_or(-1);
 
         let mut text = String::new();
         if !stdout.is_empty() {
@@ -71,10 +73,16 @@ impl Tool for PythonTool {
             }
             text.push_str(&stderr);
         }
+        if output.output_limit_exceeded {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[output limit exceeded; process tree terminated]");
+        }
         text.push_str(&format!("\n[exit code: {code}]"));
         let text = text.trim().to_string();
 
-        if code == 0 {
+        if code == 0 && !output.output_limit_exceeded {
             Ok(ToolOutput::ok(text))
         } else {
             Ok(ToolOutput::err(text))

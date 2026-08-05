@@ -8,6 +8,9 @@ pub enum LlmError {
     #[error("LLM API error (HTTP {status}): {message}")]
     Api { status: u16, message: String },
 
+    #[error("LLM request error: {0}")]
+    Request(String),
+
     #[error("LLM stream error: {0}")]
     Stream(String),
 

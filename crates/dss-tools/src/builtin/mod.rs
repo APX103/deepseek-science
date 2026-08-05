@@ -2,6 +2,7 @@
 //!
 //! 文件/bash/ask_user（P2a）+ web/python（P2b-tools）+ compile/skills（P5a）。
 
+pub mod a2a;
 pub mod ask_user;
 pub mod bash;
 pub mod compile;
