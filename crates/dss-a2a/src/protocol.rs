@@ -387,10 +387,10 @@ fn parse_message(
             "A2A Message role must be {expected_role}"
         )));
     }
-    if !object
+    if object
         .get(content_field)
         .and_then(Value::as_array)
-        .is_some_and(|parts| !parts.is_empty())
+        .is_none_or(|parts| parts.is_empty())
     {
         return Err(A2aError::Protocol(format!(
             "A2A Message {content_field} must be a non-empty array"

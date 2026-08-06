@@ -131,6 +131,15 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
                 updated_at      TEXT NOT NULL,
                 last_surfaced_at TEXT
             );
+            -- memory_events: 记忆生命周期审计（created/approved/rejected/superseded/deleted/surfaced/edited）
+            CREATE TABLE IF NOT EXISTS memory_events (
+                id          TEXT PRIMARY KEY,
+                memory_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                event_type  TEXT NOT NULL,
+                actor       TEXT,
+                detail      TEXT,
+                created_at  TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS logs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts            TEXT NOT NULL,
@@ -176,6 +185,19 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
     )?;
     ensure_column(c, "logs", "trace_id", "TEXT")?;
 
+    // --- memories: L2 Claim Store 升级（status/superseded_by/evidence/origin/valid_time/source_hash）---
+    ensure_column(c, "memories", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(c, "memories", "claim_type", "TEXT NOT NULL DEFAULT 'note'")?;
+    ensure_column(c, "memories", "evidence_refs", "TEXT")?;
+    ensure_column(c, "memories", "origin", "TEXT NOT NULL DEFAULT 'auto'")?;
+    ensure_column(c, "memories", "superseded_by", "TEXT")?;
+    ensure_column(c, "memories", "valid_from", "TEXT")?;
+    ensure_column(c, "memories", "valid_until", "TEXT")?;
+    ensure_column(c, "memories", "deleted_at", "TEXT")?;
+    ensure_column(c, "memories", "source_hash", "TEXT")?;
+    // source_hash 回填由 dss-memory 层惰性完成（SQLite 默认无 sha256 扩展；
+    // 哈希逻辑归一在 Rust 侧单点维护）。旧行 status/claim_type/origin 由 DEFAULT 兜底。
+
     // No run can still be active while startup migrations execute. A crash after a durable tool
     // checkpoint deliberately leaves `processing`; expose it as interrupted on restore instead
     // of pretending the old SSE worker still exists.
@@ -219,6 +241,10 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
             CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity);
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
             CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
+            CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+            CREATE INDEX IF NOT EXISTS idx_memories_source_hash ON memories(source_hash);
+            CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_mid ON memory_events(memory_id);
             CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
             CREATE INDEX IF NOT EXISTS idx_logs_session_ts ON logs(session_id, ts);
             CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);

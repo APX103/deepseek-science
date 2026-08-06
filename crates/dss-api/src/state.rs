@@ -356,6 +356,7 @@ mod active_run_tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await;
         assert!(

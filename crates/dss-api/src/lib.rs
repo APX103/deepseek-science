@@ -256,12 +256,26 @@ pub fn build_router(state: AppState) -> Router {
             "/api/projects/{pid}/unarchive",
             axum::routing::post(projects::unarchive_project),
         )
-        // memories
-        .route("/api/memories", get(memories::list_memories))
+        // memories（Claim Store 治理 API）
+        .route(
+            "/api/memories",
+            get(memories::list_memories).post(memories::create_memory),
+        )
         .route(
             "/api/memories/{mid}",
-            axum::routing::delete(memories::delete_memory),
+            get(memories::get_memory)
+                .patch(memories::edit_memory)
+                .delete(memories::delete_memory),
         )
+        .route(
+            "/api/memories/{mid}/approve",
+            axum::routing::post(memories::approve_memory),
+        )
+        .route(
+            "/api/memories/{mid}/reject",
+            axum::routing::post(memories::reject_memory),
+        )
+        .route("/api/memories/{mid}/history", get(memories::memory_history))
         // logs
         .route("/api/logs", get(logs::list_logs).delete(logs::delete_logs))
         .route("/api/logs/{id}", get(logs::get_log))

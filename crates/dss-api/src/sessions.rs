@@ -1078,6 +1078,7 @@ pub async fn stream_sse(
     let prompt = req.prompt;
     let sid_clone = sid.clone();
     let run_id_for_persist = run_id.clone();
+    let run_id_for_extract = run_id.clone();
     let run_started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let persistence_control = run_control.clone();
     // session 的 project_id（记忆按项目隔离）。
@@ -1415,30 +1416,52 @@ pub async fn stream_sse(
         // Only a naturally completed answer may influence long-term memory.
         // Cancelled/failed/awaiting runs are incomplete work and extracting them
         // would add cost while contaminating later research sessions.
-        if persistence_succeeded && should_extract_memory(outcome.kind) {
+        if persistence_succeeded
+            && should_extract_memory(outcome.kind)
+            && state.settings.memory.enabled
+        {
             if let Some(client) = llm_for_extract.as_ref() {
                 let msgs_snapshot: Vec<dss_llm::ChatMessage> =
                     session.messages[run_message_start.min(session.messages.len())..].to_vec();
-                let model_c = model.clone();
+                // extract_model 优先于主模型（可用更便宜/更快的模型抽取记忆）。
+                let model_c = state
+                    .settings
+                    .memory
+                    .extract_model
+                    .clone()
+                    .unwrap_or_else(|| model.clone());
                 let memory_c = memory.clone();
                 let pid_c = project_id.clone();
                 let client_c = client.clone();
+                let sid_c = sid_clone.clone();
+                let rid_c = run_id_for_extract.clone();
+                let seq_lo = checkpoint_start_seq.unwrap_or(1).max(1);
+                let seq_hi = seq_lo + msgs_snapshot.len() as i64;
                 tokio::spawn(async move {
                     match dss_memory::extract::extract(client_c.as_ref(), &model_c, &msgs_snapshot)
                         .await
                     {
                         Ok(items) if !items.is_empty() => {
-                            for body in items {
-                                let scope = if pid_c.is_none() {
-                                    Some("profile".into())
-                                } else {
-                                    Some("project".into())
-                                };
-                                if let Err(e) = memory_c.append(body, scope, pid_c.clone()).await {
-                                    tracing::warn!(error = %e, "memory append failed");
-                                }
-                            }
-                            tracing::info!("memory extract completed (background)");
+                            // 证据回溯：本次 run 的消息范围（供 L4 证据展开）。
+                            let evidence = vec![dss_memory::EvidenceRef {
+                                session_id: sid_c,
+                                run_id: Some(rid_c),
+                                seq_start: seq_lo,
+                                seq_end: seq_hi,
+                            }];
+                            let cfg = dss_memory::consolidate::ConsolidateConfig::default();
+                            let stats = dss_memory::consolidate::promote_candidates(
+                                &memory_c, items, pid_c, &evidence, &cfg,
+                            )
+                            .await;
+                            tracing::info!(
+                                active = stats.promoted_active,
+                                candidate = stats.promoted_candidate,
+                                superseded = stats.superseded,
+                                duplicates = stats.duplicates,
+                                errors = stats.errors,
+                                "memory consolidate completed (background)"
+                            );
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "memory extract failed (background)"),
@@ -1743,6 +1766,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -1812,6 +1836,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -1915,6 +1940,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -1953,6 +1979,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -1999,6 +2026,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -2065,6 +2093,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -2117,6 +2146,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -2178,6 +2208,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -2388,6 +2419,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");
@@ -2564,6 +2596,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state");

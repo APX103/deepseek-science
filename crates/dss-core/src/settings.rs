@@ -35,6 +35,8 @@ pub struct Settings {
     pub mcp_servers: Vec<McpServerConfig>,
     /// 远端 A2A Agent 配置。这里只保存客户端连接信息；本应用不暴露 A2A server。
     pub a2a_agents: Vec<A2aAgentConfig>,
+    /// 记忆系统配置（抽取/巩固/召回）。
+    pub memory: MemorySettings,
 }
 
 /// 一个用户显式信任并配置的远端 A2A Agent。
@@ -97,6 +99,39 @@ pub struct SkillSettings {
     pub include_cursor: bool,
     /// 额外的自定义 skill 目录（绝对路径）。
     pub custom_dirs: Vec<String>,
+}
+
+/// 记忆系统配置。持久化在 `settings.json` 的 `"memory"` 键下。
+///
+/// 控制抽取/巩固/召回行为。f64 字段使此结构无法 derive Eq，用 PartialEq。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// 是否启用记忆抽取/召回（false = 完全关闭记忆功能）。
+    pub enabled: bool,
+    /// 抽取用的模型（None = 用主模型 settings.llm.model）。
+    pub extract_model: Option<String>,
+    /// 自动晋升为 active 的最低 confidence（低于则进 candidate 待审）。
+    pub auto_promote_threshold: f64,
+    /// BM25 近似重复判定阈值（0..1，越高越严格）。
+    pub dedupe_similarity: f64,
+    /// 高风险（preference/decision）是否一律进 candidate 等审批（true=审批制）。
+    pub trust_high_risk_approve: bool,
+    /// 是否把高价值 profile 记忆注入 system prefix（默认 false：保护前缀缓存命中）。
+    pub always_on: bool,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            extract_model: None,
+            auto_promote_threshold: 0.5,
+            dedupe_similarity: 0.85,
+            trust_high_risk_approve: true,
+            always_on: false,
+        }
+    }
 }
 
 /// MCP server 配置。
@@ -225,6 +260,9 @@ struct FileSettings {
     /// 多 provider 列表。显式 `[]` 可清空继承的 provider；缺失则保留低优先级层。
     /// 为空时回退到 legacy `llm` 对象。
     providers: Option<Vec<FileLlmProvider>>,
+    /// 记忆系统配置（整体替换语义：高优先级文件的 memory 对象覆盖低层）。
+    #[serde(default)]
+    memory: Option<MemorySettings>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -581,6 +619,7 @@ impl Settings {
         let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
+        let mut memory = MemorySettings::default();
 
         // config.toml（低优先级文件）
         let config_toml = data_dir.join("config.toml");
@@ -590,6 +629,7 @@ impl Settings {
                 path: config_toml.clone(),
                 message: e.to_string(),
             })?;
+            let file_memory = file.memory.clone();
             file.apply_to(
                 &mut server,
                 &mut llm,
@@ -598,6 +638,9 @@ impl Settings {
                 &mut a2a_agents,
                 &mut providers,
             );
+            if let Some(m) = file_memory {
+                memory = m;
+            }
         }
 
         // settings.json（高优先级文件）
@@ -609,6 +652,8 @@ impl Settings {
                     path: settings_json.clone(),
                     message: e.to_string(),
                 })?;
+            // memory 整体替换语义（高优先级文件的 memory 覆盖低层）。
+            let file_memory = file.memory.clone();
             file.apply_to(
                 &mut server,
                 &mut llm,
@@ -617,6 +662,9 @@ impl Settings {
                 &mut a2a_agents,
                 &mut providers,
             );
+            if let Some(m) = file_memory {
+                memory = m;
+            }
         }
 
         // 没有显式 providers 列表时，从 legacy llm 对象生成一个兼容 provider。
@@ -639,6 +687,7 @@ impl Settings {
             log_level,
             mcp_servers,
             a2a_agents,
+            memory,
         })
     }
 }

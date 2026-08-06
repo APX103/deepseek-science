@@ -1008,6 +1008,67 @@ pub struct MemoryRow {
     pub created_at: String,
     pub updated_at: String,
     pub last_surfaced_at: Option<String>,
+    // --- L2 Claim Store 扩展字段 ---
+    pub status: String,
+    pub claim_type: String,
+    pub evidence_refs: Option<String>,
+    pub origin: String,
+    pub superseded_by: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub deleted_at: Option<String>,
+    pub source_hash: Option<String>,
+}
+
+/// 记忆写入参数：把 Claim Store 的丰富维度集中到一个结构，避免 append 签名爆炸。
+#[derive(Debug, Clone, Default)]
+pub struct NewMemory<'a> {
+    pub id: &'a str,
+    pub body: &'a str,
+    pub scope: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub confidence: Option<f64>,
+    pub claim_type: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub evidence_refs: Option<&'a str>,
+    pub source_hash: Option<&'a str>,
+    pub valid_until: Option<&'a str>,
+}
+
+/// memories 的统一 SELECT 列表（与 row_to_memory 的列序严格对齐）。
+const MEM_COLS: &str = "id, entity, scope, entity_type, body, project_id, confidence, \
+     created_at, updated_at, last_surfaced_at, status, claim_type, evidence_refs, origin, \
+     superseded_by, valid_from, valid_until, deleted_at, source_hash";
+
+pub fn append_memory_full(conn: &Connection, m: NewMemory<'_>) -> Result<MemoryRow, DbError> {
+    let now = now();
+    let scope = m.scope.unwrap_or("project");
+    let confidence = m.confidence.unwrap_or(0.5);
+    let claim_type = m.claim_type.unwrap_or("note");
+    let status = m.status.unwrap_or("active");
+    let origin = m.origin.unwrap_or("auto");
+    conn.execute(
+        "INSERT INTO memories (id, entity, scope, entity_type, body, project_id, confidence, \
+         created_at, updated_at, status, claim_type, evidence_refs, origin, valid_until, source_hash) \
+         VALUES (?1, ?2, ?3, 'note', ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            m.id,
+            scope,
+            scope,
+            m.body,
+            m.project_id,
+            confidence,
+            now,
+            status,
+            claim_type,
+            m.evidence_refs,
+            origin,
+            m.valid_until,
+            m.source_hash,
+        ],
+    )?;
+    get_memory(conn, m.id)?.ok_or_else(|| DbError::Other("just-inserted memory missing".into()))
 }
 
 pub fn append_memory(
@@ -1017,62 +1078,64 @@ pub fn append_memory(
     scope: Option<&str>,
     project_id: Option<&str>,
 ) -> Result<MemoryRow, DbError> {
-    let now = now();
-    conn.execute(
-        "INSERT INTO memories (id, entity, scope, entity_type, body, project_id, confidence, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, 'note', ?4, ?5, 0.5, ?6, ?6)",
-        params![id, scope.unwrap_or("project"), scope, body, project_id, now],
-    )?;
-    get_memory(conn, id)?.ok_or_else(|| DbError::Other("just-inserted memory missing".into()))
+    append_memory_full(
+        conn,
+        NewMemory {
+            id,
+            body,
+            scope,
+            project_id,
+            ..Default::default()
+        },
+    )
 }
 
 pub fn get_memory(conn: &Connection, id: &str) -> Result<Option<MemoryRow>, DbError> {
+    let sql = format!("SELECT {MEM_COLS} FROM memories WHERE id = ?1");
     let row = conn
-        .query_row(
-            "SELECT id, entity, scope, entity_type, body, project_id, confidence, created_at, updated_at, last_surfaced_at \
-             FROM memories WHERE id = ?1",
-            params![id],
-            |r| {
-                Ok(MemoryRow {
-                    id: r.get(0)?,
-                    entity: r.get(1)?,
-                    scope: r.get(2)?,
-                    entity_type: r.get(3)?,
-                    body: r.get(4)?,
-                    project_id: r.get(5)?,
-                    confidence: r.get(6)?,
-                    created_at: r.get(7)?,
-                    updated_at: r.get(8)?,
-                    last_surfaced_at: r.get(9)?,
-                })
-            },
-        )
+        .query_row(&sql, params![id], row_to_memory)
         .optional()?;
     Ok(row)
 }
 
-/// 列记忆：profile(scope=profile，跨项目) + 当前 project 的。entity 过滤可选（Rust 侧过滤）。
+/// 列记忆：profile(scope=profile，跨项目) + 当前 project 的。
+/// 可选过滤 status（默认只看 active + candidate，排除被替代/已删的）。
 pub fn list_memories(
     conn: &Connection,
     project_id: Option<&str>,
     entity: Option<&str>,
 ) -> Result<Vec<MemoryRow>, DbError> {
-    // profile 永可见 + 指定 project 的（SQL 侧），entity 在 Rust 侧过滤。
-    let sql = if project_id.is_some() {
-        "SELECT id, entity, scope, entity_type, body, project_id, confidence, created_at, updated_at, last_surfaced_at \
-         FROM memories WHERE scope = 'profile' OR project_id = ?1 ORDER BY updated_at DESC"
-    } else {
-        "SELECT id, entity, scope, entity_type, body, project_id, confidence, created_at, updated_at, last_surfaced_at \
-         FROM memories WHERE scope = 'profile' ORDER BY updated_at DESC"
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let rows_iter = if project_id.is_some() {
-        stmt.query_map(params![project_id], row_to_memory)?
-    } else {
-        stmt.query_map([], row_to_memory)?
-    };
-    let mut list: Vec<MemoryRow> = rows_iter.collect::<Result<Vec<_>, _>>()?;
-    if let Some(e) = entity {
+    list_memories_filtered(
+        conn,
+        MemoryFilter {
+            project_id,
+            entity,
+            status: None,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFilter<'a> {
+    pub project_id: Option<&'a str>,
+    pub entity: Option<&'a str>,
+    /// None = 不按 status 过滤（兼容旧调用）；Some = 仅返回该 status。
+    pub status: Option<&'a str>,
+}
+
+pub fn list_memories_filtered(
+    conn: &Connection,
+    f: MemoryFilter<'_>,
+) -> Result<Vec<MemoryRow>, DbError> {
+    let sql = format!(
+        "SELECT {MEM_COLS} FROM memories WHERE (scope = 'profile' OR (?1 IS NULL OR project_id = ?1)) \
+         AND (?2 IS NULL OR status = ?2) ORDER BY updated_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let pid = f.project_id;
+    let rows = stmt.query_map(params![pid, f.status], row_to_memory)?;
+    let mut list: Vec<MemoryRow> = rows.collect::<Result<Vec<_>, _>>()?;
+    if let Some(e) = f.entity {
         list.retain(|m| m.entity == e);
     }
     Ok(list)
@@ -1090,7 +1153,29 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
         last_surfaced_at: r.get(9)?,
+        status: r.get(10)?,
+        claim_type: r.get(11)?,
+        evidence_refs: r.get(12)?,
+        origin: r.get(13)?,
+        superseded_by: r.get(14)?,
+        valid_from: r.get(15)?,
+        valid_until: r.get(16)?,
+        deleted_at: r.get(17)?,
+        source_hash: r.get(18)?,
     })
+}
+
+/// 软删除：置 status=deleted + deleted_at，保留行用于审计。
+pub fn soft_delete_memory(conn: &Connection, id: &str) -> Result<(), DbError> {
+    let now = now();
+    let n = conn.execute(
+        "UPDATE memories SET status = 'deleted', deleted_at = ?2, updated_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound(format!("memory {id}")));
+    }
+    Ok(())
 }
 
 pub fn delete_memory(conn: &Connection, id: &str) -> Result<(), DbError> {
@@ -1101,12 +1186,143 @@ pub fn delete_memory(conn: &Connection, id: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// 标记被替代：old.status=superseded + old.superseded_by=new_id。
+pub fn supersede_memory(conn: &Connection, old_id: &str, new_id: &str) -> Result<(), DbError> {
+    let now = now();
+    let n = conn.execute(
+        "UPDATE memories SET status = 'superseded', superseded_by = ?2, updated_at = ?3 WHERE id = ?1 \
+         AND status IN ('active', 'candidate')",
+        params![old_id, new_id, now],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound(format!(
+            "active/candidate memory {old_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// 更新状态（active/candidate/superseded/expired/deleted）。
+pub fn update_memory_status(conn: &Connection, id: &str, status: &str) -> Result<(), DbError> {
+    let now = now();
+    let n = conn.execute(
+        "UPDATE memories SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, status, now],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound(format!("memory {id}")));
+    }
+    Ok(())
+}
+
+/// 编辑 body（创建新版本由调用方处理，这里只改文本，用于同版本订正）。
+/// source_hash 由调用方（dss-memory 层）用 memory_hash() 计算后传入，保证与去重路径一致。
+pub fn update_memory_body(
+    conn: &Connection,
+    id: &str,
+    body: &str,
+    source_hash: Option<&str>,
+) -> Result<(), DbError> {
+    let now = now();
+    let n = conn.execute(
+        "UPDATE memories SET body = ?2, source_hash = COALESCE(?3, source_hash), updated_at = ?4 WHERE id = ?1",
+        params![id, body, source_hash, now],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound(format!("memory {id}")));
+    }
+    Ok(())
+}
+
+/// 更新召回时间戳（批量）。
+pub fn touch_surfaced(conn: &Connection, ids: &[String]) -> Result<(), DbError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let now = now();
+    let tx = conn.unchecked_transaction()?;
+    for id in ids {
+        tx.execute(
+            "UPDATE memories SET last_surfaced_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 精确查 source_hash（去重用）。
+pub fn find_by_source_hash(
+    conn: &Connection,
+    hash: &str,
+    project_id: Option<&str>,
+) -> Result<Vec<MemoryRow>, DbError> {
+    let sql = format!(
+        "SELECT {MEM_COLS} FROM memories WHERE source_hash = ?1 \
+         AND (scope = 'profile' OR (?2 IS NULL OR project_id = ?2)) \
+         AND status IN ('active', 'candidate')"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![hash, project_id], row_to_memory)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// 取全部记忆（BM25 在 dss-memory 里做；这里只读候选集：profile + project）。
 pub fn candidate_memories(
     conn: &Connection,
     project_id: Option<&str>,
 ) -> Result<Vec<MemoryRow>, DbError> {
     list_memories(conn, project_id, None)
+}
+
+// ----------------- memory_events -----------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEventRow {
+    pub id: String,
+    pub memory_id: String,
+    pub event_type: String,
+    pub actor: Option<String>,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+pub fn append_memory_event(
+    conn: &Connection,
+    id: &str,
+    memory_id: &str,
+    event_type: &str,
+    actor: Option<&str>,
+    detail: Option<&str>,
+) -> Result<(), DbError> {
+    let now = now();
+    conn.execute(
+        "INSERT INTO memory_events (id, memory_id, event_type, actor, detail, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, memory_id, event_type, actor, detail, now],
+    )?;
+    Ok(())
+}
+
+pub fn list_memory_events(
+    conn: &Connection,
+    memory_id: &str,
+) -> Result<Vec<MemoryEventRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, memory_id, event_type, actor, detail, created_at FROM memory_events \
+         WHERE memory_id = ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![memory_id], |r| {
+        Ok(MemoryEventRow {
+            id: r.get(0)?,
+            memory_id: r.get(1)?,
+            event_type: r.get(2)?,
+            actor: r.get(3)?,
+            detail: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 // ----------------- logs -----------------

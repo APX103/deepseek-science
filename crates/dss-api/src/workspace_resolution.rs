@@ -147,6 +147,7 @@ mod tests {
             log_level: None,
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
         })
         .await
         .expect("build test application state")
