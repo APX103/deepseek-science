@@ -46,3 +46,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 include_dir = "0.7"
 libc = "0.2"
 sha2 = "0.10"
+tempfile = "3"

@@ -551,4 +551,91 @@ mod tests {
             .unwrap();
         assert_eq!(seqs, vec![1, 2]);
     }
+
+    #[test]
+    fn migration_creates_memory_events_table_and_claim_store_columns() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        apply_migrations(&mut c).unwrap();
+        apply_migrations(&mut c).unwrap(); // 幂等
+
+        // memory_events 表存在
+        let events_table: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_table, 1, "memory_events table must exist");
+
+        // memories 的 L2 Claim Store 新列存在
+        for column in [
+            "status",
+            "claim_type",
+            "evidence_refs",
+            "origin",
+            "superseded_by",
+            "valid_from",
+            "valid_until",
+            "deleted_at",
+            "source_hash",
+        ] {
+            let count: i64 = c
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1"),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "memories.{column} missing");
+        }
+
+        // 新列默认值正确：旧行 status=active, claim_type=note, origin=auto
+        c.execute(
+            "INSERT INTO memories (id, body, created_at, updated_at) VALUES ('m1', 'x', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let (status, claim_type, origin): (String, String, String) = c
+            .query_row(
+                "SELECT status, claim_type, origin FROM memories WHERE id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(claim_type, "note");
+        assert_eq!(origin, "auto");
+
+        // memory_events FK 级联：删 memory 应级联删其事件
+        c.execute(
+            "INSERT INTO memory_events (id, memory_id, event_type, created_at) \
+             VALUES ('e1', 'm1', 'created', 't')",
+            [],
+        )
+        .unwrap();
+        c.execute("DELETE FROM memories WHERE id='m1'", []).unwrap();
+        let orphaned: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE memory_id='m1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphaned, 0, "memory_events must cascade on memory delete");
+    }
+
+    #[test]
+    fn migration_adds_compaction_state_column_to_sessions() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        apply_migrations(&mut c).unwrap();
+        let count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'compaction_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "sessions.compaction_state missing");
+    }
 }
