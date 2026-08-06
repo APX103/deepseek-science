@@ -145,6 +145,27 @@ pub async fn promote_candidates(
         return stats;
     }
 
+    // FK 防御：project_id 对应的 project 可能已被删除（sessions.project_id 是 ON DELETE SET NULL，
+    // 但抽取拿到的可能是 run 持久化前的旧值）。无效 project_id 会因 FK 约束让 INSERT 静默失败。
+    // 降级为 profile（跨项目），保证记忆不丢；证据链里仍保留 session_id 可追溯。
+    let project_id = match project_id.as_deref() {
+        Some(pid) if !pid.is_empty() => match store.project_exists(pid.to_string()).await {
+            Ok(true) => project_id,
+            Ok(false) => {
+                tracing::warn!(
+                    project_id = pid,
+                    "consolidate: project not found, falling back to profile scope"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "consolidate: project_exists check failed, falling back to profile");
+                None
+            }
+        },
+        _ => project_id,
+    };
+
     // 候选集 = 同 scope 的 active+candidate 记忆（去重/替代判定用）。
     let existing = match store
         .list_filtered(MemoryFilter {

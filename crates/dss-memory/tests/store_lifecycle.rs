@@ -345,6 +345,30 @@ async fn recall_index_invalidates_after_write_and_rebuilds() {
 // ============ retention sweep ============
 
 #[tokio::test]
+async fn promote_falls_back_to_profile_when_project_missing() {
+    // FK 防御：无效 project_id 会因 FK 约束静默失败。
+    // promote_candidates 应把无效 project 降级为 profile，保证记忆不丢。
+    let store = fresh_store().await;
+    let cfg = ConsolidateConfig::default();
+
+    let stats = promote_candidates(
+        &store,
+        vec![mk_extracted("项目用 tokio", ClaimType::Fact, 0.9)],
+        Some("proj_does_not_exist".into()),
+        &[],
+        &cfg,
+    )
+    .await;
+
+    assert_eq!(stats.errors, 0, "no FK failure should occur");
+    assert_eq!(stats.promoted_active, 1, "memory must be written");
+    let mems = store.list(None, None).await.unwrap();
+    assert_eq!(mems.len(), 1);
+    assert_eq!(mems[0].scope.as_deref(), Some("profile"));
+    assert!(mems[0].project_id.is_none());
+}
+
+#[tokio::test]
 async fn retention_expires_past_valid_until() {
     let store = fresh_store().await;
     let past = "2020-01-01T00:00:00Z";

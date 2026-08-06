@@ -95,6 +95,16 @@ impl MemoryStore {
             .map_err(Self::interact_err)?
     }
 
+    /// project 是否存在（用于写入前 FK 防御：无效 project_id 降级为 profile，避免静默丢记忆）。
+    pub async fn project_exists(&self, project_id: String) -> Result<bool, DbError> {
+        let conn = self.pool.get().await.map_err(DbError::Pool)?;
+        let exists = conn
+            .interact(move |c| repo::get_project(c, &project_id).map(|r| r.is_some()))
+            .await
+            .map_err(Self::interact_err)?;
+        Ok(exists.unwrap_or(false))
+    }
+
     /// 用持久化倒排索引召回（懒加载 + 写入失效）。
     /// 返回 (id, score) 排序结果。只索引 active 记忆（candidate/superseded/deleted 不召回）。
     /// 调用方需自行用 id 去 get() 取完整行（通常 top-N 很小）。
