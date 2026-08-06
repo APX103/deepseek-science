@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { listSkills } from '../api/client'
 import type { Skill } from '../types'
 import Modal from './Modal'
+import MemoryPanel from './MemoryPanel'
 import Toggle from './Toggle'
 import {
   IconBook,
@@ -155,6 +156,8 @@ export default function SkillsModal({ onClose }: Props) {
                 )}
               </div>
             </>
+          ) : nav === 'memory' ? (
+            <MemoryPanel />
           ) : (
             <div className="flex flex-1 items-center justify-center text-[13px] text-ink3">
               <IconSliders className="mr-2" width={14} height={14} />

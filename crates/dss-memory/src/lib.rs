@@ -9,6 +9,7 @@ pub mod consolidate;
 pub mod events;
 pub mod extract;
 pub mod recall;
+pub mod retention;
 pub mod store;
 pub mod types;
 

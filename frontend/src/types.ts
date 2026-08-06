@@ -141,11 +141,37 @@ export interface McpServerUpdate {
 }
 
 // ---------- 记忆 ----------
+// 对齐后端 dss_db::repo::MemoryRow（完整 Claim Store 字段）。
 export interface Memory {
   id: string
   entity: string
-  content: string
+  scope: string | null
+  entity_type: string
+  body: string
+  project_id: string | null
+  confidence: number
+  created_at: string
   updated_at: string
+  last_surfaced_at: string | null
+  status: string // active | candidate | superseded | expired | deleted
+  claim_type: string // fact | preference | decision | procedure | repo | note
+  evidence_refs: string | null
+  origin: string // auto | explicit | imported
+  superseded_by: string | null
+  valid_from: string | null
+  valid_until: string | null
+  deleted_at: string | null
+  source_hash: string | null
+}
+
+// 记忆生命周期事件（memory_events）。
+export interface MemoryEvent {
+  id: string
+  memory_id: string
+  event_type: string // created | approved | rejected | superseded | deleted | surfaced | edited | expired
+  actor: string | null
+  detail: string | null
+  created_at: string
 }
 
 // ---------- Skills / 模板 ----------

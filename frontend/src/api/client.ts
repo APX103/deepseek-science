@@ -122,12 +122,64 @@ export async function saveSettings(
 // ---------- MCP ----------
 // MCP server 配置统一走后端 /api/settings（见 SettingsModal McpSection），不再使用 localStorage。
 
-// ---------- 记忆 ----------
-export async function listMemories(_entity?: string): Promise<Memory[]> {
-  return [];
+// ---------- 记忆（Claim Store 治理 API）----------
+export async function listMemories(opts?: {
+  entity?: string
+  project_id?: string
+  status?: string
+}): Promise<Memory[]> {
+  const params = new URLSearchParams();
+  if (opts?.entity) params.set("entity", opts.entity);
+  if (opts?.project_id) params.set("project_id", opts.project_id);
+  if (opts?.status) params.set("status", opts.status);
+  const qs = params.toString();
+  return request<Memory[]>(`/memories${qs ? "?" + qs : ""}`);
 }
 
-export async function deleteMemory(_memId: string): Promise<void> {}
+export async function createMemory(body: {
+  body: string
+  scope?: string
+  project_id?: string
+  claim_type?: string
+  confidence?: number
+}): Promise<Memory> {
+  return request<Memory>("/memories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getMemory(id: string): Promise<Memory> {
+  return request<Memory>(`/memories/${encodeURIComponent(id)}`);
+}
+
+export async function editMemory(id: string, body: string): Promise<void> {
+  await request<void>(`/memories/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+}
+
+export async function deleteMemory(id: string): Promise<void> {
+  // 软删除（status=deleted，保留审计）。
+  await request<void>(`/memories/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function approveMemory(id: string): Promise<void> {
+  await request<void>(`/memories/${encodeURIComponent(id)}/approve`, { method: "POST" });
+}
+
+export async function rejectMemory(id: string): Promise<void> {
+  await request<void>(`/memories/${encodeURIComponent(id)}/reject`, { method: "POST" });
+}
+
+export async function getMemoryHistory(id: string): Promise<import("../types").MemoryEvent[]> {
+  return request<import("../types").MemoryEvent[]>(
+    `/memories/${encodeURIComponent(id)}/history`,
+  );
+}
 
 // ---------- Skills / 模板 ----------
 export async function listSkills(): Promise<Skill[]> {

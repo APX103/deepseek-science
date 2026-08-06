@@ -1469,6 +1469,7 @@ pub async fn stream_sse(
                 let client_c = client.clone();
                 let sid_c = sid_clone.clone();
                 let rid_c = run_id_for_extract.clone();
+                let logs_c = state.logs.clone();
                 let seq_lo = checkpoint_start_seq.unwrap_or(1).max(1);
                 let seq_hi = seq_lo + msgs_snapshot.len() as i64;
                 tokio::spawn(async move {
@@ -1478,7 +1479,7 @@ pub async fn stream_sse(
                         Ok(items) if !items.is_empty() => {
                             // 证据回溯：本次 run 的消息范围（供 L4 证据展开）。
                             let evidence = vec![dss_memory::EvidenceRef {
-                                session_id: sid_c,
+                                session_id: sid_c.clone(),
                                 run_id: Some(rid_c),
                                 seq_start: seq_lo,
                                 seq_end: seq_hi,
@@ -1496,6 +1497,37 @@ pub async fn stream_sse(
                                 errors = stats.errors,
                                 "memory consolidate completed (background)"
                             );
+                            // 评测埋点：把巩固统计写进 logs（source=agent, kind=memory），
+                            // 供文章 §7 评测框架（capture precision / supersede 率 / candidate 积压）。
+                            let total = stats.promoted_active
+                                + stats.promoted_candidate
+                                + stats.superseded
+                                + stats.duplicates;
+                            let _ = logs_c
+                                .append(dss_observability::LogEntry {
+                                    level: "info".into(),
+                                    source: "agent".into(),
+                                    kind: "memory".into(),
+                                    session_id: Some(sid_c.clone()),
+                                    frame_id: None,
+                                    iteration: None,
+                                    message: format!(
+                                    "记忆巩固：{} 条候选 → {} 生效 / {} 待审 / {} 替代 / {} 重复",
+                                    total,
+                                    stats.promoted_active,
+                                    stats.promoted_candidate,
+                                    stats.superseded,
+                                    stats.duplicates,
+                                ),
+                                    detail: Some(serde_json::json!({
+                                        "promoted_active": stats.promoted_active,
+                                        "promoted_candidate": stats.promoted_candidate,
+                                        "superseded": stats.superseded,
+                                        "duplicates": stats.duplicates,
+                                        "errors": stats.errors,
+                                    })),
+                                })
+                                .await;
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "memory extract failed (background)"),
