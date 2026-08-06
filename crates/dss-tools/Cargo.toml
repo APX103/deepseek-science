@@ -10,6 +10,7 @@ dss-a2a = { path = "../dss-a2a" }
 dss-skills = { path = "../dss-skills" }
 dss-mcp = { path = "../dss-mcp" }
 dss-llm = { path = "../dss-llm" }
+dss-memory = { path = "../dss-memory" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

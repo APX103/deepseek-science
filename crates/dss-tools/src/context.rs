@@ -81,6 +81,10 @@ pub struct ToolContext {
     /// delegate 深度（modules.md 上限 2；主 agent 为 0，子为 1，孙为 2）。
     pub delegate_depth: u32,
     history_checkpoint_tx: Option<mpsc::Sender<HistoryCheckpoint>>,
+    /// 记忆库（阶段二：search_memory/read_memory 工具用）。None = 记忆功能关闭。
+    pub memory: Option<Arc<dss_memory::MemoryStore>>,
+    /// 当前 project_id（记忆按项目隔离召回）。
+    pub project_id: Option<String>,
 }
 
 /// plan 模式状态（generate_plan 产出）。
@@ -145,6 +149,8 @@ impl ToolContext {
             model: String::new(),
             delegate_depth: 0,
             history_checkpoint_tx: None,
+            memory: None,
+            project_id: None,
         }
     }
 
@@ -157,6 +163,17 @@ impl ToolContext {
     pub fn with_llm(mut self, llm: std::sync::Arc<dyn dss_llm::LlmClient>, model: String) -> Self {
         self.llm = Some(llm);
         self.model = model;
+        self
+    }
+
+    /// 注入记忆库（阶段二：让 search_memory/read_memory 工具可用）。
+    pub fn with_memory(
+        mut self,
+        memory: Arc<dss_memory::MemoryStore>,
+        project_id: Option<String>,
+    ) -> Self {
+        self.memory = Some(memory);
+        self.project_id = project_id;
         self
     }
 

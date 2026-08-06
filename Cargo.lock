@@ -596,6 +596,7 @@ dependencies = [
  "dss-core",
  "dss-llm",
  "dss-mcp",
+ "dss-memory",
  "dss-skills",
  "libc",
  "reqwest",

@@ -1,6 +1,8 @@
 //! recall：BM25 召回 + render_recall_block（产 `[Memory]` 块注入）。
+//!
+//! 召回优先走持久化倒排索引（RecallIndex，懒加载 + 写入失效），
+//! 避免每次全量重分词。命中后批量 touch_surfaced 打点（供 retention 判断使用率）。
 
-use crate::bm25;
 use crate::store::MemoryStore;
 use dss_db::repo::MemoryRow;
 use dss_db::DbError;
@@ -12,13 +14,23 @@ pub async fn recall(
     project_id: Option<&str>,
     top_n: usize,
 ) -> Result<Vec<MemoryRow>, DbError> {
-    let candidates = store.candidates(project_id.map(|s| s.to_string())).await?;
-    let scored = bm25::recall(&candidates, query);
-    Ok(scored
-        .into_iter()
-        .take(top_n)
-        .map(|(m, _)| m.clone())
-        .collect())
+    let hits = store.recall_indexed(query, project_id, top_n).await?;
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 索引返回 id+score，批量取完整行。只保留确实仍 active 的（防索引与 DB 短暂不一致）。
+    let mut out = Vec::with_capacity(hits.len());
+    for (id, _) in &hits {
+        if let Ok(Some(m)) = store.get(id.clone()).await {
+            if m.status == "active" {
+                out.push(m);
+            }
+        }
+    }
+    // 打点召回时间（best-effort，失败不影响召回）。
+    let ids: Vec<String> = out.iter().map(|m| m.id.clone()).collect();
+    let _ = store.touch_surfaced(ids).await;
+    Ok(out)
 }
 
 /// 把召回的记忆渲染成 `[Memory]` 注入块（作为 harness-notice system 消息）。

@@ -1143,6 +1143,36 @@ pub async fn stream_sse(
             run_context.push(m);
         }
 
+        // Always-on 记忆注入（默认关）：把高价值 profile 记忆注入 system prefix。
+        // ⚠️ 前缀缓存红线：此注入会改变 system prefix，破坏 DeepSeek 前缀缓存命中（招牌特性）。
+        // 因此默认 always_on=false；启用前需评估缓存命中率下降的 token 成本。
+        // on-demand BM25 召回（放 user 消息之后，runner.rs，不破坏缓存）仍是主路径。
+        if state.settings.memory.enabled && state.settings.memory.always_on {
+            if let Ok(profile_mems) = state
+                .memory
+                .list_filtered(dss_db::repo::MemoryFilter {
+                    project_id: None,
+                    entity: None,
+                    status: Some("active"),
+                })
+                .await
+            {
+                let top: Vec<_> = profile_mems
+                    .into_iter()
+                    .filter(|m| m.scope.as_deref() == Some("profile"))
+                    .take(3)
+                    .collect();
+                if !top.is_empty() {
+                    let block = dss_memory::render_recall_block(&top);
+                    if !block.is_empty() {
+                        let mut m = ChatMessage::system(block);
+                        m.harness_notice = true;
+                        run_context.push(m);
+                    }
+                }
+            }
+        }
+
         let (history_checkpoint_tx, history_checkpoint_rx) = mpsc::channel(1);
         let ctx = {
             // 复制全局 catalog（builtin+global+外部/custom），再叠加 project 源（workspace/.deepseek-science/skills）。
@@ -1162,6 +1192,10 @@ pub async fn stream_sse(
                     client.clone() as std::sync::Arc<dyn dss_llm::LlmClient>,
                     model.clone(),
                 );
+            }
+            // 注入记忆库（search_memory/read_memory 工具用）。enabled=false 时不注入（工具报未启用）。
+            if state.settings.memory.enabled {
+                tc = tc.with_memory(state.memory.clone(), project_id.clone());
             }
             tc
         };

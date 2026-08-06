@@ -171,6 +171,9 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
         "TEXT REFERENCES projects(id) ON DELETE SET NULL",
     )?;
     ensure_column(c, "sessions", "plan_data", "TEXT")?;
+    // compaction_state：持久化压缩视图态（JSON）。避免重启后首次请求 token 爆炸。
+    // 阶段二已为 CompactionState 加 serde derive；完整 restore/save 接线作为增强项。
+    ensure_column(c, "sessions", "compaction_state", "TEXT")?;
     ensure_column(
         c,
         "session_messages",

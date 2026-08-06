@@ -6,7 +6,7 @@
 use dss_llm::ChatMessage;
 
 /// 一个被折叠的区间：日志的 `[start_idx, end_idx)` 被 summary 消息替代（在 projection 里）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Fold {
     /// 折叠区间起点（含），日志索引。
     pub start_idx: usize,
@@ -19,7 +19,7 @@ pub struct Fold {
 }
 
 /// Session 上的压缩视图态。日志（session.messages）不被 mutate。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CompactionState {
     /// 已折叠的区间（按 start_idx 升序，互不重叠）。
     pub folds: Vec<Fold>,

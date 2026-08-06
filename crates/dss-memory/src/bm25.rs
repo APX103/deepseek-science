@@ -1,6 +1,11 @@
 //! memory recall BM25：k1=1.5, b=0.75，Okapi IDF，**CJK 每字成 token**。
 //!
 //! 注意：memory 的 k1=1.5 与 skills 的 k1=1.2 是两套独立常量（modules.md 决策，不要统一）。
+//!
+//! 两套召回路径：
+//! - `recall()`：无状态，每次对候选集全量分词打分。适合一次性/小集合（consolidate 去重）。
+//! - `RecallIndex`：持久化倒排索引，构建一次后多次查询 O(候选token数)。
+//!   MemoryStore 懒加载缓存 + 写入失效策略（本地应用记忆量小，增量更新是过度工程）。
 
 use std::collections::{HashMap, HashSet};
 
@@ -140,6 +145,98 @@ pub fn self_score(_doc: &MemoryRow, body_used_as_query: &str) -> f64 {
     score_doc(&doc, &q_terms, &df, n, avgdl)
 }
 
+// ----------------- 持久化倒排索引 -----------------
+
+/// 预构建的 BM25 倒排索引：构建一次后多次查询，避免每次 recall 全量重分词。
+///
+/// 策略：MemoryStore 懒加载 + 写入失效。对本地应用（记忆量小、写入少），
+/// 比写入时增量维护倒排表更简单可靠。
+pub struct RecallIndex {
+    /// doc id → 分词后的 token 序列（保留重复，用于 tf 计算）。
+    docs: HashMap<String, Vec<String>>,
+    /// token → 包含该 token 的 doc id 集合（df 来源）。
+    df: HashMap<String, HashSet<String>>,
+    /// doc id → 文档长度（token 数）。
+    doc_len: HashMap<String, usize>,
+    n: usize,
+    avgdl: f64,
+}
+
+impl RecallIndex {
+    /// 从候选记忆集合构建索引（一次性全量分词）。
+    pub fn build(candidates: &[MemoryRow]) -> Self {
+        let mut docs = HashMap::new();
+        let mut df: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut doc_len = HashMap::new();
+        let mut total_len = 0usize;
+        for m in candidates {
+            let toks = tokenize(&m.body);
+            total_len += toks.len();
+            let uniq: HashSet<&String> = toks.iter().collect();
+            for t in uniq {
+                df.entry(t.clone()).or_default().insert(m.id.clone());
+            }
+            doc_len.insert(m.id.clone(), toks.len());
+            docs.insert(m.id.clone(), toks);
+        }
+        let n = candidates.len();
+        let avgdl = if n == 0 {
+            0.0
+        } else {
+            total_len as f64 / n as f64
+        };
+        Self {
+            docs,
+            df,
+            doc_len,
+            n,
+            avgdl,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// 用索引对 query 打分，返回 (doc_id, score) 按 score 降序，只含 score > 0。
+    pub fn search(&self, query: &str, top_n: usize) -> Vec<(String, f64)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let q_terms = tokenize(query);
+        let n = self.n as f64;
+        let mut scored: Vec<(String, f64)> = Vec::new();
+        // 遍历所有文档打分（文档级并行无意义，量小）。
+        for (id, doc) in &self.docs {
+            let dl = *self.doc_len.get(id).unwrap_or(&0) as f64;
+            let mut tf: HashMap<&str, f64> = HashMap::new();
+            for t in doc {
+                *tf.entry(t.as_str()).or_insert(0.0) += 1.0;
+            }
+            let mut s = 0.0f64;
+            for t in &q_terms {
+                let f = match tf.get(t.as_str()) {
+                    Some(v) => *v,
+                    None => continue,
+                };
+                let df_t = self.df.get(t).map(|s| s.len() as f64).unwrap_or(0.0);
+                if df_t == 0.0 {
+                    continue;
+                }
+                let idf = (((n - df_t + 0.5) / (df_t + 0.5)) + 1.0).ln().max(0.0);
+                let denom = f + K1 * (1.0 - B + B * (dl / self.avgdl.max(1.0)));
+                s += idf * (f * (K1 + 1.0)) / denom;
+            }
+            if s > 0.0 {
+                scored.push((id.clone(), s));
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_n);
+        scored
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +300,37 @@ mod tests {
     fn self_score_zero_for_empty() {
         let m = mk("1", "的 了 是", None); // 全停用词 → 空 token
         assert_eq!(self_score(&m, "的 了 是"), 0.0);
+    }
+
+    #[test]
+    fn recall_index_ranks_relevant_first() {
+        let cands = vec![
+            mk("1", "用户研究钙钛矿太阳电池", None),
+            mk("2", "今晚吃火锅", None),
+        ];
+        let idx = RecallIndex::build(&cands);
+        let hits = idx.search("钙钛矿 太阳电池", 5);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, "1");
+        assert!(hits[0].1 > 0.0);
+    }
+
+    #[test]
+    fn recall_index_respects_top_n() {
+        let cands = vec![
+            mk("1", "钙钛矿电池效率", None),
+            mk("2", "钙钛矿稳定性", None),
+            mk("3", "钙钛矿毒性", None),
+        ];
+        let idx = RecallIndex::build(&cands);
+        let hits = idx.search("钙钛矿", 2);
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn recall_index_empty_for_no_match() {
+        let cands = vec![mk("1", "some memory", None)];
+        let idx = RecallIndex::build(&cands);
+        assert!(idx.search("zzznomatch", 5).is_empty());
     }
 }

@@ -9,6 +9,7 @@ pub mod compile;
 pub mod delegate;
 pub mod files;
 pub mod mcp;
+pub mod memory;
 pub mod plan;
 pub mod python;
 pub mod skills;
@@ -37,4 +38,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(plan::UpdateStepStatusTool));
     registry.register(Arc::new(delegate::DelegateTool));
     registry.register(Arc::new(delegate::SubmitOutputTool));
+    registry.register(Arc::new(memory::SearchMemoryTool));
+    registry.register(Arc::new(memory::ReadMemoryTool));
 }

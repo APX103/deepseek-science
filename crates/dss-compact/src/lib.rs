@@ -27,6 +27,9 @@ pub struct CompactionOutcome {
     pub hard_wall_tokens: usize,
     /// summarizer 失败或没有可折叠消息时，结果是否仍超过硬墙。
     pub hard_wall_exceeded: bool,
+    /// 本次成功折叠的消息范围列表（start..end），供上层在折叠前 flush 记忆。
+    /// 阶段二：runner 据此对即将被摘要替换的原始消息做记忆抽取，防丢失。
+    pub folded_ranges: Vec<(usize, usize)>,
 }
 
 /// 主入口：在每轮 LLM 前调用。判断是否触发 L1 → 选 chunk → summarize → 记 fold。
@@ -64,6 +67,7 @@ pub async fn maybe_compact_with_reserved_tokens(
     }
 
     let mut folds_added = 0usize;
+    let mut folded_ranges: Vec<(usize, usize)> = Vec::new();
     // 循环触发 L1，直到不再需要或无候选。
     // 安全上限：避免极端情况无限折叠（与 PTL_RETRY_CAP 同量级）。
     let safety = constants::PTL_RETRY_CAP;
@@ -116,10 +120,16 @@ pub async fn maybe_compact_with_reserved_tokens(
         }
         *state = next_state;
         folds_added += 1;
+        folded_ranges.push((start, end));
         projected_tokens = next_projected_tokens;
     }
 
-    outcome(folds_added, projected_tokens, hard_wall_tokens)
+    outcome_with_ranges(
+        folds_added,
+        projected_tokens,
+        hard_wall_tokens,
+        folded_ranges,
+    )
 }
 
 fn projection_tokens(
@@ -141,6 +151,23 @@ fn outcome(
         projected_tokens,
         hard_wall_tokens,
         hard_wall_exceeded: projected_tokens > hard_wall_tokens,
+        folded_ranges: Vec::new(),
+    }
+}
+
+fn outcome_with_ranges(
+    folds_added: usize,
+    projected_tokens: usize,
+    hard_wall_tokens: usize,
+    folded_ranges: Vec<(usize, usize)>,
+) -> CompactionOutcome {
+    CompactionOutcome {
+        folded: folds_added > 0,
+        folds_added,
+        projected_tokens,
+        hard_wall_tokens,
+        hard_wall_exceeded: projected_tokens > hard_wall_tokens,
+        folded_ranges,
     }
 }
 

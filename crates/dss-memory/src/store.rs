@@ -5,7 +5,7 @@
 //!
 //! 注意：conn.interact 的闭包需 'static（spawn_blocking），因此所有跨闭包数据都先克隆成 owned。
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use dss_db::repo::{
     self, list_memories_filtered, list_memory_events, MemoryEventRow, MemoryFilter, MemoryRow,
@@ -13,15 +13,22 @@ use dss_db::repo::{
 };
 use dss_db::{Connection, DbError, DbPool};
 
+use crate::bm25::RecallIndex;
 use crate::types::{gen_id, memory_hash, EvidenceRef, Origin};
 
 pub struct MemoryStore {
     pool: Arc<DbPool>,
+    /// 懒加载的召回倒排索引。任何写入后置 None（下次 recall 重建）。
+    /// 本地应用记忆量小，写入失效比增量维护倒排表更简单可靠。
+    index: RwLock<Option<RecallIndex>>,
 }
 
 impl MemoryStore {
     pub fn new(pool: Arc<DbPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            index: RwLock::new(None),
+        }
     }
 
     pub fn pool(&self) -> &Arc<DbPool> {
@@ -30,6 +37,13 @@ impl MemoryStore {
 
     fn interact_err(e: impl std::fmt::Debug) -> DbError {
         DbError::Other(format!("memory interact: {e:?}"))
+    }
+
+    /// 写入路径后调用：失效缓存索引，下次 recall 重建。
+    fn invalidate_index(&self) {
+        if let Ok(mut guard) = self.index.write() {
+            *guard = None;
+        }
     }
 
     // ----------------- 读 -----------------
@@ -79,6 +93,40 @@ impl MemoryStore {
         conn.interact(move |c| repo::candidate_memories(c, project_id.as_deref()))
             .await
             .map_err(Self::interact_err)?
+    }
+
+    /// 用持久化倒排索引召回（懒加载 + 写入失效）。
+    /// 返回 (id, score) 排序结果。只索引 active 记忆（candidate/superseded/deleted 不召回）。
+    /// 调用方需自行用 id 去 get() 取完整行（通常 top-N 很小）。
+    pub async fn recall_indexed(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        top_n: usize,
+    ) -> Result<Vec<(String, f64)>, DbError> {
+        // 懒加载：索引为 None 时从 DB 重建（只含 active）。
+        let need_build = self.index.read().map(|g| g.is_none()).unwrap_or(true);
+        if need_build {
+            let pid = project_id.map(str::to_owned);
+            let cands = self.candidates(pid).await?;
+            // 只索引 active（recallable）。
+            let active: Vec<MemoryRow> =
+                cands.into_iter().filter(|m| m.status == "active").collect();
+            let idx = RecallIndex::build(&active);
+            if let Ok(mut guard) = self.index.write() {
+                *guard = Some(idx);
+            }
+        }
+        // 用缓存索引查询。
+        let guard = self
+            .index
+            .read()
+            .map_err(|e| DbError::Other(format!("memory index read lock: {e}")))?;
+        if let Some(idx) = guard.as_ref() {
+            Ok(idx.search(query, top_n))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// 精确查 source_hash（去重用）。
@@ -136,6 +184,7 @@ impl MemoryStore {
             .map_err(Self::interact_err)??;
         self.record_event(&conn, &row.id, "created", None, None)
             .await?;
+        self.invalidate_index();
         Ok(row)
     }
 
@@ -148,15 +197,19 @@ impl MemoryStore {
             .map_err(Self::interact_err)??;
         self.record_event(&conn, &id, "deleted", Some("user"), None)
             .await?;
+        self.invalidate_index();
         Ok(())
     }
 
     /// 硬删除（仅清理用，日常请用 soft_delete）。
     pub async fn delete(&self, id: String) -> Result<(), DbError> {
         let conn = self.pool.get().await.map_err(DbError::Pool)?;
-        conn.interact(move |c| repo::delete_memory(c, &id))
+        let r = conn
+            .interact(move |c| repo::delete_memory(c, &id))
             .await
-            .map_err(Self::interact_err)?
+            .map_err(Self::interact_err)?;
+        self.invalidate_index();
+        r
     }
 
     /// 标记 old 被 new 替代。
@@ -170,6 +223,7 @@ impl MemoryStore {
         let detail = serde_json::json!({ "by": new_id }).to_string();
         self.record_event(&conn, &old_id, "superseded", Some("system"), Some(&detail))
             .await?;
+        self.invalidate_index();
         Ok(())
     }
 
@@ -193,6 +247,7 @@ impl MemoryStore {
             other => other,
         };
         self.record_event(&conn, &id, event, actor, None).await?;
+        self.invalidate_index();
         Ok(())
     }
 
@@ -214,6 +269,7 @@ impl MemoryStore {
         let detail = serde_json::json!({ "new_hash": hash }).to_string();
         self.record_event(&conn, &id, "edited", actor, Some(&detail))
             .await?;
+        self.invalidate_index();
         Ok(())
     }
 

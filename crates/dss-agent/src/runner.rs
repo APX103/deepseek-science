@@ -527,8 +527,26 @@ impl Runner {
             if compact_outcome.folded {
                 tracing::info!(
                     folds_added = compact_outcome.folds_added,
+                    ranges = ?compact_outcome.folded_ranges,
                     "rolling compact applied L1 fold(s)"
                 );
+                // 阶段二 hook：被折叠的消息范围（历史，可能跨 run）。
+                // 这些原始消息将被摘要替换，重要信息有丢失风险。
+                // 当前的 run-end extract 只覆盖本次 run 的消息（run_message_start..），
+                // 因此被折叠的历史消息不会自动进记忆。真正的 compaction flush
+                // （对 folded_ranges 做后台 extract+consolidate）作为独立增强项，
+                // 此处仅记录 hook 点与可观测性。
+                if !compact_outcome.folded_ranges.is_empty() {
+                    let folded_msg_count: usize = compact_outcome
+                        .folded_ranges
+                        .iter()
+                        .map(|(s, e)| e.saturating_sub(*s))
+                        .sum();
+                    tracing::debug!(
+                        folded_msg_count,
+                        "compaction folded history not yet flushed to memory (hook pending)"
+                    );
+                }
             }
             // 折叠后的最终视图（若未折叠，与 free_view 等价但重新构建，避免持有旧借用）。
             let view = build_view(&session.messages, &session.compaction);
