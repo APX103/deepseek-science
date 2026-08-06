@@ -68,6 +68,31 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
 }
 
 // ---------- LLM Providers ----------
+const DEFAULT_PROVIDERS: Omit<AppSettingsProvider, 'id' | 'enabled'>[] = [
+  { name: 'DeepSeek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-flash', api_key_masked: '' },
+  { name: 'OpenAI', base_url: 'https://api.openai.com/v1', model: 'gpt-4o', api_key_masked: '' },
+  { name: '自定义', base_url: 'https://api.example.com/v1', model: '', api_key_masked: '' },
+]
+
+function generateProviderId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function createProviderDraft(templateIndex = 2): AppSettingsProvider {
+  const template = DEFAULT_PROVIDERS[templateIndex % DEFAULT_PROVIDERS.length]
+  return {
+    id: generateProviderId(),
+    name: template.name,
+    base_url: template.base_url,
+    model: template.model,
+    api_key_masked: '',
+    enabled: false,
+  }
+}
+
 function LlmSection() {
   const { refreshBackend } = useApp()
   const [settings, setSettings] = useState<AppSettings | null>(null)
@@ -115,23 +140,55 @@ function LlmSection() {
     setSaveNotice(null)
   }
 
-  const patch = (name: string, p: Partial<AppSettingsProvider>) => {
+  const patch = (id: string, p: Partial<AppSettingsProvider>) => {
     clearSaveFeedback()
-    setSettings((current) =>
-      current
-        ? {
-            ...current,
-            providers: current.providers.map((provider) =>
-              provider.name === name ? { ...provider, ...p } : provider,
-            ),
-          }
-        : current,
-    )
+    setSettings((current) => {
+      if (!current) return current
+      const nextProviders = current.providers.map((provider) =>
+        provider.id === id ? { ...provider, ...p } : provider,
+      )
+      // 单选约束：启用一个时自动禁用其它 provider。
+      if (p.enabled) {
+        for (const provider of nextProviders) {
+          if (provider.id !== id) provider.enabled = false
+        }
+      }
+      return { ...current, providers: nextProviders }
+    })
   }
 
-  const patchKeyDraft = (name: string, value: string) => {
+  const patchKeyDraft = (id: string, value: string) => {
     clearSaveFeedback()
-    setKeyDrafts((drafts) => ({ ...drafts, [name]: value }))
+    setKeyDrafts((drafts) => ({ ...drafts, [id]: value }))
+  }
+
+  const addProvider = () => {
+    clearSaveFeedback()
+    setSettings((current) => {
+      if (!current) return current
+      const draft = createProviderDraft(current.providers.length)
+      // 如果当前没有启用项，新 provider 默认启用。
+      const hasEnabled = current.providers.some((p) => p.enabled)
+      draft.enabled = !hasEnabled
+      return { ...current, providers: [...current.providers, draft] }
+    })
+  }
+
+  const removeProvider = (id: string) => {
+    clearSaveFeedback()
+    setSettings((current) => {
+      if (!current) return current
+      const next = current.providers.filter((p) => p.id !== id)
+      // 删除后若没有任何启用项，自动启用第一个。
+      if (next.length > 0 && !next.some((p) => p.enabled)) {
+        next[0].enabled = true
+      }
+      return { ...current, providers: next }
+    })
+    setKeyDrafts((drafts) => {
+      const { [id]: _removed, ...rest } = drafts
+      return rest
+    })
   }
 
   const save = async () => {
@@ -164,25 +221,53 @@ function LlmSection() {
     }
   }
 
+  const enabledCount = settings.providers.filter((p) => p.enabled).length
+
   return (
     <div className="space-y-4">
-      {settings.providers.map((p) => (
-        <div key={p.name} className="card p-3">
+      {settings.providers.map((p, index) => (
+        <div key={p.id} className="card p-3">
           <div className="flex items-center justify-between">
-            <span className="text-[13px] font-medium text-ink">{p.name}</span>
-            <Toggle checked={p.enabled} onChange={(v) => patch(p.name, { enabled: v })} />
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-medium text-ink">{p.name || `Provider ${index + 1}`}</span>
+              {p.enabled && (
+                <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10px] font-medium text-success">
+                  已启用
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <Toggle checked={p.enabled} onChange={(v) => patch(p.id, { enabled: v })} />
+              <button
+                type="button"
+                className="rounded border border-danger/30 px-2 py-1 text-[11px] text-danger hover:bg-dangerSoft"
+                aria-label={`移除 provider ${p.name || index + 1}`}
+                disabled={settings.providers.length <= 1}
+                onClick={() => removeProvider(p.id)}
+              >
+                移除
+              </button>
+            </div>
           </div>
           <div className="mt-3 space-y-2">
             <label className="block">
+              <span className="mb-1 block text-[11px] text-ink3">名称</span>
+              <input
+                className="input py-1.5"
+                value={p.name}
+                onChange={(e) => patch(p.id, { name: e.target.value })}
+              />
+            </label>
+            <label className="block">
               <span className="mb-1 block text-[11px] text-ink3">Base URL</span>
-              <input className="input py-1.5" value={p.base_url} onChange={(e) => patch(p.name, { base_url: e.target.value })} />
+              <input className="input py-1.5 font-mono" value={p.base_url} onChange={(e) => patch(p.id, { base_url: e.target.value })} />
             </label>
             <label className="block">
               <span className="mb-1 block text-[11px] text-ink3">Model</span>
               <input
                 className="input py-1.5"
                 value={p.model ?? ''}
-                onChange={(e) => patch(p.name, { model: e.target.value })}
+                onChange={(e) => patch(p.id, { model: e.target.value })}
               />
             </label>
             <label className="block">
@@ -191,8 +276,8 @@ function LlmSection() {
                 className="input py-1.5 font-mono"
                 type="password"
                 placeholder={p.api_key_masked || 'sk-…'}
-                value={keyDrafts[p.name] ?? ''}
-                onChange={(e) => patchKeyDraft(p.name, e.target.value)}
+                value={keyDrafts[p.id] ?? ''}
+                onChange={(e) => patchKeyDraft(p.id, e.target.value)}
                 autoComplete="new-password"
               />
               <span className="mt-1 block text-[11px] text-ink3">
@@ -204,6 +289,11 @@ function LlmSection() {
       ))}
       {settings.providers.length === 0 && (
         <div className="card p-4 text-center text-[12px] text-ink3">后端未返回可配置的 LLM provider。</div>
+      )}
+      {enabledCount !== 1 && (
+        <p role="alert" className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-amber-600">
+          必须且只能启用一个 provider（当前 {enabledCount} 个）。
+        </p>
       )}
       {saveError && (
         <p role="alert" className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-[12px] text-danger">
@@ -227,10 +317,17 @@ function LlmSection() {
           {saveNotice.message}
         </p>
       )}
-      <div className="flex items-center justify-end gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          className="btn-outline"
+          disabled={saving || settings.providers.length >= 8}
+          onClick={addProvider}
+        >
+          添加 provider{settings.providers.length >= 8 ? '（已达 8 个上限）' : ''}
+        </button>
         <button
           className="btn-primary"
-          disabled={saving || settings.providers.length === 0}
+          disabled={saving || settings.providers.length === 0 || enabledCount !== 1}
           onClick={() => void save()}
         >
           {saving ? '保存中…' : '保存'}

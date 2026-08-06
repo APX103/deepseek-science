@@ -123,6 +123,8 @@ async fn write_private_settings(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSettings {
+    #[serde(default)]
+    id: String,
     name: String,
     base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,25 +281,35 @@ pub struct AppSettingsPayload {
 fn public_settings(
     state: &AppState,
     runtime: &AppRuntimeSnapshot,
-    persisted: &dss_core::LlmSettings,
+    persisted_providers: &[dss_core::LlmProvider],
+    persisted_llm: &dss_core::LlmSettings,
     persisted_skills: &dss_core::SkillSettings,
     persisted_mcp: &[dss_core::McpServerConfig],
 ) -> AppSettingsPayload {
     let llm = runtime.llm();
+    let effective_model = persisted_providers
+        .iter()
+        .find(|p| p.enabled)
+        .map(|p| p.model.clone())
+        .unwrap_or_else(|| persisted_llm.model.clone());
     AppSettingsPayload {
-        providers: vec![ProviderSettings {
-            name: "DeepSeek".into(),
-            base_url: persisted.base_url.clone(),
-            model: Some(persisted.model.clone()),
-            api_key_masked: if persisted.is_configured() {
-                "••••••••".into()
-            } else {
-                String::new()
-            },
-            api_key: None,
-            enabled: true,
-        }],
-        model: persisted.model.clone(),
+        providers: persisted_providers
+            .iter()
+            .map(|p| ProviderSettings {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                base_url: p.base_url.clone(),
+                model: Some(p.model.clone()),
+                api_key_masked: if p.is_configured() {
+                    "••••••••".into()
+                } else {
+                    String::new()
+                },
+                api_key: None,
+                enabled: p.enabled,
+            })
+            .collect(),
+        model: effective_model,
         default_workspace: state
             .settings
             .data_dir
@@ -408,7 +420,11 @@ pub async fn get_settings(
     State(state): State<AppState>,
 ) -> Result<Json<AppSettingsPayload>, (StatusCode, Json<Value>)> {
     let runtime = state.runtime_snapshot().await;
-    let persisted = state
+    let persisted_providers = state
+        .settings
+        .reload_persisted_providers()
+        .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let persisted_llm = state
         .settings
         .reload_persisted_llm()
         .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
@@ -420,7 +436,14 @@ pub async fn get_settings(
         .settings
         .reload_persisted_mcp_servers()
         .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
-    let mut payload = public_settings(&state, &runtime, &persisted, &persisted_skills, &persisted_mcp);
+    let mut payload = public_settings(
+        &state,
+        &runtime,
+        &persisted_providers,
+        &persisted_llm,
+        &persisted_skills,
+        &persisted_mcp,
+    );
     enrich_mcp_status(&state, &mut payload).await;
     Ok(Json(payload))
 }
@@ -429,41 +452,54 @@ pub async fn save_settings(
     State(state): State<AppState>,
     Json(payload): Json<AppSettingsPayload>,
 ) -> Result<Json<AppSettingsPayload>, (StatusCode, Json<Value>)> {
-    let provider = payload
-        .providers
-        .iter()
-        .find(|p| p.enabled)
-        .ok_or_else(|| {
-            json_error(
+    // 校验 provider 列表：必须有且仅有一个启用；名称非空且不重复；base_url/model 合法。
+    let enabled_count = payload.providers.iter().filter(|p| p.enabled).count();
+    if enabled_count != 1 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("exactly one provider must be enabled (found {enabled_count})"),
+        ));
+    }
+    if payload.providers.is_empty() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "at least one provider must be configured",
+        ));
+    }
+    let mut seen_provider_names = std::collections::HashSet::new();
+    for provider in &payload.providers {
+        let name = provider.name.trim();
+        if name.is_empty() {
+            return Err(json_error(
                 StatusCode::BAD_REQUEST,
-                "at least one provider must be enabled",
-            )
-        })?;
-    let base_url = provider.base_url.trim().to_owned();
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "provider base_url must use http:// or https://",
-        ));
+                "each provider needs a name",
+            ));
+        }
+        if !seen_provider_names.insert(name.to_lowercase()) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("duplicate provider name: {name}"),
+            ));
+        }
+        let base_url = provider.base_url.trim();
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("provider \"{name}\" base_url must use http:// or https://"),
+            ));
+        }
+        let model = provider
+            .model
+            .as_deref()
+            .unwrap_or(payload.model.as_str())
+            .trim();
+        if model.is_empty() {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("provider \"{name}\" model must not be empty"),
+            ));
+        }
     }
-    let model = provider
-        .model
-        .as_deref()
-        .unwrap_or(payload.model.as_str())
-        .trim()
-        .to_owned();
-    if model.is_empty() {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "model must not be empty",
-        ));
-    }
-    let submitted_key = provider
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_owned);
 
     // Keep root read/merge/write serialized, but do network discovery without blocking runs from
     // cloning the previous immutable snapshot.
@@ -572,18 +608,79 @@ pub async fn save_settings(
         });
     }
 
+    let persisted_providers_before = state
+        .settings
+        .resolve_persisted_candidate_providers(root.clone())
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error.to_string()))?;
+
+    // Build the provider list to persist, preserving api_key by id when the UI did not submit one.
+    let mut provider_configs: Vec<dss_core::LlmProvider> =
+        Vec::with_capacity(payload.providers.len());
+    let mut seen_provider_ids = std::collections::HashSet::new();
+    for submitted in &payload.providers {
+        let submitted_key = submitted
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
+        let preserved_key = persisted_providers_before
+            .iter()
+            .find(|existing| existing.id == submitted.id)
+            .and_then(|existing| existing.api_key.clone());
+        let id = if submitted.id.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            submitted.id.trim().to_owned()
+        };
+        if !seen_provider_ids.insert(id.clone()) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("duplicate provider id: {id}"),
+            ));
+        }
+        provider_configs.push(dss_core::LlmProvider {
+            id,
+            name: submitted.name.trim().to_owned(),
+            base_url: submitted.base_url.trim().to_owned(),
+            model: submitted
+                .model
+                .as_deref()
+                .unwrap_or(payload.model.as_str())
+                .trim()
+                .to_owned(),
+            api_key: submitted_key.or(preserved_key),
+            enabled: submitted.enabled,
+        });
+    }
+
     let object = root.as_object_mut().expect("object assigned above");
+    let selected_provider = provider_configs
+        .iter()
+        .find(|p| p.enabled)
+        .expect("exactly one enabled provider validated above");
     let mut llm = object.remove("llm").unwrap_or_else(|| json!({}));
     if !llm.is_object() {
         llm = json!({});
     }
     let llm_object = llm.as_object_mut().expect("object assigned above");
-    llm_object.insert("base_url".into(), Value::String(base_url));
-    llm_object.insert("model".into(), Value::String(model));
-    if let Some(key) = submitted_key {
+    llm_object.insert(
+        "base_url".into(),
+        Value::String(selected_provider.base_url.clone()),
+    );
+    llm_object.insert(
+        "model".into(),
+        Value::String(selected_provider.model.clone()),
+    );
+    if let Some(key) = selected_provider.api_key.clone() {
         llm_object.insert("api_key".into(), Value::String(key));
     }
     object.insert("llm".into(), llm);
+    object.insert(
+        "providers".into(),
+        serde_json::to_value(&provider_configs)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    );
     object.insert(
         "a2a_agents".into(),
         serde_json::to_value(&a2a_configs)
@@ -613,6 +710,10 @@ pub async fn save_settings(
             "runtime settings revision overflow",
         )
     })?;
+    let persisted_providers = state
+        .settings
+        .resolve_candidate_providers(root.clone())
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
     let persisted = state
         .settings
         .resolve_persisted_candidate_llm(root.clone())
@@ -680,6 +781,7 @@ pub async fn save_settings(
     let mut payload = public_settings(
         &state,
         &replacement,
+        &persisted_providers,
         &persisted,
         &persisted_skills,
         &persisted_mcp,
@@ -793,8 +895,16 @@ mod tests {
             llm: LlmSettings {
                 base_url: INITIAL_BASE_URL.into(),
                 model: INITIAL_MODEL.into(),
-                api_key: credential,
+                api_key: credential.clone(),
             },
+            providers: vec![dss_core::LlmProvider {
+                id: "deepseek".to_string(),
+                name: "DeepSeek".to_string(),
+                base_url: INITIAL_BASE_URL.into(),
+                model: INITIAL_MODEL.into(),
+                api_key: credential,
+                enabled: true,
+            }],
             llm_env_overrides: LlmEnvOverrides::default(),
             log_level: None,
             mcp_servers: Vec::new(),
@@ -807,6 +917,7 @@ mod tests {
     fn payload(base_url: &str, model: &str, api_key: Option<String>) -> AppSettingsPayload {
         AppSettingsPayload {
             providers: vec![ProviderSettings {
+                id: "deepseek".to_string(),
                 name: "DeepSeek".into(),
                 base_url: base_url.into(),
                 model: Some(model.into()),
@@ -1483,5 +1594,116 @@ mod tests {
                 "temporary settings file was not cleaned up: {name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn save_and_read_back_multiple_providers_with_single_enabled() {
+        if rerun_without_llm_env("save_and_read_back_multiple_providers_with_single_enabled") {
+            return;
+        }
+
+        let test_dir = TestDir::new("multi-provider");
+        let state = build_test_state(&test_dir, true).await;
+
+        let mut multi = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        multi.providers = vec![
+            ProviderSettings {
+                id: "deepseek".to_string(),
+                name: "DeepSeek".into(),
+                base_url: INITIAL_BASE_URL.into(),
+                model: Some(INITIAL_MODEL.into()),
+                api_key_masked: "••••••••".into(),
+                api_key: None,
+                enabled: false,
+            },
+            ProviderSettings {
+                id: "openai".to_string(),
+                name: "OpenAI".into(),
+                base_url: "https://api.openai.com".into(),
+                model: Some("gpt-4o".into()),
+                api_key_masked: String::new(),
+                api_key: Some(["openai", "credential"].join("-")),
+                enabled: true,
+            },
+        ];
+
+        let Json(saved) = save_settings(State(state.clone()), Json(multi))
+            .await
+            .expect("save multiple providers");
+        assert_eq!(saved.providers.len(), 2);
+        let enabled = saved
+            .providers
+            .iter()
+            .filter(|p| p.enabled)
+            .collect::<Vec<_>>();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "OpenAI");
+        assert_eq!(enabled[0].model, Some("gpt-4o".to_string()));
+
+        let runtime = state.llm_snapshot().await;
+        assert_eq!(runtime.settings().base_url, "https://api.openai.com");
+        assert_eq!(runtime.settings().model, "gpt-4o");
+        assert!(runtime.is_configured());
+
+        let Json(fetched) = get_settings(State(state)).await.expect("get settings");
+        assert_eq!(fetched.providers.len(), 2);
+        assert_eq!(fetched.providers.iter().filter(|p| p.enabled).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_zero_or_multiple_enabled_providers() {
+        if rerun_without_llm_env("save_rejects_zero_or_multiple_enabled_providers") {
+            return;
+        }
+
+        let test_dir = TestDir::new("provider-selection");
+        let state = build_test_state(&test_dir, true).await;
+
+        let mut none_enabled = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        none_enabled.providers[0].enabled = false;
+        let err = save_settings(State(state.clone()), Json(none_enabled))
+            .await
+            .expect_err("zero enabled providers must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let mut both_enabled = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        both_enabled.providers.push(ProviderSettings {
+            id: "second".to_string(),
+            name: "Second".into(),
+            base_url: "https://second.example".into(),
+            model: Some("second-model".into()),
+            api_key_masked: String::new(),
+            api_key: None,
+            enabled: true,
+        });
+        let err = save_settings(State(state.clone()), Json(both_enabled))
+            .await
+            .expect_err("two enabled providers must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_duplicate_provider_names() {
+        if rerun_without_llm_env("save_rejects_duplicate_provider_names") {
+            return;
+        }
+
+        let test_dir = TestDir::new("duplicate-provider-names");
+        let state = build_test_state(&test_dir, true).await;
+
+        let mut dup = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        dup.providers.push(ProviderSettings {
+            id: "other".to_string(),
+            name: "DeepSeek".into(),
+            base_url: "https://other.example".into(),
+            model: Some("other-model".into()),
+            api_key_masked: String::new(),
+            api_key: None,
+            enabled: false,
+        });
+        let err = save_settings(State(state.clone()), Json(dup))
+            .await
+            .expect_err("duplicate provider names must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }

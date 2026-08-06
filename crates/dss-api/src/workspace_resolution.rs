@@ -142,6 +142,7 @@ mod tests {
             data_dir_is_default: false,
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
+            providers: Vec::new(),
             llm_env_overrides: LlmEnvOverrides::default(),
             log_level: None,
             mcp_servers: Vec::new(),

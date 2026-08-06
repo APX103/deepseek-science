@@ -29,6 +29,11 @@
 | GET | `/api/settings` | AppSettings（API key 已脱敏） |
 | POST | `/api/settings` | 以 `revision` 做 CAS 后合并保存 AppSettings；陈旧快照返回 409 |
 
+`AppSettings.providers` 是 LLM provider 列表，每项可编辑字段为
+`id/name/base_url/model/api_key?/enabled`；GET 只返回 `api_key_masked`（`••••••••` 或空），
+绝不返回明文 API Key。运行时**只能启用一个 provider**；POST 时 `enabled=true` 的项必须且只能有一个。
+`AppSettings.model` 保留作为兼容字段，其值等于当前启用 provider 的 model。
+
 `AppSettings.a2a_agents` 是最多 16 项的数组。每项可编辑字段为
 `id/name/endpoint/enabled/timeout_seconds/bearer_token?/clear_bearer_token?`；GET 只返回
 `bearer_token_masked`，绝不返回明文凭据。诊断字段为
@@ -36,6 +41,10 @@
 `settings.json` 事务并立即替换一个 LLM+A2A 运行时快照；已经开始的 run 继续使用旧快照。
 空 token 默认保留同 endpoint 的既有凭据，只有显式 `clear_bearer_token=true` 才清除；修改
 endpoint 时旧凭据绝不自动转发。GET 返回的 `revision` 必须原样带回 POST，防止两个设置窗口互相覆盖。
+
+> 持久化格式：`settings.json` 同时写入 `providers` 数组与兼容用的 `llm` 对象。
+> `providers` 优先级更高；旧版本或没有 `providers` 的文件会回退读取 `llm` 对象作为单一
+> DeepSeek provider。
 
 ### A2A client
 

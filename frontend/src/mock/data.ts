@@ -467,6 +467,7 @@ export const mockLogs: LogEntry[] = [
 export const mockSettings: AppSettings = {
   providers: [
     {
+      id: 'deepseek',
       name: 'deepseek',
       base_url: 'https://api.deepseek.com',
       api_key_masked: 'sk-…****',
@@ -474,6 +475,7 @@ export const mockSettings: AppSettings = {
       model: 'deepseek-chat',
     },
     {
+      id: 'openai-compatible',
       name: 'openai-compatible',
       base_url: 'https://api.openai.com/v1',
       api_key_masked: '',

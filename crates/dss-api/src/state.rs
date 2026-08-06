@@ -351,6 +351,7 @@ mod active_run_tests {
             data_dir_is_default: false,
             server: dss_core::settings::ServerSettings::default(),
             llm: dss_core::LlmSettings::default(),
+            providers: Vec::new(),
             llm_env_overrides: dss_core::LlmEnvOverrides::default(),
             log_level: None,
             mcp_servers: Vec::new(),
@@ -593,8 +594,9 @@ pub async fn build_mcp_runtime(
         for srv in servers.iter().filter(|s| s.enabled) {
             if manager.add_server(&srv.name, &srv.url).await {
                 if let Some(mcp_tools) = manager.list_tools(&srv.name).await {
-                    let count =
-                        dss_tools::builtin::mcp::register_mcp_tools(&mut tools, &srv.name, &mcp_tools);
+                    let count = dss_tools::builtin::mcp::register_mcp_tools(
+                        &mut tools, &srv.name, &mcp_tools,
+                    );
                     tracing::info!(server = %srv.name, tools = count, "MCP tools mounted");
                 }
             } else {
@@ -602,7 +604,10 @@ pub async fn build_mcp_runtime(
             }
         }
     };
-    if tokio::time::timeout(MCP_STARTUP_BUDGET, connect).await.is_err() {
+    if tokio::time::timeout(MCP_STARTUP_BUDGET, connect)
+        .await
+        .is_err()
+    {
         tracing::warn!(
             budget_secs = MCP_STARTUP_BUDGET.as_secs(),
             "MCP connect budget exhausted; continuing without remaining servers"

@@ -22,6 +22,7 @@ export interface AppConfig {
 }
 
 export interface AppSettingsProvider {
+  id: string
   name: string
   base_url: string
   api_key_masked: string

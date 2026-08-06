@@ -1,6 +1,7 @@
 import type {
   A2aAgentSettings,
   AppSettings,
+  AppSettingsProvider,
   AppSettingsUpdate,
   BackendStatus,
   LlmOverriddenField,
@@ -138,7 +139,7 @@ export function buildSettingsPayload(
     default_workspace: sanitized.default_workspace,
     revision: sanitized.revision,
     providers: sanitized.providers.map((provider) => {
-      const draft = keyDrafts[provider.name]?.trim()
+      const draft = keyDrafts[provider.id]?.trim()
       return draft ? { ...provider, api_key: draft } : provider
     }),
     a2a_agents: (sanitized.a2a_agents ?? []).map((agent) => {
@@ -196,6 +197,10 @@ export function effectiveSettingsModel(settings: AppSettings): string | undefine
 
 export function effectiveSettingsBaseUrl(settings: AppSettings): string | undefined {
   return settings.providers.find((provider) => provider.enabled)?.base_url.trim() || undefined
+}
+
+export function enabledProvider(settings: AppSettings): AppSettingsProvider | undefined {
+  return settings.providers.find((provider) => provider.enabled)
 }
 
 /** The save is considered active only after the runtime config reflects the response. */

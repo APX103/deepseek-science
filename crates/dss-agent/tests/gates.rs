@@ -3900,11 +3900,9 @@ async fn memory_recall_block_sits_after_history_not_in_prefix() {
         "memory block must come after the latest user message"
     );
     // 前缀区（第一条 = 执行策略）不含记忆块。
-    assert!(
-        !request[0]
-            .content
-            .as_deref()
-            .unwrap_or("")
-            .contains("[Memory]")
-    );
+    assert!(!request[0]
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .contains("[Memory]"));
 }
