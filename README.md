@@ -1,52 +1,117 @@
-# Deepseek Science — 设计文档集
+<div align="center">
 
-> **状态：P0–P8 + F2 已实现并验收，P9+ 增强方向待排期。**
->
-> 所有架构、模块、API、路线图文档均位于 [`docs/`](docs/)。
+# Deepseek Science
+
+**本地优先的科研 AI 工作台 · DeepSeek 原生**
+
+让 DeepSeek 系列模型成为你的科研助手：文献检索、代码实验、论文写作、PDF 编译——一个窗口里完成，数据留在本机。
+
+Rust · React · Tauri 2 · 从零构建
+
+</div>
 
 ---
 
-## 这是什么
+## ✨ 特性
 
-**Deepseek Science** 是一个**全新本地优先的科研 AI 工作台**：以 **Deepseek** 系列模型为主力推理引擎，面向科研场景做深度强化。全新工程——后端（Rust）、前端（React + DeepSeek 风格）、Tauri 桌面壳全部从零搭建。
+| | |
+|---|---|
+| 🧪 **科研原生工具链** | 30+ 内置工具：`python` / `bash` 执行、`search_papers` / `fetch_paper`（OpenAlex）、`web_search` / `fetch_url`、`compile_pdf`（Tectonic）、版本化 artifacts、`install_packages`（venv） |
+| 🧠 **DeepSeek 深度集成** | 思考模式（`reasoning_content`）流式呈现；**前缀缓存感知**——system 前缀字节稳定、可变内容移到尾部，实测同会话缓存命中率 **98%+**，命中输入按官方约 1/120 计价 |
+| 🩺 **论文写作编排** | 内置 paper-writing skill：clarify → 文献综述 → 结构 → 图表 → 实验设计 → 同行评审 → 编译成 PDF |
+| 🧠 **长上下文不爆 token** | Rolling Compact：append-only 历史 + 非破坏性 projection，先免费裁剪工具输出、超阈值才付费摘要折叠 |
+| 🧠 **分层记忆** | 跨项目 profile + 项目级记忆，BM25 召回（CJK 感知），LLM 抽取，后台异步更新 |
+| 🗂️ **计划与审查** | Plan 模式（生成计划 → 人工批准 → 执行）+ terminal barrier 最终审查（veto 可修一轮） |
+| 🔌 **可扩展** | MCP 客户端（streamable HTTP，动态挂载）+ A2A 协议（跨 agent 互操作）+ skill 体系（5 源加载） |
+| 🔒 **本地优先** | 后端 + 前端 + 桌面壳全部自包含，SQLite 落库（WAL），会话重启可恢复；浏览器仅做 UI 壳 |
 
-- **范围**：全部从零。后端用 Rust 实现；前端全新 React 工程、DeepSeek 视觉风格（蓝色 / 简约 / 细线条，见 [design-system](docs/design-system.md)）并内置日志列表（见 [logging](docs/logging.md)）；Tauri 壳全新实现。
-- **目标**：性能、内存安全、单文件部署、并发友好；并为 Deepseek 深度集成、实验数据分析、文献知识图谱、长程自主研究、跨学科数据处理与可视化预留扩展点。
+---
 
-## 文档导航
+## 🚀 快速开始
 
-按阅读顺序排列。每个文档开头都有「本文回答什么问题」的小结。
+**环境要求**：Rust stable（edition 2021）· bun 1.3+ · （可选）Tectonic（`compile_pdf` 用）
 
-| 文档 | 回答的问题 |
-|------|-----------|
-| [项目概览](docs/overview.md) | 做什么、不做什么、产品边界、目标用户与场景 |
-| [整体架构](docs/architecture.md) | 分层、进程模型、运行时拓扑、与前端/Tauri 的边界 |
-| [技术栈选型](docs/tech-stack.md) | 后端 Rust crate、前端栈、Tauri 壳的选型论证与备选 |
-| [模块详细设计](docs/modules.md) | agent kernel / tools / skills / mcp / memory / compact / verify 逐模块 |
-| [API 契约](docs/api-contract.md) | HTTP/SSE 端点、事件流格式 |
-| [被调用的 A2A Agent 实现说明](docs/a2a-agent-implementation-guide.md) | 第三方 Agent 如何实现发现、调用、长任务、恢复、取消与安全接入 |
-| [数据模型与存储](docs/data-model.md) | SQLite schema、消息/会话/记忆/artifact 模型、迁移 |
-| [增强方向设计预留](docs/enhancements.md) | Deepseek 集成 / 实验数据分析 / 文献知识图谱 / 长程自主研究 |
-| [学科扩展插件体系](docs/domain-plugins.md) | 跨学科数据处理与可视化的插件化机制 + 调研清单 |
-| [设计系统](docs/design-system.md) | DeepSeek 蓝 / 超级简约 / 细线条 视觉规范 |
-| [日志系统](docs/logging.md) | 日志列表功能：系统日志 + agent 执行记录统一视图 |
-| [开发路线图](docs/roadmap.md) | 分阶段交付计划，每阶段可独立验收 |
-| [决策记录](docs/decisions.md) | 设计决策、待办、暂缓项的变更与追溯 |
+API Key 通过环境变量注入（或应用内设置）：
 
-### 规划记录（实现期再填充）
+```sh
+export DEEPSEEK_API_KEY=sk-...
+```
 
-- [`docs/plans/`](docs/plans/) — 每个开发阶段一份实施计划与回顾。
-- [`docs/research/`](docs/research/) — 调研笔记（Rust 生态、学科工具链、Deepseek 能力边界等）。
+### 方式 A：桌面应用（推荐）
 
-## 如何阅读
+```sh
+cd src-tauri && cargo tauri build
+# 产物：src-tauri/target/release/bundle/macos/Deepseek Science.app
+```
 
-1. **想快速了解项目**：读 [概览](docs/overview.md)。
-2. **想理解整体设计**：概览 → 架构 → 模块。
-3. **要做某模块开发**：先看 [路线图](docs/roadmap.md) 定位当前阶段，再看对应模块（[模块](docs/modules.md)）和数据/API 契约（[api-contract](docs/api-contract.md) / [data-model](docs/data-model.md)），最后看该阶段的 [plans](docs/plans/)。
-4. **要决策一个跨阶段问题**：查 [决策记录](docs/decisions.md)。
+### 方式 B：本地开发（后端 + 前端）
 
-## 文档约定
+```sh
+# 终端 1：后端（默认端口 17896，提供 HTTP/SSE API）
+cargo run -p dss-bin -- serve --port 17896
 
-- **状态标签**：文档段落用 `> 状态：已定 / 待定 / 调研中` 标注成熟度。
-- **决策标注**：关键设计选择用 `> 决策：…` 引用块标出，并在 [决策记录](docs/decisions.md) 登记。
-- **实现状态**：P0–P8、F1、F2 的核心代码已完成；文档示例与代码不一致时以代码为准。
+# 终端 2：前端（http://localhost:5173，/api 已代理到 17896）
+cd frontend && bun install && bun run dev
+```
+
+浏览器打开 <http://localhost:5173> 即可使用完整功能。
+
+### 方式 C：纯 API
+
+```sh
+curl -X POST http://127.0.0.1:17896/api/sessions          # 建会话
+curl -N -X POST http://127.0.0.1:17896/api/sessions/<sid>/stream-sse \
+  -H 'Content-Type: application/json' \
+  -d '{"run_id":"r1","prompt":"用一句话说明质数有无穷多个"}'
+# 响应含 complete.usage：{input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens}
+```
+
+---
+
+## 🧪 测试
+
+```sh
+cargo test        # 300+ 测试：agent 门控、Rolling Compact、记忆 BM25、MCP、skills、缓存解析…
+bun run build     # 前端类型检查 + 生产构建
+```
+
+> 注：`sandbox` 相关 4 个用例依赖 macOS `sandbox-exec` 权限，无沙箱权限的环境会跳过失败，非代码问题。
+
+---
+
+## 📚 文档
+
+| 想了解什么 | 读这里 |
+|---|---|
+| 项目概览、产品边界 | [overview](docs/overview.md) |
+| 整体架构、进程模型 | [architecture](docs/architecture.md) |
+| 模块详细设计（agent/tools/skills/mcp/memory/compact/verify） | [modules](docs/modules.md) |
+| HTTP/SSE API 契约 | [api-contract](docs/api-contract.md) |
+| A2A Agent 接入指南 | [a2a-agent-implementation-guide](docs/a2a-agent-implementation-guide.md) |
+| 数据模型与存储 | [data-model](docs/data-model.md) |
+| 开发路线图与决策记录 | [roadmap](docs/roadmap.md) · [decisions](docs/decisions.md) |
+| 前缀缓存省 token 方案（独立文档） | [research/prefix-cache-strategy](docs/research/prefix-cache-strategy.md) |
+
+---
+
+## 🗺️ 状态
+
+- **核心主线已完成**：P0–P8 + F2（对话、工具、持久化、Rolling Compact、记忆、skills、plan/verify、MCP、A2A、日志、Tauri 桌面壳）。
+- **增强方向**（P9+，待排期）：沙箱化执行、文献知识库、长程自主研究、学科插件。
+
+## 🛠️ 技术栈
+
+- **后端**：Rust · axum（HTTP/SSE）· SQLite（deadpool 连接池 + WAL）
+- **前端**：React 18 · TypeScript · Vite · Tailwind（DeepSeek 设计语言：蓝 #4D6BFE / 1px 细边 / 简约）
+- **桌面**：Tauri 2（内嵌后端进程托管：找端口 → spawn → 注入 → 关窗清理）
+- **模型**：DeepSeek 系列（v4 思考模式），OpenAI 兼容协议，可配置其它端点
+
+---
+
+## 🤝 贡献
+
+项目尚处早期，欢迎任何形式的参与。请先阅读 [贡献约定（HANDOFF）](HANDOFF.md) 与 [决策记录](docs/decisions.md)，遵守「最小改动、文档先行、每阶段可验收」的工作规则。
+
+## 📄 License
+
+暂未指定（详见仓库根目录 / 项目维护者）。商业与二次分发前请先联系。
