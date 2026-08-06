@@ -1,4 +1,4 @@
-// API 客户端：核心用户路径全部走真实后端；MCP 列表暂保留 localStorage。
+// API 客户端：核心用户路径全部走真实后端。
 import type {
   AppConfig,
   AppSettings,
@@ -7,7 +7,6 @@ import type {
   BackendStatus,
   HealthResponse,
   LogEntry,
-  McpServer,
   Memory,
   Plan,
   Project,
@@ -29,7 +28,6 @@ import { buildRunPayload, type StreamRunOptions } from "./sessionRun";
 import { withApiToken } from "./auth";
 import {
   mockLogs,
-  mockMcpServers,
   mockTemplates,
 } from "../mock/data";
 
@@ -77,22 +75,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T;
 }
 
-/** localStorage 写助手（仅 MCP 设置仍在本地）。 */
-function readLS<T>(key: string, seed: T[]): T[] {
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw) return JSON.parse(raw) as T[];
-  } catch {
-    // 解析失败则回退 seed
-  }
-  localStorage.setItem(key, JSON.stringify(seed));
-  return [...seed];
-}
-
-function writeLS<T>(key: string, value: T) {
-  localStorage.setItem(key, JSON.stringify(value));
-}
-
 // ---------- 系统 / 配置 ----------
 export async function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>("/health");
@@ -138,15 +120,7 @@ export async function saveSettings(
 }
 
 // ---------- MCP ----------
-const MCP_KEY = "dss_mcp_servers";
-
-export async function listMcpServers(): Promise<McpServer[]> {
-  return readLS(MCP_KEY, mockMcpServers);
-}
-
-export async function saveMcpServers(servers: McpServer[]): Promise<void> {
-  writeLS(MCP_KEY, servers);
-}
+// MCP server 配置统一走后端 /api/settings（见 SettingsModal McpSection），不再使用 localStorage。
 
 // ---------- 记忆 ----------
 export async function listMemories(_entity?: string): Promise<Memory[]> {

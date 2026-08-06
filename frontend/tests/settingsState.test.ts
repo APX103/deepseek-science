@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import {
   backendReflectsSettings,
   buildSettingsPayload,
+  normalizeMcpServers,
+  parseMcpJsonConfig,
   sanitizeSettings,
   settingsSaveNotice,
 } from '../src/api/settingsState'
@@ -127,5 +129,68 @@ describe('settings state safety', () => {
       kind: 'success',
       message: '已保存并立即生效。后续新请求将使用模型 deepseek-research。',
     })
+  })
+})
+
+describe('mcp server settings', () => {
+  test('normalize fills defaults for a missing or partial list', () => {
+    expect(normalizeMcpServers(undefined)).toEqual([])
+    expect(normalizeMcpServers(null)).toEqual([])
+    expect(
+      normalizeMcpServers([{ name: 'a', url: 'http://x', enabled: true } as never]),
+    ).toEqual([{ name: 'a', url: 'http://x', enabled: true, connected: false, tool_count: null }])
+  })
+
+  test('payload carries mcp servers without diagnostic fields', () => {
+    const withMcp = settings({
+      mcp_servers: [
+        { name: 'lit', url: 'http://127.0.0.1:8901/sse', enabled: true, connected: true, tool_count: 4 },
+      ],
+    })
+    const payload = buildSettingsPayload(withMcp, {})
+    expect(payload.mcp_servers).toEqual([{ name: 'lit', url: 'http://127.0.0.1:8901/sse', enabled: true }])
+    expect(JSON.stringify(payload)).not.toContain('tool_count')
+  })
+
+  test('sanitize normalizes a missing mcp list so saves never drop it', () => {
+    const sanitized = sanitizeSettings(settings())
+    expect(sanitized.mcp_servers).toEqual([])
+    expect(buildSettingsPayload(sanitized, {}).mcp_servers).toEqual([])
+  })
+
+  test('parses a single server object', () => {
+    expect(parseMcpJsonConfig('{"name":"lit","url":"http://127.0.0.1:8901/sse"}')).toEqual([
+      { name: 'lit', url: 'http://127.0.0.1:8901/sse', enabled: true },
+    ])
+  })
+
+  test('parses the Claude-style mcpServers map', () => {
+    const parsed = parseMcpJsonConfig(
+      '{"mcpServers":{"lit":{"url":"http://a/sse"},"off":{"url":"https://b/mcp","enabled":false}}}',
+    )
+    expect(parsed).toEqual([
+      { name: 'lit', url: 'http://a/sse', enabled: true },
+      { name: 'off', url: 'https://b/mcp', enabled: false },
+    ])
+  })
+
+  test('parses an array and a bare name-keyed map', () => {
+    expect(parseMcpJsonConfig('[{"name":"a","url":"http://a"}]')).toEqual([
+      { name: 'a', url: 'http://a', enabled: true },
+    ])
+    expect(parseMcpJsonConfig('{"b":{"url":"http://b"}}')).toEqual([
+      { name: 'b', url: 'http://b', enabled: true },
+    ])
+  })
+
+  test('rejects stdio servers, bad urls, duplicates, and broken json', () => {
+    expect(() => parseMcpJsonConfig('{"mcpServers":{"x":{"command":"npx","args":[]}}}')).toThrow(
+      /command\/stdio/,
+    )
+    expect(() => parseMcpJsonConfig('{"name":"x","url":"stdio://nope"}')).toThrow(/http/)
+    expect(() =>
+      parseMcpJsonConfig('[{"name":"x","url":"http://a"},{"name":"X","url":"http://b"}]'),
+    ).toThrow(/重复/)
+    expect(() => parseMcpJsonConfig('{not json')).toThrow(/JSON 解析失败/)
   })
 })

@@ -20,17 +20,17 @@ pub struct SkillItem {
     pub enabled: bool,
 }
 
-/// `GET /api/skills`：返回 catalog 里的全部 skill。
+/// `GET /api/skills`：返回 catalog 里的全部 skill（含被禁用项，`enabled` 反映当前配置）。
 pub async fn list_skills(State(state): State<AppState>) -> Json<Vec<SkillItem>> {
-    let items = state
-        .catalog
-        .list()
+    let catalog = state.catalog_snapshot().await;
+    let items = catalog
+        .list_all()
         .into_iter()
         .map(|s| SkillItem {
             name: s.name.clone(),
             description: s.description.clone(),
             source: s.source.clone(),
-            enabled: true,
+            enabled: catalog.is_enabled(&s.name),
         })
         .collect();
     Json(items)

@@ -79,6 +79,24 @@ impl std::fmt::Debug for A2aAgentConfig {
     }
 }
 
+/// Skill 发现配置：控制内置 skill 的启用/禁用、是否纳入 claude/codex/cursor 目录、以及自定义目录。
+///
+/// 持久化在 `settings.json` 的 `"skills"` 键下（`config.toml` 可作为低优先级默认层）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillSettings {
+    /// 被禁用的 skill 名称（禁用后不会进入 agent 的 search/list/read）。
+    pub disabled: Vec<String>,
+    /// 纳入 `~/.claude/skills` 目录。
+    pub include_claude: bool,
+    /// 纳入 `~/.codex/skills` 目录。
+    pub include_codex: bool,
+    /// 纳入 `~/.cursor/skills-cursor`（及 `~/.cursor/skills`）目录。
+    pub include_cursor: bool,
+    /// 额外的自定义 skill 目录（绝对路径）。
+    pub custom_dirs: Vec<String>,
+}
+
 /// MCP server 配置。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
@@ -164,8 +182,9 @@ struct FileSettings {
     llm: FileLlmSettings,
     #[serde(default)]
     log_level: Option<String>,
-    #[serde(default)]
-    mcp_servers: Vec<McpServerConfig>,
+    /// `Option` is intentional: an explicit `[]` in the higher-priority file clears inherited
+    /// servers, while an absent field leaves the lower layer untouched (mirrors `a2a_agents`).
+    mcp_servers: Option<Vec<McpServerConfig>>,
     /// `Option` is intentional: an explicit `[]` in the higher-priority file clears
     /// inherited Agents, while an absent field leaves the lower layer untouched.
     a2a_agents: Option<Vec<A2aAgentConfig>>,
@@ -184,6 +203,14 @@ struct FileLlmSettings {
     base_url: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
+}
+
+/// Minimal wrapper to extract only the `skills` object from a config file, ignoring all other
+/// top-level keys. A missing `skills` key deserializes to `None`.
+#[derive(Debug, Default, Deserialize)]
+struct SkillsFileWrapper {
+    #[serde(default)]
+    skills: Option<SkillSettings>,
 }
 
 impl Settings {
@@ -318,6 +345,115 @@ impl Settings {
             &mut a2a_agents,
         );
         Ok(a2a_agents)
+    }
+
+    /// Reload the editable file-backed MCP server list without any network connection attempt.
+    pub fn reload_persisted_mcp_servers(&self) -> Result<Vec<McpServerConfig>, Error> {
+        let settings_json = self.data_dir.join("settings.json");
+        let candidate = if settings_json.is_file() {
+            let text = std::fs::read_to_string(&settings_json)?;
+            serde_json::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?
+        } else {
+            serde_json::json!({})
+        };
+        self.resolve_persisted_candidate_mcp_servers(candidate)
+    }
+
+    /// Resolve the file-backed MCP server list represented by a candidate `settings.json`.
+    /// Mirrors restart layering (config.toml defaults, settings.json overrides) with no I/O
+    /// against the servers themselves.
+    pub fn resolve_persisted_candidate_mcp_servers(
+        &self,
+        candidate: Value,
+    ) -> Result<Vec<McpServerConfig>, Error> {
+        let mut server = ServerSettings::default();
+        let mut llm = LlmSettings::default();
+        let mut log_level = None;
+        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
+
+        let config_toml = self.data_dir.join("config.toml");
+        if config_toml.is_file() {
+            let text = std::fs::read_to_string(&config_toml)?;
+            let file: FileSettings = toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: config_toml.clone(),
+                message: e.to_string(),
+            })?;
+            file.apply_to(
+                &mut server,
+                &mut llm,
+                &mut log_level,
+                &mut mcp_servers,
+                &mut a2a_agents,
+            );
+        }
+
+        let settings_json = self.data_dir.join("settings.json");
+        let file: FileSettings =
+            serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?;
+        file.apply_to(
+            &mut server,
+            &mut llm,
+            &mut log_level,
+            &mut mcp_servers,
+            &mut a2a_agents,
+        );
+        Ok(mcp_servers)
+    }
+
+    /// Reload the file-backed Skill discovery configuration without any filesystem scan of the
+    /// skill directories themselves.
+    pub fn reload_persisted_skills(&self) -> Result<SkillSettings, Error> {
+        let settings_json = self.data_dir.join("settings.json");
+        let candidate = if settings_json.is_file() {
+            let text = std::fs::read_to_string(&settings_json)?;
+            serde_json::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?
+        } else {
+            serde_json::json!({})
+        };
+        self.resolve_persisted_candidate_skills(candidate)
+    }
+
+    /// Resolve the file-backed Skill configuration represented by a candidate `settings.json`.
+    /// Layering mirrors restart precedence: `config.toml` supplies defaults, and a `skills`
+    /// object present in settings.json (the candidate) overrides it wholesale.
+    pub fn resolve_persisted_candidate_skills(
+        &self,
+        candidate: Value,
+    ) -> Result<SkillSettings, Error> {
+        let mut skills = SkillSettings::default();
+
+        let config_toml = self.data_dir.join("config.toml");
+        if config_toml.is_file() {
+            let text = std::fs::read_to_string(&config_toml)?;
+            let wrapper: SkillsFileWrapper =
+                toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                    path: config_toml.clone(),
+                    message: e.to_string(),
+                })?;
+            if let Some(section) = wrapper.skills {
+                skills = section;
+            }
+        }
+
+        if let Some(section) = candidate.get("skills") {
+            skills =
+                serde_json::from_value(section.clone()).map_err(|e| Error::ConfigParse {
+                    path: self.data_dir.join("settings.json"),
+                    message: e.to_string(),
+                })?;
+        }
+
+        Ok(skills)
     }
 
     /// Resolve the effective LLM configuration a restart would produce if `candidate` were the
@@ -460,9 +596,9 @@ impl FileSettings {
         if self.log_level.is_some() {
             *log_level = self.log_level;
         }
-        // mcp_servers：非空则覆盖（后文件覆盖前文件）。
-        if !self.mcp_servers.is_empty() {
-            *mcp_servers = self.mcp_servers;
+        // mcp_servers：显式列表覆盖（含空列表清空）；缺省则保留低优先级层。
+        if let Some(configured) = self.mcp_servers {
+            *mcp_servers = configured;
         }
         if let Some(configured) = self.a2a_agents {
             *a2a_agents = configured;

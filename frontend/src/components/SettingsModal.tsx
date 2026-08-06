@@ -1,11 +1,21 @@
-// Settings 弹层：LLM 配置读写后端 /api/settings；MCP server 暂存 localStorage。
+// Settings 弹层：LLM / MCP / Skills 配置均读写后端 /api/settings。
 import { useEffect, useState } from 'react'
-import type { A2aAgentSettings, AppSettings, AppSettingsProvider, McpServer } from '../types'
-import { getSettings, listMcpServers, saveMcpServers, saveSettings } from '../api/client'
+import type {
+  A2aAgentSettings,
+  AppSettings,
+  AppSettingsProvider,
+  McpServer,
+  Skill,
+  SkillSettingsValue,
+} from '../types'
+import { getSettings, listSkills, saveSettings } from '../api/client'
 import {
   backendReflectsSettings,
   buildSettingsPayload,
   createA2aAgentDraft,
+  normalizeMcpServers,
+  normalizeSkillSettings,
+  parseMcpJsonConfig,
   sanitizeSettings,
   settingsSaveNotice,
   type SettingsSaveNotice,
@@ -13,14 +23,15 @@ import {
 import { useApp } from '../App'
 import Modal from './Modal'
 import Toggle from './Toggle'
-import { IconCpu, IconKey, IconSettings } from './icons'
+import { IconCpu, IconKey, IconSearch, IconSettings, IconZap } from './icons'
 
-type SectionId = 'llm' | 'a2a' | 'mcp' | 'general'
+type SectionId = 'llm' | 'a2a' | 'mcp' | 'skills' | 'general'
 
 const SECTIONS: { id: SectionId; label: string; icon: React.ReactNode }[] = [
   { id: 'llm', label: 'LLM Providers', icon: <IconKey width={14} height={14} /> },
   { id: 'a2a', label: 'A2A Agents', icon: <IconCpu width={14} height={14} /> },
   { id: 'mcp', label: 'MCP Servers', icon: <IconCpu width={14} height={14} /> },
+  { id: 'skills', label: 'Skills', icon: <IconZap width={14} height={14} /> },
   { id: 'general', label: 'General', icon: <IconSettings width={14} height={14} /> },
 ]
 
@@ -48,6 +59,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
           {section === 'llm' && <LlmSection />}
           {section === 'a2a' && <A2aSection />}
           {section === 'mcp' && <McpSection />}
+          {section === 'skills' && <SkillsSection />}
           {section === 'general' && <GeneralSection />}
         </div>
       </div>
@@ -596,70 +608,560 @@ function formatDateTime(value: string): string {
 }
 
 // ---------- MCP Servers ----------
+type McpEditorMode = 'form' | 'json'
+
+const EMPTY_MCP_DRAFT = { name: '', url: '', enabled: true }
+
+const JSON_PLACEHOLDER = `支持三种写法：
+1. 单个 server：{ "name": "lit", "url": "http://127.0.0.1:8901/sse" }
+2. server 数组：[ { "name": …, "url": … }, … ]
+3. Claude 风格：{ "mcpServers": { "lit": { "url": "http://…" } } }
+仅支持 http(s) 接入；command/stdio 方式暂不支持。`
+
 function McpSection() {
-  const [servers, setServers] = useState<McpServer[] | null>(null)
-  const [name, setName] = useState('')
-  const [url, setUrl] = useState('')
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveMessage, setSaveMessage] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
 
-  useEffect(() => {
-    void listMcpServers().then(setServers)
-  }, [])
+  // 编辑器状态：form 直接配置 / json 粘贴配置；editing 为正在编辑的原始名称（null = 新增）。
+  const [mode, setMode] = useState<McpEditorMode>('form')
+  const [editing, setEditing] = useState<string | null>(null)
+  const [draft, setDraft] = useState(EMPTY_MCP_DRAFT)
+  const [jsonText, setJsonText] = useState('')
+  const [editorError, setEditorError] = useState<string | null>(null)
 
-  if (!servers) return <div className="py-8 text-center text-[12px] text-ink3">加载中…</div>
-
-  const persist = (next: McpServer[]) => {
-    setServers(next)
-    void saveMcpServers(next) // TODO: 接后端
+  const load = async () => {
+    setLoadError(null)
+    try {
+      setSettings(sanitizeSettings(await getSettings()))
+    } catch (error) {
+      setLoadError(errorMessage(error))
+    }
   }
 
-  const add = () => {
-    const n = name.trim()
-    const u = url.trim()
-    if (!n || !u) return
-    persist([...servers, { name: n, url: u, enabled: true, connected: false }])
-    setName('')
-    setUrl('')
+  useEffect(() => {
+    void load()
+  }, [])
+
+  if (!settings) {
+    if (loadError) {
+      return (
+        <div className="card space-y-3 p-4 text-[12px]">
+          <p role="alert" className="text-danger">MCP 设置加载失败：{loadError}</p>
+          <button className="btn-outline" onClick={() => void load()}>重试</button>
+        </div>
+      )
+    }
+    return <div className="py-8 text-center text-[12px] text-ink3">加载中…</div>
+  }
+
+  const servers = normalizeMcpServers(settings.mcp_servers)
+
+  const clearFeedback = () => {
+    setSaveError(null)
+    setSaveMessage(null)
+  }
+
+  const patchServers = (next: McpServer[]) => {
+    clearFeedback()
+    setSettings((current) => (current ? { ...current, mcp_servers: next } : current))
+  }
+
+  const resetEditor = () => {
+    setEditing(null)
+    setDraft(EMPTY_MCP_DRAFT)
+    setJsonText('')
+    setEditorError(null)
+  }
+
+  /** 编辑已有 server：回填表单并进入编辑态。 */
+  const startEdit = (server: McpServer) => {
+    setMode('form')
+    setEditing(server.name)
+    setDraft({ name: server.name, url: server.url, enabled: server.enabled })
+    setEditorError(null)
+  }
+
+  const removeServer = (name: string) => {
+    if (editing === name) resetEditor()
+    patchServers(servers.filter((s) => s.name !== name))
+  }
+
+  const toggleServer = (name: string, enabled: boolean) => {
+    patchServers(servers.map((s) => (s.name === name ? { ...s, enabled } : s)))
+  }
+
+  /** 保留同名同 URL 条目的连接状态，避免本地编辑后闪断显示。 */
+  const keepLiveState = (entry: McpServer, previous?: McpServer): McpServer =>
+    previous && previous.url === entry.url
+      ? { ...entry, connected: previous.connected, tool_count: previous.tool_count ?? null }
+      : entry
+
+  /** 表单模式：校验并写入本地列表（最终保存由「保存 MCP 设置」提交后端）。 */
+  const applyForm = () => {
+    const name = draft.name.trim()
+    const url = draft.url.trim()
+    if (!name) return setEditorError('请填写 server 名称')
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return setEditorError('URL 必须以 http:// 或 https:// 开头')
+    }
+    const clash = servers.some(
+      (s) => s.name.toLowerCase() === name.toLowerCase() && s.name !== editing,
+    )
+    if (clash) return setEditorError(`已存在同名 server：${name}`)
+
+    const previous = editing ? servers.find((s) => s.name === editing) : undefined
+    const entry = keepLiveState(
+      { name, url, enabled: draft.enabled, connected: false, tool_count: null },
+      previous,
+    )
+    patchServers(editing ? servers.map((s) => (s.name === editing ? entry : s)) : [...servers, entry])
+    resetEditor()
+  }
+
+  /** JSON 模式：解析后按名称 upsert 到本地列表。 */
+  const applyJson = () => {
+    let parsed: ReturnType<typeof parseMcpJsonConfig>
+    try {
+      parsed = parseMcpJsonConfig(jsonText)
+    } catch (error) {
+      return setEditorError(errorMessage(error))
+    }
+    if (parsed.length === 0) return setEditorError('JSON 中没有可添加的 server')
+
+    const next = [...servers]
+    for (const p of parsed) {
+      const idx = next.findIndex((s) => s.name.toLowerCase() === p.name.toLowerCase())
+      const entry = keepLiveState(
+        { ...p, connected: false, tool_count: null },
+        idx >= 0 ? next[idx] : undefined,
+      )
+      if (idx >= 0) next[idx] = entry
+      else next.push(entry)
+    }
+    patchServers(next)
+    resetEditor()
+  }
+
+  const save = async () => {
+    setSaving(true)
+    clearFeedback()
+    try {
+      const payload = buildSettingsPayload(settings, {})
+      const saved = sanitizeSettings(await saveSettings(payload))
+      setSettings(saved)
+      const list = normalizeMcpServers(saved.mcp_servers)
+      const connected = list.filter((s) => s.connected).length
+      setSaveMessage(
+        `已保存并即时生效。${list.length} 个 server 中 ${connected} 个已连接，新请求会使用更新后的工具集。`,
+      )
+    } catch (error) {
+      setSaveError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
     <div className="space-y-3">
+      {/* server 列表 */}
       <div className="card divide-y divide-border">
         {servers.map((s) => (
           <div key={s.name} className="flex items-center gap-3 px-3 py-2.5">
             <span
               className={`h-1.5 w-1.5 shrink-0 rounded-full ${s.connected ? 'bg-success' : 'bg-borderStrong'}`}
-              title={s.connected ? 'connected' : 'disconnected'}
+              title={s.connected ? '已连接' : '未连接'}
             />
             <div className="min-w-0 flex-1">
               <div className="truncate text-[13px] font-medium text-ink">{s.name}</div>
               <div className="truncate font-mono text-[11px] text-ink3">{s.url}</div>
             </div>
-            <span className="text-[11px] text-ink3">{s.connected ? 'connected' : 'disconnected'}</span>
-            <Toggle
-              checked={s.enabled}
-              onChange={(v) => persist(servers.map((x) => (x.name === s.name ? { ...x, enabled: v } : x)))}
-            />
+            <span className="shrink-0 text-[11px] text-ink3">
+              {s.connected ? `已连接 · ${s.tool_count ?? 0} 工具` : '未连接'}
+            </span>
+            <Toggle checked={s.enabled} onChange={(v) => toggleServer(s.name, v)} />
+            <button
+              type="button"
+              className="btn-ghost shrink-0 rounded px-2 py-1 text-[11px] text-ink2"
+              aria-label={`编辑 ${s.name}`}
+              onClick={() => startEdit(s)}
+            >
+              编辑
+            </button>
+            <button
+              type="button"
+              className="shrink-0 rounded border border-danger/30 px-2 py-1 text-[11px] text-danger hover:bg-dangerSoft"
+              aria-label={`删除 ${s.name}`}
+              onClick={() => removeServer(s.name)}
+            >
+              删除
+            </button>
           </div>
         ))}
-        {servers.length === 0 && <div className="px-3 py-6 text-center text-[12px] text-ink3">暂无 MCP server</div>}
+        {servers.length === 0 && (
+          <div className="px-3 py-6 text-center text-[12px] text-ink3">暂无 MCP server</div>
+        )}
       </div>
 
-      {/* 添加表单（前端态） */}
+      {/* 添加 / 编辑器 */}
       <div className="card space-y-2 p-3">
-        <div className="text-[12px] font-medium text-ink2">Add server</div>
-        <input className="input py-1.5" placeholder="名称，如 literature-search" value={name} onChange={(e) => setName(e.target.value)} />
-        <input
-          className="input py-1.5 font-mono"
-          placeholder="URL，如 http://127.0.0.1:8901/sse"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-        />
-        <div className="flex justify-end">
-          <button className="btn-outline" disabled={!name.trim() || !url.trim()} onClick={add}>
-            添加
-          </button>
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] font-medium text-ink2">
+            {editing ? `编辑 server：${editing}` : '添加 server'}
+          </span>
+          <div className="ml-auto flex overflow-hidden rounded-md border border-border text-[11px]">
+            {(['form', 'json'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                className={`px-2.5 py-1 ${mode === m ? 'bg-brandSoft text-brand' : 'text-ink3 hover:text-ink'}`}
+                aria-pressed={mode === m}
+                onClick={() => {
+                  setMode(m)
+                  setEditorError(null)
+                }}
+              >
+                {m === 'form' ? '直接配置' : 'JSON 配置'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {mode === 'form' ? (
+          <>
+            <input
+              className="input py-1.5"
+              placeholder="名称，如 literature-search"
+              value={draft.name}
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+            />
+            <input
+              className="input py-1.5 font-mono"
+              placeholder="URL，如 http://127.0.0.1:8901/sse"
+              value={draft.url}
+              onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+            />
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 text-[12px] text-ink2">
+                <Toggle
+                  checked={draft.enabled}
+                  onChange={(v) => setDraft({ ...draft, enabled: v })}
+                />
+                启用
+              </label>
+              <div className="flex gap-2">
+                {editing && (
+                  <button type="button" className="btn-outline" onClick={resetEditor}>
+                    取消
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn-outline"
+                  disabled={!draft.name.trim() || !draft.url.trim()}
+                  onClick={applyForm}
+                >
+                  {editing ? '应用修改' : '添加到列表'}
+                </button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <textarea
+              className="input h-36 resize-y py-1.5 font-mono text-[12px] leading-relaxed"
+              placeholder={JSON_PLACEHOLDER}
+              value={jsonText}
+              onChange={(e) => setJsonText(e.target.value)}
+              spellCheck={false}
+            />
+            <div className="flex justify-end">
+              <button
+                type="button"
+                className="btn-outline"
+                disabled={!jsonText.trim()}
+                onClick={applyJson}
+              >
+                解析并添加到列表
+              </button>
+            </div>
+          </>
+        )}
+
+        {editorError && (
+          <p role="alert" className="rounded-md border border-danger/30 bg-dangerSoft px-3 py-2 text-[12px] text-danger">
+            {editorError}
+          </p>
+        )}
+      </div>
+
+      {saveError && (
+        <p role="alert" className="rounded-md border border-danger/30 bg-dangerSoft px-3 py-2 text-[12px] text-danger">
+          保存失败：{saveError}
+        </p>
+      )}
+      {saveMessage && (
+        <p role="status" className="rounded-md border border-success/30 bg-success/10 px-3 py-2 text-[12px] text-success">
+          {saveMessage}
+        </p>
+      )}
+
+      <div className="flex items-center justify-between">
+        <p className="text-[11px] text-ink3">改动需保存后生效；保存后后端会重新连接 server。</p>
+        <button className="btn-primary" disabled={saving} onClick={() => void save()}>
+          {saving ? '保存中…' : '保存 MCP 设置'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ---------- Skills ----------
+const SKILL_SOURCE_LABELS: Record<string, string> = {
+  builtin: '内置',
+  global: '全局',
+  project: '项目',
+  claude: 'Claude',
+  codex: 'Codex',
+  cursor: 'Cursor',
+  custom: '自定义',
+}
+
+function SkillsSection() {
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [skills, setSkills] = useState<Skill[] | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveMessage, setSaveMessage] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [q, setQ] = useState('')
+
+  const load = async () => {
+    setLoadError(null)
+    try {
+      const [s, list] = await Promise.all([getSettings(), listSkills()])
+      setSettings(sanitizeSettings(s))
+      setSkills(list)
+    } catch (error) {
+      setLoadError(errorMessage(error))
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  if (!settings || !skills) {
+    if (loadError) {
+      return (
+        <div className="card space-y-3 p-4 text-[12px]">
+          <p role="alert" className="text-danger">Skills 设置加载失败：{loadError}</p>
+          <button className="btn-outline" onClick={() => void load()}>重试</button>
+        </div>
+      )
+    }
+    return <div className="py-8 text-center text-[12px] text-ink3">加载中…</div>
+  }
+
+  const skillCfg = normalizeSkillSettings(settings.skills)
+  const disabled = new Set(skillCfg.disabled)
+
+  const clearFeedback = () => {
+    setSaveError(null)
+    setSaveMessage(null)
+  }
+
+  const patchSkills = (patch: Partial<SkillSettingsValue>) => {
+    clearFeedback()
+    setSettings((current) =>
+      current ? { ...current, skills: { ...normalizeSkillSettings(current.skills), ...patch } } : current,
+    )
+  }
+
+  const toggleSkill = (name: string, enabled: boolean) => {
+    const next = new Set(disabled)
+    if (enabled) next.delete(name)
+    else next.add(name)
+    patchSkills({ disabled: [...next] })
+  }
+
+  const setCustomDir = (index: number, value: string) => {
+    const next = [...skillCfg.custom_dirs]
+    next[index] = value
+    patchSkills({ custom_dirs: next })
+  }
+
+  const removeCustomDir = (index: number) => {
+    patchSkills({ custom_dirs: skillCfg.custom_dirs.filter((_, i) => i !== index) })
+  }
+
+  const addCustomDir = () => {
+    patchSkills({ custom_dirs: [...skillCfg.custom_dirs, ''] })
+  }
+
+  const save = async () => {
+    setSaving(true)
+    clearFeedback()
+    try {
+      const payload = buildSettingsPayload(settings, {})
+      const saved = sanitizeSettings(await saveSettings(payload))
+      setSettings(saved)
+      // 目录/开关变化后重新拉取列表（可能新增或移除了外部/custom skill）。
+      setSkills(await listSkills())
+      setSaveMessage('已保存并即时生效。后续新请求会使用更新后的 skill 集合。')
+    } catch (error) {
+      setSaveError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const filtered = skills.filter(
+    (s) =>
+      s.name.toLowerCase().includes(q.trim().toLowerCase()) ||
+      s.description.toLowerCase().includes(q.trim().toLowerCase()),
+  )
+  const enabledCount = skills.filter((s) => !disabled.has(s.name)).length
+
+  return (
+    <div className="space-y-4">
+      {/* 外部 skill 目录开关 */}
+      <div className="card p-3">
+        <div className="text-[13px] font-medium text-ink">外部 skills 目录</div>
+        <p className="mt-1 text-[11px] text-ink3">
+          开启后，skill 查找也会扫描对应工具的 skills 目录（各 skill 的 SKILL.md）。
+        </p>
+        <div className="mt-3 space-y-2">
+          <DirToggleRow
+            label="Claude Code"
+            hint="~/.claude/skills"
+            checked={skillCfg.include_claude}
+            onChange={(v) => patchSkills({ include_claude: v })}
+          />
+          <DirToggleRow
+            label="Codex"
+            hint="~/.codex/skills"
+            checked={skillCfg.include_codex}
+            onChange={(v) => patchSkills({ include_codex: v })}
+          />
+          <DirToggleRow
+            label="Cursor"
+            hint="~/.cursor/skills-cursor · ~/.cursor/skills"
+            checked={skillCfg.include_cursor}
+            onChange={(v) => patchSkills({ include_cursor: v })}
+          />
         </div>
       </div>
+
+      {/* 自定义目录 */}
+      <div className="card p-3">
+        <div className="text-[13px] font-medium text-ink">自定义 skills 目录</div>
+        <p className="mt-1 text-[11px] text-ink3">额外的 skill 根目录（绝对路径），可添加多个。</p>
+        <div className="mt-3 space-y-2">
+          {skillCfg.custom_dirs.map((dir, index) => (
+            <div key={index} className="flex gap-2">
+              <input
+                className="input min-w-0 flex-1 py-1.5 font-mono"
+                placeholder="/绝对/路径/到/skills"
+                value={dir}
+                onChange={(e) => setCustomDir(index, e.target.value)}
+              />
+              <button
+                type="button"
+                className="shrink-0 rounded border border-danger/30 px-2 text-[11px] text-danger hover:bg-dangerSoft"
+                aria-label={`移除自定义目录 ${index + 1}`}
+                onClick={() => removeCustomDir(index)}
+              >
+                移除
+              </button>
+            </div>
+          ))}
+          {skillCfg.custom_dirs.length === 0 && (
+            <div className="text-[12px] text-ink3">暂无自定义目录。</div>
+          )}
+          <button className="btn-outline" onClick={addCustomDir}>添加目录</button>
+        </div>
+      </div>
+
+      {/* skill 列表与开关 */}
+      <div className="card">
+        <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+          <span className="text-[13px] font-medium text-ink">
+            全部 skills（{enabledCount}/{skills.length} 启用）
+          </span>
+          <div className="ml-auto flex items-center gap-2 rounded-md border border-border px-2 py-1">
+            <IconSearch width={12} height={12} className="text-ink3" />
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索 skill…"
+              className="w-32 bg-transparent text-[12px] outline-none placeholder:text-ink3"
+            />
+          </div>
+        </div>
+        <ul className="divide-y divide-border px-3">
+          {filtered.map((s) => (
+            <li key={`${s.source}:${s.name}`} className="flex items-center gap-3 py-2.5">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-[13px] font-medium text-ink">{s.name}</span>
+                  <span className="shrink-0 rounded bg-surface2 px-1.5 py-0.5 text-[10px] text-ink3">
+                    {SKILL_SOURCE_LABELS[s.source] ?? s.source}
+                  </span>
+                </div>
+                <div className="truncate text-[12px] text-ink2">{s.description}</div>
+              </div>
+              <Toggle checked={!disabled.has(s.name)} onChange={(v) => toggleSkill(s.name, v)} />
+            </li>
+          ))}
+          {filtered.length === 0 && (
+            <li className="py-10 text-center text-[12px] text-ink3">
+              {skills.length === 0 ? '未发现可用 skill。' : '没有匹配的 skill。'}
+            </li>
+          )}
+        </ul>
+      </div>
+
+      {saveError && (
+        <p role="alert" className="rounded-md border border-danger/30 bg-dangerSoft px-3 py-2 text-[12px] text-danger">
+          保存失败：{saveError}
+        </p>
+      )}
+      {saveMessage && (
+        <p role="status" className="rounded-md border border-success/30 bg-success/10 px-3 py-2 text-[12px] text-success">
+          {saveMessage}
+        </p>
+      )}
+
+      <div className="flex items-center justify-end gap-2">
+        <button className="btn-primary" disabled={saving} onClick={() => void save()}>
+          {saving ? '保存中…' : '保存 Skills 设置'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function DirToggleRow({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string
+  hint: string
+  checked: boolean
+  onChange: (v: boolean) => void
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] text-ink">{label}</div>
+        <code className="block truncate text-[11px] text-ink3">{hint}</code>
+      </div>
+      <Toggle checked={checked} onChange={onChange} />
     </div>
   )
 }

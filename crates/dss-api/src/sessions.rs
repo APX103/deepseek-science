@@ -1021,7 +1021,8 @@ pub async fn stream_sse(
     let llm_runtime = runtime.llm().clone();
     let llm = llm_runtime.client().cloned();
     let model = llm_runtime.settings().model.clone();
-    let mut run_tools = state.tools.snapshot();
+    let mcp_runtime = state.mcp_runtime_snapshot().await;
+    let mut run_tools = mcp_runtime.tools.snapshot();
     dss_tools::builtin::a2a::register_tools(
         &mut run_tools,
         runtime.a2a(),
@@ -1143,15 +1144,15 @@ pub async fn stream_sse(
 
         let (history_checkpoint_tx, history_checkpoint_rx) = mpsc::channel(1);
         let ctx = {
-            // 复制全局 catalog（builtin+global），再叠加 project 源（workspace/.deepseek-science/skills）。
-            let mut cat = (*state.catalog).clone();
+            // 复制全局 catalog（builtin+global+外部/custom），再叠加 project 源（workspace/.deepseek-science/skills）。
+            let mut cat = (*state.catalog_snapshot().await).clone();
             cat.load_dir(
                 &dss_skills::project_skills_dir(&session.workspace),
                 "project",
             );
             let mut tc = ToolContext::new(session.workspace.clone())
                 .with_skill_catalog(cat)
-                .with_mcp_arc(state.mcp.clone())
+                .with_mcp_arc(mcp_runtime.manager.clone())
                 .with_history_checkpoint(history_checkpoint_tx);
             tc = tc.with_plan(initial_plan).await;
             // 注入 LLM（delegate 工具用）。

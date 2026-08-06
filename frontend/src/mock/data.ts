@@ -5,7 +5,6 @@ import type {
   LogEntry,
   LogLevel,
   LogSource,
-  McpServer,
   Message,
   Project,
   SessionState,
@@ -464,7 +463,7 @@ export const mockLogs: LogEntry[] = [
   }),
 ]
 
-// ---------- Settings / MCP ----------
+// ---------- Settings ----------
 export const mockSettings: AppSettings = {
   providers: [
     {
@@ -486,9 +485,8 @@ export const mockSettings: AppSettings = {
   default_workspace: '~/.deepseek-science',
   revision: 0,
   overridden_fields: [],
+  mcp_servers: [
+    { name: 'literature-search', url: 'http://127.0.0.1:8901/sse', enabled: true, connected: true, tool_count: 3 },
+    { name: 'compute-cluster', url: 'http://127.0.0.1:8902/sse', enabled: true, connected: false, tool_count: null },
+  ],
 }
-
-export const mockMcpServers: McpServer[] = [
-  { name: 'literature-search', url: 'http://127.0.0.1:8901/sse', enabled: true, connected: true },
-  { name: 'compute-cluster', url: 'http://127.0.0.1:8902/sse', enabled: true, connected: false },
-]

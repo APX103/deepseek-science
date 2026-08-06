@@ -4,11 +4,105 @@ import type {
   AppSettingsUpdate,
   BackendStatus,
   LlmOverriddenField,
+  McpServer,
+  McpServerUpdate,
+  SkillSettingsValue,
 } from '../types'
 
 export type SettingsKeyDrafts = Readonly<Record<string, string>>
+
+/** Normalize skill settings so the shape is always complete regardless of backend version. */
+export function normalizeSkillSettings(value?: SkillSettingsValue | null): SkillSettingsValue {
+  return {
+    disabled: value?.disabled ? [...value.disabled] : [],
+    include_claude: value?.include_claude ?? false,
+    include_codex: value?.include_codex ?? false,
+    include_cursor: value?.include_cursor ?? false,
+    custom_dirs: value?.custom_dirs ? [...value.custom_dirs] : [],
+  }
+}
 export type A2aTokenDrafts = Readonly<Record<string, string>>
 export type A2aTokenClears = ReadonlySet<string>
+
+/**
+ * Parse a JSON MCP config into editable server entries. Accepts three shapes:
+ * a single server object (`{"name": …, "url": …}`), an array of those, or the Claude-style
+ * map (`{"mcpServers": {"<name>": {"url": …}}}`). Only http(s) servers are supported;
+ * stdio/command entries are rejected with a readable error.
+ */
+export function parseMcpJsonConfig(text: string): McpServerUpdate[] {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`JSON 解析失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  const toEntry = (name: unknown, value: unknown): McpServerUpdate => {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new Error('每个 server 都需要非空的 name')
+    }
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`server "${name}" 的配置必须是对象`)
+    }
+    const record = value as Record<string, unknown>
+    if (typeof record.command === 'string' && record.command.trim() !== '') {
+      throw new Error(`server "${name}" 使用 command/stdio 方式启动，当前仅支持 http(s) URL 接入`)
+    }
+    const url = typeof record.url === 'string' ? record.url.trim() : ''
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      throw new Error(`server "${name}" 的 url 必须以 http:// 或 https:// 开头`)
+    }
+    return {
+      name: name.trim(),
+      url,
+      enabled: typeof record.enabled === 'boolean' ? record.enabled : true,
+    }
+  }
+
+  const entries: McpServerUpdate[] = []
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (typeof item !== 'object' || item === null) throw new Error('数组中的每项必须是对象')
+      entries.push(toEntry((item as Record<string, unknown>).name, item))
+    }
+  } else if (typeof raw === 'object' && raw !== null) {
+    const record = raw as Record<string, unknown>
+    const map = record.mcpServers ?? record.mcp_servers
+    if (map !== undefined) {
+      if (typeof map !== 'object' || map === null || Array.isArray(map)) {
+        throw new Error('mcpServers 必须是 { 名称: 配置 } 形式的对象')
+      }
+      for (const [name, value] of Object.entries(map)) entries.push(toEntry(name, value))
+    } else if ('url' in record || 'name' in record) {
+      entries.push(toEntry(record.name, record))
+    } else {
+      // 裸 map 形式：{"<name>": {"url": …}}
+      for (const [name, value] of Object.entries(record)) entries.push(toEntry(name, value))
+    }
+  } else {
+    throw new Error('JSON 配置必须是对象或数组')
+  }
+
+  const seen = new Set<string>()
+  for (const entry of entries) {
+    const key = entry.name.toLowerCase()
+    if (seen.has(key)) throw new Error(`JSON 中存在重复的 server 名称：${entry.name}`)
+    seen.add(key)
+  }
+  return entries
+}
+
+/** Normalize the MCP server list so the shape is always complete regardless of backend version. */
+export function normalizeMcpServers(value?: McpServer[] | null): McpServer[] {
+  return (value ?? []).map((server) => ({
+    name: server.name ?? '',
+    url: server.url ?? '',
+    enabled: server.enabled ?? true,
+    connected: server.connected ?? false,
+    tool_count: server.tool_count ?? null,
+  }))
+}
 
 /** Never retain a plaintext key received from the server in frontend state. */
 export function sanitizeSettings(settings: AppSettings): AppSettings {
@@ -26,6 +120,8 @@ export function sanitizeSettings(settings: AppSettings): AppSettings {
       } = agent
       return publicAgent
     }),
+    skills: normalizeSkillSettings(settings.skills),
+    mcp_servers: normalizeMcpServers(settings.mcp_servers),
   }
 }
 
@@ -59,6 +155,13 @@ export function buildSettingsPayload(
       }
       return draft ? { ...editable, bearer_token: draft } : editable
     }),
+    skills: normalizeSkillSettings(sanitized.skills),
+    // connected/tool_count are server-side diagnostics; only the editable triple goes back out.
+    mcp_servers: normalizeMcpServers(sanitized.mcp_servers).map((server) => ({
+      name: server.name,
+      url: server.url,
+      enabled: server.enabled,
+    })),
   }
 }
 

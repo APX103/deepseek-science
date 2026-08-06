@@ -182,6 +182,81 @@ pub struct A2aAgentSettings {
     card_summary: Option<A2aCardSettings>,
 }
 
+/// Editable Skill discovery settings mirrored from/to `settings.json`'s `skills` object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillSettingsPayload {
+    #[serde(default)]
+    disabled: Vec<String>,
+    #[serde(default)]
+    include_claude: bool,
+    #[serde(default)]
+    include_codex: bool,
+    #[serde(default)]
+    include_cursor: bool,
+    #[serde(default)]
+    custom_dirs: Vec<String>,
+}
+
+impl From<&dss_core::SkillSettings> for SkillSettingsPayload {
+    fn from(value: &dss_core::SkillSettings) -> Self {
+        Self {
+            disabled: value.disabled.clone(),
+            include_claude: value.include_claude,
+            include_codex: value.include_codex,
+            include_cursor: value.include_cursor,
+            custom_dirs: value.custom_dirs.clone(),
+        }
+    }
+}
+
+impl SkillSettingsPayload {
+    /// Normalize submitted skill settings: trim and drop empty names/paths, de-duplicate.
+    fn to_config(&self) -> dss_core::SkillSettings {
+        fn clean(values: &[String]) -> Vec<String> {
+            let mut seen = std::collections::HashSet::new();
+            values
+                .iter()
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .filter(|v| seen.insert(v.clone()))
+                .collect()
+        }
+        dss_core::SkillSettings {
+            disabled: clean(&self.disabled),
+            include_claude: self.include_claude,
+            include_codex: self.include_codex,
+            include_cursor: self.include_cursor,
+            custom_dirs: clean(&self.custom_dirs),
+        }
+    }
+}
+
+/// Editable MCP server entry mirrored from/to `settings.json`'s `mcp_servers` array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerSettings {
+    name: String,
+    url: String,
+    #[serde(default)]
+    enabled: bool,
+    /// Live connection state (diagnostic; never persisted). Present only on responses.
+    #[serde(default)]
+    connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+}
+
+impl From<&dss_core::McpServerConfig> for McpServerSettings {
+    fn from(value: &dss_core::McpServerConfig) -> Self {
+        Self {
+            name: value.name.clone(),
+            url: value.url.clone(),
+            enabled: value.enabled,
+            connected: false,
+            tool_count: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettingsPayload {
     providers: Vec<ProviderSettings>,
@@ -195,12 +270,18 @@ pub struct AppSettingsPayload {
     overridden_fields: Vec<String>,
     #[serde(default)]
     a2a_agents: Vec<A2aAgentSettings>,
+    #[serde(default)]
+    skills: SkillSettingsPayload,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerSettings>,
 }
 
 fn public_settings(
     state: &AppState,
     runtime: &AppRuntimeSnapshot,
     persisted: &dss_core::LlmSettings,
+    persisted_skills: &dss_core::SkillSettings,
+    persisted_mcp: &[dss_core::McpServerConfig],
 ) -> AppSettingsPayload {
     let llm = runtime.llm();
     AppSettingsPayload {
@@ -231,6 +312,22 @@ fn public_settings(
             .map(str::to_owned)
             .collect(),
         a2a_agents: runtime.a2a().agents.iter().map(public_a2a_agent).collect(),
+        skills: SkillSettingsPayload::from(persisted_skills),
+        mcp_servers: persisted_mcp.iter().map(McpServerSettings::from).collect(),
+    }
+}
+
+/// Overlay live MCP connection state (connected + tool count) onto the persisted server list.
+async fn enrich_mcp_status(state: &AppState, payload: &mut AppSettingsPayload) {
+    let manager = state.mcp_runtime_snapshot().await.manager;
+    for server in &mut payload.mcp_servers {
+        if let Some(info) = manager.server_info(&server.name).await {
+            server.connected = info.connected;
+            server.tool_count = Some(info.tools.len());
+        } else {
+            server.connected = false;
+            server.tool_count = None;
+        }
     }
 }
 
@@ -315,7 +412,17 @@ pub async fn get_settings(
         .settings
         .reload_persisted_llm()
         .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
-    Ok(Json(public_settings(&state, &runtime, &persisted)))
+    let persisted_skills = state
+        .settings
+        .reload_persisted_skills()
+        .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let persisted_mcp = state
+        .settings
+        .reload_persisted_mcp_servers()
+        .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let mut payload = public_settings(&state, &runtime, &persisted, &persisted_skills, &persisted_mcp);
+    enrich_mcp_status(&state, &mut payload).await;
+    Ok(Json(payload))
 }
 
 pub async fn save_settings(
@@ -434,6 +541,37 @@ pub async fn save_settings(
     dss_a2a::validate_configs(&a2a_configs)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error.to_string()))?;
 
+    let mut mcp_configs: Vec<dss_core::McpServerConfig> =
+        Vec::with_capacity(payload.mcp_servers.len());
+    let mut seen_mcp_names = std::collections::HashSet::new();
+    for submitted in &payload.mcp_servers {
+        let name = submitted.name.trim().to_owned();
+        if name.is_empty() {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "each MCP server needs a name",
+            ));
+        }
+        let url = submitted.url.trim().to_owned();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("MCP server \"{name}\" url must use http:// or https://"),
+            ));
+        }
+        if !seen_mcp_names.insert(name.to_lowercase()) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("duplicate MCP server name: {name}"),
+            ));
+        }
+        mcp_configs.push(dss_core::McpServerConfig {
+            name,
+            url,
+            enabled: submitted.enabled,
+        });
+    }
+
     let object = root.as_object_mut().expect("object assigned above");
     let mut llm = object.remove("llm").unwrap_or_else(|| json!({}));
     if !llm.is_object() {
@@ -449,6 +587,17 @@ pub async fn save_settings(
     object.insert(
         "a2a_agents".into(),
         serde_json::to_value(&a2a_configs)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    );
+    let skills_config = payload.skills.to_config();
+    object.insert(
+        "skills".into(),
+        serde_json::to_value(&skills_config)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    );
+    object.insert(
+        "mcp_servers".into(),
+        serde_json::to_value(&mcp_configs)
             .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
     );
 
@@ -474,7 +623,15 @@ pub async fn save_settings(
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
     let persisted_a2a = state
         .settings
-        .resolve_persisted_candidate_a2a_agents(root)
+        .resolve_persisted_candidate_a2a_agents(root.clone())
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let persisted_skills = state
+        .settings
+        .resolve_persisted_candidate_skills(root.clone())
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let persisted_mcp = state
+        .settings
+        .resolve_persisted_candidate_mcp_servers(root)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
     let llm_replacement = Arc::new(LlmRuntimeSnapshot::new(
         resolved.llm,
@@ -514,7 +671,21 @@ pub async fn save_settings(
     })?
     .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
 
-    Ok(Json(public_settings(&state, &replacement, &persisted)))
+    // Skill discovery and MCP are not part of the atomic LLM/A2A runtime snapshot; rebuild them
+    // after the durable write so built-in toggles, external/custom dirs, and MCP server changes
+    // apply without a restart.
+    state.rebuild_catalog(&persisted_skills).await;
+    state.rebuild_mcp(&persisted_mcp).await;
+
+    let mut payload = public_settings(
+        &state,
+        &replacement,
+        &persisted,
+        &persisted_skills,
+        &persisted_mcp,
+    );
+    enrich_mcp_status(&state, &mut payload).await;
+    Ok(Json(payload))
 }
 
 #[cfg(test)]
@@ -649,6 +820,8 @@ mod tests {
             revision: 0,
             overridden_fields: Vec::new(),
             a2a_agents: Vec::new(),
+            skills: SkillSettingsPayload::default(),
+            mcp_servers: Vec::new(),
         }
     }
 

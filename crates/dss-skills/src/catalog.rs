@@ -4,7 +4,7 @@
 //! 首跑复制 builtin 到 global（不覆盖）。claude/custom 源留 P5b。
 //! 后源覆盖前源（同名 skill 取后加载的）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::bm25;
@@ -14,17 +14,30 @@ use crate::skill::{Skill, SkillHit};
 /// 嵌入的内置 skills（编译期打进二进制）。
 static BUILTIN_SKILLS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/skills");
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SkillCatalog {
     /// name → skill（后源覆盖前源）。
     pub skills: HashMap<String, Skill>,
+    /// 被禁用的 skill 名称：仍保留在 `skills` 中（供设置 UI 展示），但不进入 agent 的检索/读取。
+    pub disabled: HashSet<String>,
 }
 
 impl SkillCatalog {
     pub fn new() -> Self {
         Self {
             skills: HashMap::new(),
+            disabled: HashSet::new(),
         }
+    }
+
+    /// 设置禁用的 skill 名称集合。
+    pub fn set_disabled<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        self.disabled = names.into_iter().collect();
+    }
+
+    /// 该 skill 是否启用（未被禁用）。
+    pub fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled.contains(name)
     }
 
     /// 从一个源目录加载（递归找 SKILL.md）。
@@ -52,27 +65,38 @@ impl SkillCatalog {
         load_builtin_recursive(&BUILTIN_SKILLS, "builtin", &mut self.skills);
     }
 
-    /// 检索。
+    /// 检索（仅启用的 skill）。
     pub fn search(&self, query: &str) -> Vec<SkillHit> {
-        let skills: Vec<Skill> = self.skills.values().cloned().collect();
+        let skills: Vec<Skill> = self
+            .skills
+            .values()
+            .filter(|s| self.is_enabled(&s.name))
+            .cloned()
+            .collect();
         bm25::search(&skills, query)
     }
 
-    /// 按 name 取 skill body。
+    /// 按 name 取 skill body（禁用的 skill 视为不存在）。
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.get(name)
+        self.skills.get(name).filter(|_| self.is_enabled(name))
     }
 
+    /// 启用的 skill 列表（agent 可见）。
     pub fn list(&self) -> Vec<&Skill> {
-        let mut v: Vec<&Skill> = self.skills.values().collect();
+        let mut v: Vec<&Skill> = self
+            .skills
+            .values()
+            .filter(|s| self.is_enabled(&s.name))
+            .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
-}
 
-impl Default for SkillCatalog {
-    fn default() -> Self {
-        Self::new()
+    /// 全部 skill 列表（含被禁用项），供设置 UI 展示与开关。
+    pub fn list_all(&self) -> Vec<&Skill> {
+        let mut v: Vec<&Skill> = self.skills.values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 }
 
@@ -145,4 +169,74 @@ pub fn global_skills_dir(data_dir: &Path) -> PathBuf {
 /// 项目级 skills 目录：<workspace>/.deepseek-science/skills。
 pub fn project_skills_dir(workspace: &Path) -> PathBuf {
     workspace.join(".deepseek-science").join("skills")
+}
+
+/// 用户 home 目录（跨平台兜底）。
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Claude Code skills 目录：`~/.claude/skills`。
+pub fn claude_skills_dirs() -> Vec<PathBuf> {
+    home_dir()
+        .map(|h| vec![h.join(".claude").join("skills")])
+        .unwrap_or_default()
+}
+
+/// Codex skills 目录：`~/.codex/skills`。
+pub fn codex_skills_dirs() -> Vec<PathBuf> {
+    home_dir()
+        .map(|h| vec![h.join(".codex").join("skills")])
+        .unwrap_or_default()
+}
+
+/// Cursor skills 目录：`~/.cursor/skills-cursor` 与 `~/.cursor/skills`。
+pub fn cursor_skills_dirs() -> Vec<PathBuf> {
+    home_dir()
+        .map(|h| {
+            vec![
+                h.join(".cursor").join("skills-cursor"),
+                h.join(".cursor").join("skills"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+/// 按配置从多源构建 catalog。
+///
+/// 源顺序（后源覆盖同名前源）：builtin → global → claude → codex → cursor → custom。
+/// `disabled` 中的 skill 仍会被加载（供 UI 展示），但通过 [`SkillCatalog::is_enabled`] 屏蔽。
+pub fn build_catalog(
+    global_dir: &Path,
+    include_claude: bool,
+    include_codex: bool,
+    include_cursor: bool,
+    custom_dirs: &[PathBuf],
+    disabled: &[String],
+) -> SkillCatalog {
+    let mut catalog = SkillCatalog::new();
+    catalog.load_builtin();
+    catalog.load_dir(global_dir, "global");
+    if include_claude {
+        for dir in claude_skills_dirs() {
+            catalog.load_dir(&dir, "claude");
+        }
+    }
+    if include_codex {
+        for dir in codex_skills_dirs() {
+            catalog.load_dir(&dir, "codex");
+        }
+    }
+    if include_cursor {
+        for dir in cursor_skills_dirs() {
+            catalog.load_dir(&dir, "cursor");
+        }
+    }
+    for dir in custom_dirs {
+        catalog.load_dir(dir, "custom");
+    }
+    catalog.set_disabled(disabled.iter().cloned());
+    catalog
 }

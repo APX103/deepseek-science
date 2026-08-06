@@ -470,11 +470,17 @@ pub struct AppState {
     pub(crate) settings_save_lock: Arc<Mutex<()>>,
     /// Shared no-redirect transport; it contains no Agent credentials or mutable card state.
     pub a2a_client: Arc<A2aClient>,
+    /// Base tool registry: built-in tools only. Runs overlay per-run A2A tools and the current
+    /// MCP tools on top of this immutable base.
     pub tools: Arc<ToolRegistry>,
-    pub catalog: Arc<dss_skills::SkillCatalog>,
+    /// Skill catalog behind a lock so a settings save can hot-rebuild discovery (built-in
+    /// enable/disable, external claude/codex/cursor dirs, custom dirs) without a restart.
+    pub catalog: Arc<RwLock<Arc<dss_skills::SkillCatalog>>>,
     pub memory: Arc<dss_memory::MemoryStore>,
     pub logs: Arc<dss_observability::LogStore>,
-    pub mcp: Arc<dss_mcp::MCPServerManager>,
+    /// MCP manager + MCP-augmented tool registry, behind a lock so a settings save can reconnect
+    /// servers and remount tools without a restart.
+    pub mcp_runtime: Arc<RwLock<McpRuntime>>,
     pub db: Arc<DbPool>,
     /// 活跃 session（id → Arc<ActiveSession>）。LRU 驱逐仅影响内存。
     pub sessions: Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>,
@@ -496,6 +502,33 @@ impl AppState {
 
     pub async fn a2a_snapshot(&self) -> Arc<A2aRuntimeSnapshot> {
         self.runtime.read().await.a2a().clone()
+    }
+
+    /// Clone the current skill catalog pointer. Runs and the `/api/skills` endpoint read this so a
+    /// concurrent settings save can swap in a rebuilt catalog atomically.
+    pub async fn catalog_snapshot(&self) -> Arc<dss_skills::SkillCatalog> {
+        self.catalog.read().await.clone()
+    }
+
+    /// Rebuild the skill catalog from the given discovery configuration and publish it. Used after
+    /// a settings save so built-in toggles, external directories, and custom dirs take effect
+    /// without restarting the backend.
+    pub async fn rebuild_catalog(&self, skills: &dss_core::SkillSettings) {
+        let catalog = build_skill_catalog(&self.settings.data_dir, skills);
+        *self.catalog.write().await = Arc::new(catalog);
+    }
+
+    /// Clone the current MCP runtime (manager + tools). Reads both together so a run never mixes a
+    /// new tool registry with an old manager.
+    pub async fn mcp_runtime_snapshot(&self) -> McpRuntime {
+        self.mcp_runtime.read().await.clone()
+    }
+
+    /// Reconnect the given MCP servers and publish a rebuilt runtime. Used after a settings save so
+    /// MCP server changes take effect without restarting the backend.
+    pub async fn rebuild_mcp(&self, servers: &[dss_core::McpServerConfig]) {
+        let runtime = build_mcp_runtime(self.tools.clone(), servers).await;
+        *self.mcp_runtime.write().await = runtime;
     }
 
     /// Refresh discovery before publishing the run's tool catalog, so a restarted application
@@ -537,6 +570,73 @@ impl AppState {
     }
 }
 
+/// MCP manager paired with the tool registry that mounts its dynamic tools on top of the
+/// built-in base. Both are replaced together on a settings save so a run always sees a coherent
+/// (manager, tools) pair.
+#[derive(Clone)]
+pub struct McpRuntime {
+    pub manager: Arc<dss_mcp::MCPServerManager>,
+    /// Built-in tools plus mounted `mcp__{server}__{tool}` tools.
+    pub tools: Arc<ToolRegistry>,
+}
+
+/// Connect the enabled MCP servers and mount their tools on top of `base_tools`. Connection is
+/// best-effort within a bounded budget: an unreachable server is simply skipped (persisted config
+/// still applies), matching A2A's offline-tolerant behavior.
+pub async fn build_mcp_runtime(
+    base_tools: Arc<ToolRegistry>,
+    servers: &[dss_core::McpServerConfig],
+) -> McpRuntime {
+    let manager = Arc::new(dss_mcp::MCPServerManager::new());
+    let mut tools = base_tools.snapshot();
+    let connect = async {
+        for srv in servers.iter().filter(|s| s.enabled) {
+            if manager.add_server(&srv.name, &srv.url).await {
+                if let Some(mcp_tools) = manager.list_tools(&srv.name).await {
+                    let count =
+                        dss_tools::builtin::mcp::register_mcp_tools(&mut tools, &srv.name, &mcp_tools);
+                    tracing::info!(server = %srv.name, tools = count, "MCP tools mounted");
+                }
+            } else {
+                tracing::warn!(server = %srv.name, url = %srv.url, "MCP server connect failed");
+            }
+        }
+    };
+    if tokio::time::timeout(MCP_STARTUP_BUDGET, connect).await.is_err() {
+        tracing::warn!(
+            budget_secs = MCP_STARTUP_BUDGET.as_secs(),
+            "MCP connect budget exhausted; continuing without remaining servers"
+        );
+    }
+    McpRuntime {
+        manager,
+        tools: Arc::new(tools),
+    }
+}
+
+/// Build a skill catalog from persisted discovery settings for the given data directory.
+pub fn build_skill_catalog(
+    data_dir: &std::path::Path,
+    skills: &dss_core::SkillSettings,
+) -> dss_skills::SkillCatalog {
+    let global_dir = dss_skills::global_skills_dir(data_dir);
+    let custom_dirs: Vec<std::path::PathBuf> = skills
+        .custom_dirs
+        .iter()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect();
+    dss_skills::build_catalog(
+        &global_dir,
+        skills.include_claude,
+        skills.include_codex,
+        skills.include_cursor,
+        &custom_dirs,
+        &skills.disabled,
+    )
+}
+
 pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError> {
     // Read once during startup. The value is deliberately never serialized or logged.
     let api_token = std::env::var("DSS_API_TOKEN")
@@ -560,8 +660,10 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
     let a2a_runtime = Arc::new(initial_a2a_snapshot(0, &settings.a2a_agents));
     let runtime = Arc::new(AppRuntimeSnapshot::new(0, llm_runtime.clone(), a2a_runtime));
 
-    let mut tools = ToolRegistry::new();
-    builtin::register_all(&mut tools);
+    // 基础工具集（仅内置工具）。MCP 动态工具挂载到可热重建的 mcp_runtime 上，不污染这个基座。
+    let mut base = ToolRegistry::new();
+    builtin::register_all(&mut base);
+    let tools = Arc::new(base);
 
     // DB pool（先建，memory 依赖它）。
     let pool = open_pool(&settings.data_dir)?;
@@ -569,41 +671,24 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
     crate::db::ensure_default_project(&pool).await?;
     let db = Arc::new(pool);
 
-    // Skill 目录：builtin → global（首跑 seed）→ global 加载。project 源在 stream_sse 按 workspace 加载。
+    // Skill 目录：builtin → global（首跑 seed）→ 可选 claude/codex/cursor + custom。project 源在
+    // stream_sse 按 workspace 叠加。禁用集合过滤 agent 可见性。配置来自 settings.json 的 `skills`。
     let global_dir = dss_skills::global_skills_dir(&settings.data_dir);
     dss_skills::seed_builtin_to_global(&global_dir);
-    let mut catalog = dss_skills::SkillCatalog::new();
-    catalog.load_builtin();
-    catalog.load_dir(&global_dir, "global");
-    let catalog = Arc::new(catalog);
+    let skill_settings = settings.reload_persisted_skills().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load skill settings; using defaults");
+        dss_core::SkillSettings::default()
+    });
+    let catalog = build_skill_catalog(&settings.data_dir, &skill_settings);
+    let catalog = Arc::new(RwLock::new(Arc::new(catalog)));
 
     let memory = Arc::new(dss_memory::MemoryStore::new(db.clone()));
     let logs = Arc::new(dss_observability::LogStore::new(db.clone()));
 
-    // MCP server 管理器：连接 settings 配置的 server，挂载其工具到 ToolRegistry。
-    let mcp = Arc::new(dss_mcp::MCPServerManager::new());
-    let mcp_cfg = settings.mcp_servers.clone();
-    let mcp_startup = async {
-        for srv in mcp_cfg.iter().filter(|s| s.enabled) {
-            if mcp.add_server(&srv.name, &srv.url).await {
-                if let Some(mcp_tools) = mcp.list_tools(&srv.name).await {
-                    let count = dss_tools::builtin::mcp::register_mcp_tools(
-                        &mut tools, &srv.name, &mcp_tools,
-                    );
-                    tracing::info!(server = %srv.name, tools = count, "MCP tools mounted");
-                }
-            }
-        }
-    };
-    if tokio::time::timeout(MCP_STARTUP_BUDGET, mcp_startup)
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            budget_secs = MCP_STARTUP_BUDGET.as_secs(),
-            "MCP startup budget exhausted; continuing without remaining servers"
-        );
-    }
+    // MCP：连接 settings.json 配置的 server 并把工具挂到 base 之上；结果放进可热重建的 mcp_runtime。
+    // 保存 MCP 设置时会重连并原子替换这个指针，无需重启。
+    let mcp_runtime = build_mcp_runtime(tools.clone(), &settings.mcp_servers).await;
+    let mcp_runtime = Arc::new(RwLock::new(mcp_runtime));
 
     // 启动日志（system source）。
     let _ = logs
@@ -630,11 +715,11 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
         runtime: Arc::new(RwLock::new(runtime)),
         settings_save_lock: Arc::new(Mutex::new(())),
         a2a_client,
-        tools: Arc::new(tools),
+        tools,
         catalog,
         memory,
         logs,
-        mcp,
+        mcp_runtime,
         db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session_restore_lock: Arc::new(Mutex::new(())),

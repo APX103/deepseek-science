@@ -81,6 +81,16 @@ export interface A2aAgentSettingsUpdate {
 
 export type LlmOverriddenField = 'api_key' | 'base_url' | 'model'
 
+/** Skill 发现配置：内置开关 + 外部目录纳入 + 自定义目录。 */
+export interface SkillSettingsValue {
+  /** 被禁用的 skill 名称。 */
+  disabled: string[]
+  include_claude: boolean
+  include_codex: boolean
+  include_cursor: boolean
+  custom_dirs: string[]
+}
+
 export interface AppSettings {
   providers: AppSettingsProvider[]
   /** GET /settings always returns this list; optional keeps older saved mocks loadable. */
@@ -93,6 +103,10 @@ export interface AppSettings {
   revision: number
   /** 仅暴露覆盖来源，不包含任何环境变量值。 */
   overridden_fields: LlmOverriddenField[]
+  /** Skill 发现配置；旧后端可能不返回。 */
+  skills?: SkillSettingsValue
+  /** MCP server 列表（含连接状态）；旧后端可能不返回。 */
+  mcp_servers?: McpServer[]
 }
 
 /** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */
@@ -103,6 +117,8 @@ export interface AppSettingsUpdate {
   default_workspace: string
   /** Optimistic concurrency guard; stale full-form saves receive HTTP 409. */
   revision: number
+  skills?: SkillSettingsValue
+  mcp_servers?: McpServerUpdate[]
 }
 
 // ---------- MCP ----------
@@ -110,7 +126,17 @@ export interface McpServer {
   name: string
   url: string
   enabled: boolean
+  /** 实时连接状态（仅响应，不回传）。 */
   connected: boolean
+  /** 已发现的工具数（仅响应；未连接时为 null/缺省）。 */
+  tool_count?: number | null
+}
+
+/** MCP server 的可提交字段（连接状态/工具数只由后端产生）。 */
+export interface McpServerUpdate {
+  name: string
+  url: string
+  enabled: boolean
 }
 
 // ---------- 记忆 ----------

@@ -75,7 +75,7 @@ describe("restoreVisibleMessages", () => {
           { type: "thinking", thinking: "visible reasoning" },
           { type: "text", text: "visible answer" },
         ],
-        usage: { input_tokens: 7, output_tokens: 3 },
+        usage: { input_tokens: 7, output_tokens: 3, cache_hit_tokens: 0, cache_miss_tokens: 0 },
       },
     ]);
     const serialized = JSON.stringify(restored);
