@@ -357,6 +357,7 @@ mod active_run_tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await;
         assert!(

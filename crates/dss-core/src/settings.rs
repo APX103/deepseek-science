@@ -4,6 +4,7 @@
 //! 配置文件位于 `<data_dir>/config.toml` 与 `<data_dir>/settings.json`；
 //! data_dir 本身只由 `DSS_DATA_DIR` 或默认值决定（不参与配置文件加载，避免自引用）。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,8 @@ pub struct Settings {
     pub a2a_agents: Vec<A2aAgentConfig>,
     /// 记忆系统配置（抽取/巩固/召回）。
     pub memory: MemorySettings,
+    /// 数据源 API keys（OPENALEX_API_KEY 等）。工具通过 ToolContext.api_keys 读取。
+    pub api_keys: HashMap<String, String>,
 }
 
 /// 一个用户显式信任并配置的远端 A2A Agent。
@@ -263,6 +266,9 @@ struct FileSettings {
     /// 记忆系统配置（整体替换语义：高优先级文件的 memory 对象覆盖低层）。
     #[serde(default)]
     memory: Option<MemorySettings>,
+    /// 数据源 API keys（OPENALEX_API_KEY 等）。整体替换语义。
+    #[serde(default)]
+    api_keys: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -620,6 +626,7 @@ impl Settings {
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
         let mut memory = MemorySettings::default();
+        let mut api_keys: HashMap<String, String> = HashMap::new();
 
         // config.toml（低优先级文件）
         let config_toml = data_dir.join("config.toml");
@@ -630,6 +637,7 @@ impl Settings {
                 message: e.to_string(),
             })?;
             let file_memory = file.memory.clone();
+            let file_api_keys = file.api_keys.clone();
             file.apply_to(
                 &mut server,
                 &mut llm,
@@ -640,6 +648,9 @@ impl Settings {
             );
             if let Some(m) = file_memory {
                 memory = m;
+            }
+            if let Some(k) = file_api_keys {
+                api_keys = k;
             }
         }
 
@@ -654,6 +665,7 @@ impl Settings {
                 })?;
             // memory 整体替换语义（高优先级文件的 memory 覆盖低层）。
             let file_memory = file.memory.clone();
+            let file_api_keys = file.api_keys.clone();
             file.apply_to(
                 &mut server,
                 &mut llm,
@@ -664,6 +676,9 @@ impl Settings {
             );
             if let Some(m) = file_memory {
                 memory = m;
+            }
+            if let Some(k) = file_api_keys {
+                api_keys = k;
             }
         }
 
@@ -688,6 +703,7 @@ impl Settings {
             mcp_servers,
             a2a_agents,
             memory,
+            api_keys,
         })
     }
 }

@@ -108,6 +108,8 @@ export interface AppSettings {
   skills?: SkillSettingsValue
   /** MCP server 列表（含连接状态）；旧后端可能不返回。 */
   mcp_servers?: McpServer[]
+  /** 数据源 API keys（GET 时脱敏为 ••••••••）；旧后端可能不返回。 */
+  api_keys_masked?: Record<string, string>
 }
 
 /** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */
@@ -120,6 +122,8 @@ export interface AppSettingsUpdate {
   revision: number
   skills?: SkillSettingsValue
   mcp_servers?: McpServerUpdate[]
+  /** 数据源 API keys。mask 占位（••••••••）后端保留旧值；空串清除该 key。 */
+  api_keys?: Record<string, string>
 }
 
 // ---------- MCP ----------

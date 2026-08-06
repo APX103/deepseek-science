@@ -276,6 +276,12 @@ pub struct AppSettingsPayload {
     skills: SkillSettingsPayload,
     #[serde(default)]
     mcp_servers: Vec<McpServerSettings>,
+    /// 数据源 API keys（GET 时脱敏；POST 时前端回传，None/空值保留后端旧值）。
+    /// 和 providers.api_key 同样的 mask 机制。
+    #[serde(default)]
+    api_keys_masked: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    api_keys: Option<std::collections::HashMap<String, String>>,
 }
 
 fn public_settings(
@@ -326,6 +332,20 @@ fn public_settings(
         a2a_agents: runtime.a2a().agents.iter().map(public_a2a_agent).collect(),
         skills: SkillSettingsPayload::from(persisted_skills),
         mcp_servers: persisted_mcp.iter().map(McpServerSettings::from).collect(),
+        api_keys_masked: state
+            .settings
+            .api_keys
+            .iter()
+            .map(|(k, v)| {
+                let masked = if v.is_empty() {
+                    String::new()
+                } else {
+                    "••••••••".into()
+                };
+                (k.clone(), masked)
+            })
+            .collect(),
+        api_keys: None,
     }
 }
 
@@ -697,6 +717,27 @@ pub async fn save_settings(
         serde_json::to_value(&mcp_configs)
             .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
     );
+    // api_keys：前端回传的值里，mask 占位（••••••••）保留后端旧值，其余（含空=清空）写入。
+    // 未出现在 payload.api_keys 里的旧 key 也保留（不丢用户已存的 key）。
+    let mut merged_api_keys = state.settings.api_keys.clone();
+    if let Some(submitted) = &payload.api_keys {
+        for (k, v) in submitted {
+            if v == "••••••••" {
+                // mask 占位：保留旧值（不动 merged_api_keys）
+                continue;
+            }
+            if v.is_empty() {
+                merged_api_keys.remove(k);
+            } else {
+                merged_api_keys.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    object.insert(
+        "api_keys".into(),
+        serde_json::to_value(&merged_api_keys)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    );
 
     let bytes = serde_json::to_vec_pretty(&root)
         .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
@@ -910,6 +951,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state")
@@ -934,6 +976,8 @@ mod tests {
             a2a_agents: Vec::new(),
             skills: SkillSettingsPayload::default(),
             mcp_servers: Vec::new(),
+            api_keys_masked: std::collections::HashMap::new(),
+            api_keys: None,
         }
     }
 

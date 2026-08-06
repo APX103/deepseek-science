@@ -4,6 +4,7 @@ import type {
   A2aAgentSettings,
   AppSettings,
   AppSettingsProvider,
+  AppSettingsUpdate,
   McpServer,
   Skill,
   SkillSettingsValue,
@@ -1313,6 +1314,103 @@ function GeneralSection() {
         ) : (
           <p className="mt-1 text-[11px] text-ink3">当前后端配置的会话工作区根目录（只读展示）。</p>
         )}
+      </div>
+      <AcademicKeysCard />
+    </div>
+  )
+}
+
+// ---------- 学术数据源 API keys ----------
+function AcademicKeysCard() {
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [openalexDraft, setOpenalexDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [savedAt, setSavedAt] = useState<number | null>(null)
+
+  const load = async () => {
+    try {
+      const s = sanitizeSettings(await getSettings())
+      setSettings(s)
+      // 草稿初始化为空（后端返回的是 mask 占位，不回填到输入框）。
+      setOpenalexDraft('')
+    } catch (error) {
+      setSaveError(errorMessage(error))
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  const masked = settings?.api_keys_masked?.OPENALEX_API_KEY
+  const configured = !!masked
+
+  const save = async () => {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      // 空草稿 = 不改动（保留旧值）；非空 = 写入新值。
+      // 后端对 mask 占位（••••••••）保留旧值，这里只在用户输入了内容时才提交。
+      const payload: AppSettingsUpdate = {
+        providers: settings?.providers ?? [],
+        a2a_agents: settings?.a2a_agents ?? [],
+        model: settings?.model ?? '',
+        default_workspace: settings?.default_workspace ?? '',
+        revision: settings?.revision ?? 0,
+        mcp_servers: settings?.mcp_servers ?? [],
+        skills: settings?.skills,
+        api_keys: openalexDraft.trim()
+          ? { OPENALEX_API_KEY: openalexDraft.trim() }
+          : {},
+      }
+      const saved = sanitizeSettings(await saveSettings(payload))
+      setSettings(saved)
+      setOpenalexDraft('')
+      setSavedAt(Date.now())
+    } catch (error) {
+      setSaveError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="card p-3">
+      <div className="text-[13px] font-medium text-ink">学术数据源</div>
+      <label className="mt-2 block">
+        <span className="text-[12px] text-ink2">OpenAlex API Key</span>
+        <input
+          type="password"
+          className="input mt-1 py-1.5 font-mono"
+          value={openalexDraft}
+          onChange={(e) => setOpenalexDraft(e.target.value)}
+          placeholder={configured ? '••••••••（已配置，输入新值覆盖）' : '（可选，不填走礼仪池）'}
+        />
+      </label>
+      <p className="mt-1 text-[11px] text-ink3">
+        OpenAlex 免费但建议填 key（更稳定）。在{' '}
+        <a
+          href="https://openalex.org/users/me"
+          target="_blank"
+          rel="noreferrer"
+          className="text-brand underline"
+        >
+          openalex.org/users/me
+        </a>{' '}
+        获取。用于 search_papers / fetch_paper 工具。
+      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <button className="btn-primary" disabled={saving || !openalexDraft.trim()} onClick={() => void save()}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+        {configured && !openalexDraft.trim() && (
+          <span className="text-[11px] text-success">已配置</span>
+        )}
+        {savedAt && Date.now() - savedAt < 4000 && (
+          <span className="text-[11px] text-success">已保存</span>
+        )}
+        {saveError && <span className="text-[11px] text-danger">{saveError}</span>}
       </div>
     </div>
   )

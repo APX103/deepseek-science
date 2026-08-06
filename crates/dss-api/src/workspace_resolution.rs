@@ -148,6 +148,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state")

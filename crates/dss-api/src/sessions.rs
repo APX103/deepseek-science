@@ -1197,6 +1197,8 @@ pub async fn stream_sse(
             if state.settings.memory.enabled {
                 tc = tc.with_memory(state.memory.clone(), project_id.clone());
             }
+            // 注入数据源 API keys（search_papers 等）。
+            tc = tc.with_api_keys(state.settings.api_keys.clone());
             tc
         };
         let llm_for_extract = llm.clone();
@@ -1833,6 +1835,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -1903,6 +1906,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2007,6 +2011,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2046,6 +2051,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2093,6 +2099,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2160,6 +2167,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2213,6 +2221,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2275,6 +2284,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2486,6 +2496,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");
@@ -2663,6 +2674,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            api_keys: std::collections::HashMap::new(),
         })
         .await
         .expect("build test application state");

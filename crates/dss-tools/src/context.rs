@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,6 +86,8 @@ pub struct ToolContext {
     pub memory: Option<Arc<dss_memory::MemoryStore>>,
     /// 当前 project_id（记忆按项目隔离召回）。
     pub project_id: Option<String>,
+    /// 数据源 API keys（OPENALEX_API_KEY 等）。工具按 key 名读取。
+    pub api_keys: HashMap<String, String>,
 }
 
 /// plan 模式状态（generate_plan 产出）。
@@ -151,6 +154,7 @@ impl ToolContext {
             history_checkpoint_tx: None,
             memory: None,
             project_id: None,
+            api_keys: HashMap::new(),
         }
     }
 
@@ -174,6 +178,12 @@ impl ToolContext {
     ) -> Self {
         self.memory = Some(memory);
         self.project_id = project_id;
+        self
+    }
+
+    /// 注入数据源 API keys（OPENALEX_API_KEY 等，供 search_papers 等工具读取）。
+    pub fn with_api_keys(mut self, api_keys: HashMap<String, String>) -> Self {
+        self.api_keys = api_keys;
         self
     }
 

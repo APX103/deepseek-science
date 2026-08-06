@@ -10,6 +10,7 @@ pub mod delegate;
 pub mod files;
 pub mod mcp;
 pub mod memory;
+pub mod openalex;
 pub mod plan;
 pub mod python;
 pub mod skills;
@@ -40,4 +41,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(delegate::SubmitOutputTool));
     registry.register(Arc::new(memory::SearchMemoryTool));
     registry.register(Arc::new(memory::ReadMemoryTool));
+    registry.register(Arc::new(openalex::SearchPapersTool));
+    registry.register(Arc::new(openalex::FetchPaperTool));
 }
