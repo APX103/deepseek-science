@@ -131,7 +131,7 @@ endpoint 时旧凭据绝不自动转发。GET 返回的 `revision` 必须原样�
 
 **`complete.kind` 取值**：`natural | awaiting | max_iters | error | cancelled`。
 **`complete.awaiting`**：`"user_response" | "plan_approval" | null`。
-**`complete.usage`**：`{input_tokens, output_tokens, …}`。
+**`complete.usage`**：`{input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens, …}`。`cache_hit_tokens`/`cache_miss_tokens` 来自 DeepSeek `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`（前缀缓存，命中输入约 1/120 价）；OpenAI 兼容端点回退 `prompt_tokens_details.cached_tokens`，缺失时为 0。
 
 ### 实现注意（易错点）
 

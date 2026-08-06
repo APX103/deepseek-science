@@ -18,6 +18,9 @@ use tokio::sync::{mpsc, Notify};
 const PARTIAL_USAGE: Usage = Usage {
     input_tokens: 7,
     output_tokens: 3,
+
+    cache_hit_tokens: 0,
+    cache_miss_tokens: 0,
 };
 
 struct PendingRequestLlm;
@@ -130,6 +133,9 @@ impl LlmClient for ToolThenPartialLlm {
                 Ok(StreamEvent::Usage(Usage {
                     input_tokens: 2,
                     output_tokens: 1,
+
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 0,
                 })),
                 Ok(StreamEvent::ToolCallDelta(ToolCallDelta {
                     index: 0,
@@ -148,10 +154,16 @@ impl LlmClient for ToolThenPartialLlm {
                 Ok(StreamEvent::Usage(Usage {
                     input_tokens: 1,
                     output_tokens: 1,
+
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
                 })),
                 Ok(StreamEvent::Usage(Usage {
                     input_tokens: 3,
                     output_tokens: 2,
+
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
                 })),
                 Ok(StreamEvent::Thinking("second analysis".into())),
                 Ok(StreamEvent::Text(
@@ -165,6 +177,9 @@ impl LlmClient for ToolThenPartialLlm {
                 Ok(StreamEvent::Usage(Usage {
                     input_tokens: 3,
                     output_tokens: 2,
+
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 0,
                 }))
             });
             match self.second_turn_end {
@@ -199,6 +214,9 @@ impl LlmClient for PublishedToolThenPendingLlm {
             Ok(StreamEvent::Usage(Usage {
                 input_tokens: 4,
                 output_tokens: 1,
+
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
             })),
             Ok(StreamEvent::ToolCallDelta(ToolCallDelta {
                 index: 0,

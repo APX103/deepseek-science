@@ -1,7 +1,7 @@
 // 中间对话流：空态欢迎区 / 消息流 + 失败横幅 + 流式渲染区 + 底部输入框。
 // 发送走 store 流式 buffer（connectSSE 由 WorkbenchPage 接线）；离线时输入框禁用。
 import { useEffect, useRef, useState } from 'react'
-import type { ContentBlock, Message, Plan, SessionRun } from '../../types'
+import type { ContentBlock, Message, Plan, SessionRun, Usage } from '../../types'
 import type { StreamBuffer } from '../../store'
 import { useApp } from '../../App'
 import { planStatusLabel } from '../../api/planExecution'
@@ -428,9 +428,18 @@ function MessageView({ message }: { message: Message }) {
 function MessageUsage({ usage }: { usage: NonNullable<Message['usage']> }) {
   return (
     <p className="mt-1 text-[10px] text-ink3">
-      tokens: {usage.input_tokens} in / {usage.output_tokens} out
+      tokens: {usage.input_tokens} in / {usage.output_tokens} out{cacheSuffix(usage)}
     </p>
   )
+}
+
+/** 前缀缓存命中摘要：` · cache 87% (900h/100m)`；无缓存统计时不显示。 */
+function cacheSuffix(usage: Pick<Usage, 'cache_hit_tokens' | 'cache_miss_tokens'>): string {
+  const hit = usage.cache_hit_tokens ?? 0
+  const miss = usage.cache_miss_tokens ?? 0
+  if (hit + miss === 0) return ''
+  const pct = Math.round((hit / (hit + miss)) * 100)
+  return ` · cache ${pct}% (${hit.toLocaleString()}h/${miss.toLocaleString()}m)`
 }
 
 export function RunFooter({ run }: { run: SessionRun }) {
@@ -479,8 +488,8 @@ function RunMetrics({ run }: { run: SessionRun }) {
             : '已完成'
   return (
     <p className="mt-1 text-[10px] text-ink3" data-run-id={run.run_id} data-run-kind={run.kind}>
-      {status} · tokens: {run.usage.input_tokens} in / {run.usage.output_tokens} out ·{' '}
-      {run.iterations} iteration{run.iterations === 1 ? '' : 's'}
+      {status} · tokens: {run.usage.input_tokens} in / {run.usage.output_tokens} out
+      {cacheSuffix(run.usage)} · {run.iterations} iteration{run.iterations === 1 ? '' : 's'}
     </p>
   )
 }

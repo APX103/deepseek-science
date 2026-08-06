@@ -89,7 +89,16 @@ function sanitizeUsage(value: unknown): Usage | null {
   ) {
     return null;
   }
-  return { input_tokens: input, output_tokens: output };
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_hit_tokens: finiteNonNegative(value.cache_hit_tokens),
+    cache_miss_tokens: finiteNonNegative(value.cache_miss_tokens),
+  };
+}
+
+function finiteNonNegative(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 function sanitizeBlock(value: unknown): ContentBlock | null {

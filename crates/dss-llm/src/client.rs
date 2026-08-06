@@ -804,9 +804,25 @@ impl LlmClient for OpenAICompatClient {
 }
 
 fn parse_usage(v: &serde_json::Value) -> Usage {
+    let prompt_tokens = v["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    // DeepSeek 顶层缓存字段；OpenAI 兼容端点用 `prompt_tokens_details.cached_tokens`。
+    let cache_hit_tokens = v["prompt_cache_hit_tokens"]
+        .as_u64()
+        .or_else(|| v["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0) as u32;
+    let cache_miss_tokens = v["prompt_cache_miss_tokens"].as_u64().unwrap_or_else(|| {
+        // 只有 cached_tokens 形态时补足：未命中 = 输入 - 命中。
+        if cache_hit_tokens > 0 {
+            prompt_tokens.saturating_sub(cache_hit_tokens) as u64
+        } else {
+            0
+        }
+    }) as u32;
     Usage {
-        input_tokens: v["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+        input_tokens: prompt_tokens,
         output_tokens: v["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_hit_tokens,
+        cache_miss_tokens,
     }
 }
 
@@ -1134,13 +1150,66 @@ mod tests {
 
     use super::{
         bounded_retry_after, checked_bounded_add, chunk_lines_fit, collect_bounded_body,
-        is_retryable_status, retry_delay, sse_event_stream_with_timeouts, OpenAICompatClient,
-        RequestTimeouts, ERROR_BODY_BYTE_LIMIT, ERROR_BODY_CHAR_LIMIT, MAX_REQUEST_ATTEMPTS,
-        MAX_RETRY_DELAY, MAX_SSE_LINE_BYTES, RETRY_BASE_DELAY,
+        is_retryable_status, parse_usage, retry_delay, sse_event_stream_with_timeouts,
+        OpenAICompatClient, RequestTimeouts, ERROR_BODY_BYTE_LIMIT, ERROR_BODY_CHAR_LIMIT,
+        MAX_REQUEST_ATTEMPTS, MAX_RETRY_DELAY, MAX_SSE_LINE_BYTES, RETRY_BASE_DELAY,
     };
     use crate::{
         ChatMessage, ChatRequest, LlmClient, LlmError, StreamEvent, ToolCall, ToolDef, Usage,
     };
+
+    #[test]
+    fn parse_usage_reads_deepseek_prefix_cache_fields() {
+        let usage = parse_usage(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_cache_hit_tokens": 900,
+            "prompt_cache_miss_tokens": 100,
+        }));
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.cache_hit_tokens, 900);
+        assert_eq!(usage.cache_miss_tokens, 100);
+    }
+
+    #[test]
+    fn parse_usage_falls_back_to_openai_cached_tokens() {
+        // OpenAI 兼容端点在 prompt_tokens_details.cached_tokens 报告缓存命中。
+        let usage = parse_usage(&json!({
+            "prompt_tokens": 800,
+            "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 600 },
+        }));
+        assert_eq!(usage.cache_hit_tokens, 600);
+        // 顶层 miss 缺失时按 输入 - 命中 补足。
+        assert_eq!(usage.cache_miss_tokens, 200);
+    }
+
+    #[test]
+    fn parse_usage_defaults_to_zero_when_cache_fields_absent() {
+        let usage = parse_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+        }));
+        assert_eq!(usage.cache_hit_tokens, 0);
+        assert_eq!(usage.cache_miss_tokens, 0);
+        // 无命中信息时 miss 不凭空补足。
+        let usage = parse_usage(&json!({}));
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cache_miss_tokens, 0);
+    }
+
+    #[test]
+    fn usage_legacy_two_field_json_still_deserializes() {
+        // 旧持久化会话的 assistant usage 只有两个字段；新增 cache 字段必须
+        // 可缺省，否则恢复旧 DB 时整条消息反序列化失败、历史被污染。
+        let usage: Usage = serde_json::from_str(r#"{"input_tokens":7,"output_tokens":3}"#)
+            .expect("legacy usage JSON must still deserialize");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cache_hit_tokens, 0);
+        assert_eq!(usage.cache_miss_tokens, 0);
+    }
 
     enum TestServerAction {
         Respond(String),
@@ -1257,6 +1326,8 @@ mod tests {
         message.usage = Some(Usage {
             input_tokens: 12,
             output_tokens: 34,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         });
         message.is_error = Some(true);
         let body = client.build_body(&ChatRequest::new("model", vec![message]), false);

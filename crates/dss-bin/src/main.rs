@@ -158,6 +158,9 @@ async fn execute_llm_once(
             .usage
             .output_tokens
             .saturating_add(fallback.usage.output_tokens),
+
+        cache_hit_tokens: 0,
+        cache_miss_tokens: 0,
     };
     if fallback.text.trim().is_empty() {
         anyhow::bail!("LLM returned no final text after one bounded fallback");
@@ -361,6 +364,9 @@ mod tests {
             usage: Usage {
                 input_tokens,
                 output_tokens,
+
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
             },
             finish_reason: Some(finish_reason.into()),
             tool_calls: Vec::new(),

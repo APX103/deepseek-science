@@ -218,10 +218,20 @@ pub struct ToolFunction {
 }
 
 /// token 用量（OpenAI `usage.prompt_tokens` / `completion_tokens`）。
+///
+/// `cache_hit_tokens` / `cache_miss_tokens` 来自 DeepSeek 顶层
+/// `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（上下文硬盘缓存，
+/// 命中价约为未命中的 1/120）；兼容 OpenAI 的 `prompt_tokens_details.cached_tokens`。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// 输入中命中前缀缓存的 token 数。
+    #[serde(default)]
+    pub cache_hit_tokens: u32,
+    /// 输入中未命中前缀缓存的 token 数。
+    #[serde(default)]
+    pub cache_miss_tokens: u32,
 }
 
 /// 流式增量事件。

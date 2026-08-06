@@ -125,6 +125,15 @@
 - 默认 level ≥ info，敏感字段脱敏，摘要截断。
 - 来源：logging.md。
 
+#### D-011 [DECISION] 前缀缓存计量 + 压缩顺序（借鉴 Reasonix）
+- 背景：DeepSeek 上下文硬盘缓存自动开启，缓存命中输入价约为未命中的 1/120；agent 逐轮重发相似前缀，缓存命中率直接决定长会话成本。方案见 [research/prefix-cache-strategy.md](research/prefix-cache-strategy.md)。
+- 决定：
+  1. `Usage` 增加 `cache_hit_tokens`/`cache_miss_tokens`（dss-llm），`parse_usage` 解析 DeepSeek 顶层 `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`，兼容 OpenAI `prompt_tokens_details.cached_tokens`；`complete.usage` 与前端 usage 行展示命中率。
+  2. 记忆召回块从 `run_context`（system 前缀与历史之间）移到请求视图末尾：内容随查询变化，放中间会打断 DeepSeek 前缀缓存单元、让整段历史 miss；放末尾只影响本就未命中的尾部。副作用（有意）：记忆块不再进入 terminal barrier/reviewer 的 `run_context` 输入，审查更客观。
+  3. 压缩顺序改为「免费减负先行、付费折叠兜底」：每轮先对视图做 microcompact（无 LLM 调用），仍超触发阈值才调 summarize 折叠；免费减负到触发线下时本轮不调 summarize。
+- 未做（DEFER）：环境摘要 fingerprint 持久化进前缀、稳定记忆折进前缀、prefix-shape 缓存 miss 诊断。详见方案文档 §5 D4/D5。
+- 来源：research/prefix-cache-strategy.md。
+
 ### 待办（TODO）
 
 #### D-T01 调研：代码沙箱方案定案
@@ -150,6 +159,12 @@
 #### D-T07 定：日志保留策略默认值
 - 候选：按天（14 天）/按量（10 万条）。是否需要 `/api/logs/stream` 实时推送。
 - 归属：日志系统阶段。来源：logging.md。
+
+#### D-T08 调研：Orca（onorca.dev）竞品 ✅ 已完成
+- 产出：[research/orca.md](research/orca.md)（2026-08-05 快照，17 节功能层面全梳理 + 借鉴分析）。
+- 高优先级借鉴：编排五原语（Run/Task/Dispatch/Message/Gate + dispatch ID 作用域）→ P12/P5b；用量本地记账 + 阈值预警 → P10；轻量 checkpoint（状态评论非快照）→ P12。
+- 中优先级：会话休眠/恢复分层回退 → P4/P12；段落级 AI 归属 → P5；定时自动化 + precheck → P12；agent 状态看板 → F2 延伸。
+- 注意：Orca 活跃开发中（RC 构建 often daily），引用关键设计前回官网核对。
 
 ### 暂缓改进（DEFER）
 

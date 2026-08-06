@@ -22,3 +22,4 @@ futures.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+dss-db = { path = "../dss-db" }

@@ -370,6 +370,7 @@ dependencies = [
  "async-trait",
  "dss-compact",
  "dss-core",
+ "dss-db",
  "dss-llm",
  "dss-memory",
  "dss-tools",

@@ -1,9 +1,12 @@
 //! P2b-gates 集成测试：流式 FakeLLM 驱动 Runner 走各决策门。
 
 use dss_agent::{Runner, Session, MAX_ITERATIONS};
+use dss_db::{open_pool, run_migrations};
 use dss_llm::{
-    BoxedEventStream, ChatMessage, ChatRequest, LlmClient, LlmError, StreamEvent, Usage,
+    BoxedEventStream, ChatMessage, ChatRequest, LlmClient, LlmError, LlmResponse, StreamEvent,
+    Usage,
 };
+use dss_memory::MemoryStore;
 use dss_tools::{
     builtin, Tool, ToolBatchPolicy, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec,
 };
@@ -80,6 +83,9 @@ impl LlmClient for StreamFakeLlm {
         events.push(Ok(StreamEvent::Usage(Usage {
             input_tokens: 1,
             output_tokens: 1,
+
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         })));
         events.push(Ok(StreamEvent::Finish {
             reason: turn.finish_reason,
@@ -825,6 +831,9 @@ async fn usage_is_the_only_event_allowed_after_finish() {
             Ok(StreamEvent::Usage(Usage {
                 input_tokens: 3,
                 output_tokens: 2,
+
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
             })),
         ],
         ToolRegistry::new(),
@@ -3717,5 +3726,185 @@ async fn max_iterations_completion_keeps_latest_committed_plan() {
     assert_eq!(
         session.plan.expect("session plan snapshot").steps[0].status,
         "done"
+    );
+}
+
+/// chat 记录请求并返回 terminal-barrier 的 pass verdict；chat_stream 自然完成。
+struct RecordingPassLlm {
+    chat_requests: Arc<Mutex<Vec<ChatRequest>>>,
+    stream_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for RecordingPassLlm {
+    async fn chat(&self, req: ChatRequest) -> Result<LlmResponse, LlmError> {
+        self.chat_requests.lock().unwrap().push(req);
+        Ok(LlmResponse {
+            text: r#"{"verdict":"pass","findings":[]}"#.into(),
+            thinking: None,
+            usage: Usage::default(),
+            finish_reason: Some("stop".into()),
+            tool_calls: Vec::new(),
+        })
+    }
+
+    fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let events: Vec<Result<StreamEvent, LlmError>> = vec![
+            Ok(StreamEvent::Text("final answer".into())),
+            Ok(StreamEvent::Usage(Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
+            })),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ];
+        let stream = Box::pin(stream::iter(events)) as BoxedEventStream;
+        Box::pin(async move { Ok(stream) })
+    }
+
+    fn model(&self) -> &str {
+        "recording-pass"
+    }
+}
+
+/// 阶段 C：免费 microcompact 减负先行——超大 tool result 让原始视图超压缩触发线，
+/// microcompact 截断后低于触发线，Runner 本轮不应调付费 summarize（chat）。
+#[tokio::test]
+async fn free_microcompact_reduction_skips_paid_summarize_in_runner() {
+    let cw = 10_000; // trigger = 7500
+    let mut session = Session::new("compact-free", tmp_workspace());
+    // 预置一轮含 40_000 字符（10_000 token）tool result 的历史。
+    session.messages = vec![
+        ChatMessage::user("original request"),
+        ChatMessage::assistant_tool_calls(vec![dss_llm::ToolCall::function(
+            "call_1",
+            "read_file",
+            "{}".into(),
+        )]),
+        ChatMessage::tool("call_1", &"y".repeat(40_000), Some("read_file".into())),
+        ChatMessage::assistant("done"),
+    ];
+    let chat_requests = Arc::new(Mutex::new(Vec::new()));
+    let llm = RecordingPassLlm {
+        chat_requests: chat_requests.clone(),
+        stream_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let ctx = ToolContext::new(session.workspace.clone());
+    let (tx, mut rx) = mpsc::channel::<dss_agent::AgentEvent>(64);
+    let outcome = Runner::run(
+        &mut session,
+        &llm,
+        "recording-pass",
+        "continue",
+        &ToolRegistry::new(),
+        &ctx,
+        MAX_ITERATIONS,
+        cw,
+        None,
+        None,
+        &[],
+        false,
+        &tx,
+    )
+    .await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Natural);
+    let requests = chat_requests.lock().unwrap();
+    // terminal barrier 至少调用了一次 chat（证明 FakeLlm 生效）。
+    assert!(!requests.is_empty(), "terminal barrier should run chat");
+    for req in requests.iter() {
+        for message in &req.messages {
+            if let Some(content) = message.content.as_deref() {
+                assert!(
+                    !content.contains("上下文压缩助手"),
+                    "paid summarize must not run when free microcompact clears the trigger"
+                );
+            }
+        }
+    }
+}
+
+/// 阶段 B：记忆召回块（内容随查询变化）必须位于请求视图末尾（历史之后），
+/// 不能插在 system 前缀与历史之间——否则每轮变化会打断 DeepSeek 前缀缓存。
+#[tokio::test]
+async fn memory_recall_block_sits_after_history_not_in_prefix() {
+    let data_dir = tmp_workspace();
+    let pool = Arc::new(open_pool(&data_dir).expect("open pool"));
+    run_migrations(&pool).await.expect("migrate");
+    let store = MemoryStore::new(pool);
+    store
+        .append(
+            "用户偏好使用 Python 和 numpy 做统计分析".into(),
+            Some("profile".into()),
+            None,
+        )
+        .await
+        .expect("append memory");
+
+    let turns = vec![ScriptedTurn {
+        texts: vec!["acknowledged".into()],
+        finish_reason: Some("stop".into()),
+        tool_calls: vec![],
+    }];
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let llm = StreamFakeLlm {
+        turns: Arc::new(Mutex::new(turns)),
+        seen_messages: Some(seen.clone()),
+        seen_tool_names: None,
+    };
+    let mut session = Session::new("memory-tail", tmp_workspace());
+    let ctx = ToolContext::new(session.workspace.clone());
+    let (tx, mut rx) = mpsc::channel::<dss_agent::AgentEvent>(64);
+    Runner::run(
+        &mut session,
+        &llm,
+        "fake-stream",
+        "请用 numpy 做统计分析",
+        &ToolRegistry::new(),
+        &ctx,
+        MAX_ITERATIONS,
+        500_000,
+        Some(&store),
+        None,
+        &[],
+        false,
+        &tx,
+    )
+    .await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    let requests = seen.lock().unwrap();
+    assert!(!requests.is_empty());
+    let request = &requests[0];
+    let last = request.last().expect("request has messages");
+    assert_eq!(last.role, "system");
+    let last_content = last.content.as_deref().expect("memory block has content");
+    assert!(
+        last_content.contains("[Memory]"),
+        "recalled memory should be present at the request tail"
+    );
+    // 记忆块位于最新 user 消息之后，而不是在 system 前缀与历史之间。
+    let user_pos = request
+        .iter()
+        .rposition(|message| message.role == "user")
+        .expect("request has a user message");
+    assert!(
+        user_pos < request.len() - 1,
+        "memory block must come after the latest user message"
+    );
+    // 前缀区（第一条 = 执行策略）不含记忆块。
+    assert!(
+        !request[0]
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("[Memory]")
     );
 }

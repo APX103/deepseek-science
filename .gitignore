@@ -50,6 +50,7 @@ lcov.info
 *.profdata
 
 # 编辑器 / 系统
+.reasonix/
 .vscode/
 .idea/
 .DS_Store

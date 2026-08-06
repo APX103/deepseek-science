@@ -214,6 +214,10 @@ export interface Artifact {
 export interface Usage {
   input_tokens: number
   output_tokens: number
+  /** DeepSeek 前缀缓存命中 token（可选，缺失视为 0）。 */
+  cache_hit_tokens?: number
+  /** 前缀缓存未命中 token。 */
+  cache_miss_tokens?: number
 }
 
 /** 一次用户请求的持久化终态；和 canonical messages 一起按 session id 恢复。 */

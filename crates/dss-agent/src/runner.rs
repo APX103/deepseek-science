@@ -301,6 +301,17 @@ impl RunProgress {
             .output_tokens
             .saturating_sub(self.iteration_usage.output_tokens)
             .saturating_add(next.output_tokens);
+        // 前缀缓存命中/未命中是输入 token 的细分，按同一替换式语义累计。
+        self.usage.cache_hit_tokens = self
+            .usage
+            .cache_hit_tokens
+            .saturating_sub(self.iteration_usage.cache_hit_tokens)
+            .saturating_add(next.cache_hit_tokens);
+        self.usage.cache_miss_tokens = self
+            .usage
+            .cache_miss_tokens
+            .saturating_sub(self.iteration_usage.cache_miss_tokens)
+            .saturating_add(next.cache_miss_tokens);
         self.iteration_usage = next;
     }
 
@@ -385,19 +396,29 @@ impl Runner {
         // so it cannot leak into the visible transcript or disturb compaction indexes.
         run_context.insert(0, harness_notice(SCIENCE_EXECUTION_POLICY));
 
-        // —— 记忆召回：作为本轮 harness-notice system 上下文注入 ——
-        if let Some(store) = memory {
+        // —— 记忆召回：作为本轮 harness-notice 上下文，放在请求视图末尾 ——
+        // 记忆块内容随查询（BM25 召回）变化。若插在 system 前缀与历史之间，会打断
+        // DeepSeek 的前缀缓存单元（中间任何字节变化让其后全部 miss，包括整段历史）。
+        // 放在最新用户消息之后，它只影响本就未命中的尾部，历史前缀保持稳定命中。
+        let memory_block = if let Some(store) = memory {
             match dss_memory::recall(store, prompt, project_id, 5).await {
                 Ok(memories) if !memories.is_empty() => {
                     let block = dss_memory::render_recall_block(&memories);
-                    if !block.is_empty() {
-                        run_context.push(harness_notice(&block));
+                    if block.is_empty() {
+                        None
+                    } else {
+                        Some(harness_notice(&block))
                     }
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "memory recall failed (continuing)"),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "memory recall failed (continuing)");
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
 
         // The terminal reviewer receives only this request's canonical audit
         // trail, not unrelated earlier conversation. Tool-backed iterations
@@ -456,23 +477,52 @@ impl Runner {
             let tool_schema_tokens = serde_json::to_string(&tool_defs)
                 .map(|json| dss_compact::tokens::estimate_tokens(&json))
                 .unwrap_or(0);
-            let reserved_request_tokens =
+            let mut reserved_request_tokens =
                 dss_compact::tokens::estimate_messages_tokens(&run_context)
                     .saturating_add(tool_schema_tokens);
+            // 记忆块是本轮固定开销（挂视图末尾），计入压缩预算。
+            if let Some(block) = &memory_block {
+                reserved_request_tokens = reserved_request_tokens
+                    .saturating_add(dss_compact::tokens::estimate_message_tokens(block));
+            }
 
-            // —— Rolling Compact：每轮 LLM 前压缩（短对话不触发，行为不变）——
+            // —— Rolling Compact：每轮 LLM 前压缩 ——
+            // 缓存优先顺序：先对视图做免费 microcompact 减负（截长 tool result /
+            // 已落盘写参数，无 LLM 调用），再判断是否仍超触发阈值；只有免费手段
+            // 不够时才付费 summarize 折叠。这样「免费优先、付费兜底」，且免费减负
+            // 到触发线以下时本轮完全不调 summarize。
             let cw = context_window;
-            let compact_outcome = tokio::select! {
-                biased;
-                _ = tx.closed() => return cancel(session, &mut progress),
-                outcome = dss_compact::maybe_compact_with_reserved_tokens(
-                    &session.messages,
-                    &mut session.compaction,
-                    llm,
-                    model,
-                    cw,
-                    reserved_request_tokens,
-                ) => outcome,
+            let hard_wall_tokens = dss_compact::chunk::hard_wall_tokens(cw);
+            // 视图 = 稳定 system 前缀（run_context）+ 折叠投影历史 + 记忆块（可变尾部）。
+            let build_view = |messages: &[ChatMessage], folded: &dss_compact::CompactionState| {
+                let projected = dss_compact::projection(messages, folded);
+                let mut view = Vec::with_capacity(run_context.len() + projected.len() + 1);
+                view.extend(run_context.iter().cloned());
+                view.extend(projected);
+                if let Some(block) = &memory_block {
+                    view.push(block.clone());
+                }
+                dss_compact::microcompact::microcompact(&view)
+            };
+            let free_view = build_view(&session.messages, &session.compaction);
+            let free_view_tokens = dss_compact::tokens::estimate_messages_tokens(&free_view)
+                .saturating_add(tool_schema_tokens);
+
+            let compact_outcome = if dss_compact::chunk::is_over_trigger(free_view_tokens, cw) {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => return cancel(session, &mut progress),
+                    outcome = dss_compact::maybe_compact_with_reserved_tokens(
+                        &session.messages,
+                        &mut session.compaction,
+                        llm,
+                        model,
+                        cw,
+                        reserved_request_tokens,
+                    ) => outcome,
+                }
+            } else {
+                dss_compact::CompactionOutcome::default()
             };
             if compact_outcome.folded {
                 tracing::info!(
@@ -480,15 +530,10 @@ impl Runner {
                     "rolling compact applied L1 fold(s)"
                 );
             }
-            // projection：给 LLM 的视图（fold 区间替换成 summary）+ microcompact（硬墙截 tool result）。
-            let projected = dss_compact::projection(&session.messages, &session.compaction);
-            let mut view = Vec::with_capacity(run_context.len() + projected.len());
-            view.extend(run_context.iter().cloned());
-            view.extend(projected);
-            let view = dss_compact::microcompact::microcompact(&view);
+            // 折叠后的最终视图（若未折叠，与 free_view 等价但重新构建，避免持有旧借用）。
+            let view = build_view(&session.messages, &session.compaction);
             let view_tokens = dss_compact::tokens::estimate_messages_tokens(&view)
                 .saturating_add(tool_schema_tokens);
-            let hard_wall_tokens = dss_compact::chunk::hard_wall_tokens(cw);
             if view_tokens > hard_wall_tokens {
                 return fail(
                     session,

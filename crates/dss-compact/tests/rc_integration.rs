@@ -211,3 +211,37 @@ async fn summary_failure_reports_an_unresolved_hard_wall() {
     assert!(outcome.projected_tokens > outcome.hard_wall_tokens);
     assert!(state.folds.is_empty());
 }
+
+/// 阶段 C 决策语义：Runner 先做免费 microcompact 减负，再判断是否触发付费折叠。
+/// 一长 tool result 让原始视图超触发线，microcompact 截断后应低于触发线，
+/// 这样本轮不需要调 summarize。
+#[test]
+fn microcompact_reduction_can_bring_request_below_trigger() {
+    let cw = 10_000; // trigger = 7500 token
+    let long_result = "y".repeat(40_000); // 10_000 tokens
+    let messages: Vec<ChatMessage> = vec![
+        ChatMessage::user("turn 1"),
+        ChatMessage::assistant_tool_calls(vec![dss_llm::ToolCall::function(
+            "call_1",
+            "read_file",
+            "{}".into(),
+        )]),
+        ChatMessage::tool("call_1", &long_result, Some("read_file".into())),
+        ChatMessage::user("active request"),
+    ];
+
+    // 未减负视图超触发线。
+    let raw_tokens = dss_compact::tokens::estimate_messages_tokens(&messages);
+    assert!(
+        dss_compact::chunk::is_over_trigger(raw_tokens, cw),
+        "raw view ({raw_tokens}) should exceed the trigger"
+    );
+
+    // microcompact 把长 tool result 截到 4000 字符 → 视图跌到触发线下。
+    let view = dss_compact::microcompact::microcompact(&messages);
+    let view_tokens = dss_compact::tokens::estimate_messages_tokens(&view);
+    assert!(
+        !dss_compact::chunk::is_over_trigger(view_tokens, cw),
+        "microcompact view ({view_tokens}) should drop below the trigger"
+    );
+}
