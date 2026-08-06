@@ -8,7 +8,10 @@ import { planStatusLabel } from '../../api/planExecution'
 import { sanitizeAssistantDisplayText } from '../../api/assistantProtocol'
 import AgentMarkdown from './AgentMarkdown'
 import ToolCallCard from './ToolCallCard'
-import { IconChevronRight, IconSend, IconStop } from '../icons'
+import { IconChevronRight, IconPanelLeft, IconPanelRight, IconSend, IconStop } from '../icons'
+
+// macOS 覆盖式标题栏下，左上角红黄绿三点占据约这么宽的安全区。
+const MAC_TRAFFIC_LIGHT_INSET = 76
 
 interface Props {
   messages: Message[]
@@ -27,6 +30,12 @@ interface Props {
   onExecutePlan: () => void
   onSend: (text: string) => void
   onStop: () => void
+  /** 显示在中间栏顶部的标题（当前项目名） */
+  title?: string
+  leftCollapsed: boolean
+  rightCollapsed: boolean
+  onToggleLeft: () => void
+  onToggleRight: () => void
 }
 
 type ToolUse = Extract<ContentBlock, { type: 'tool_use' }>
@@ -47,6 +56,11 @@ export default function ChatArea({
   onExecutePlan,
   onSend,
   onStop,
+  title,
+  leftCollapsed,
+  rightCollapsed,
+  onToggleLeft,
+  onToggleRight,
 }: Props) {
   const running = stream?.running ?? false
   const stopping = stream?.stopping ?? false
@@ -63,30 +77,44 @@ export default function ChatArea({
     return () => window.cancelAnimationFrame(frame)
   }, [messages.length, stream?.thinking.length, stream?.text.length, stream?.toolCalls.length])
 
+  const toolbar = (
+    <WorkbenchToolbar
+      title={title}
+      leftCollapsed={leftCollapsed}
+      rightCollapsed={rightCollapsed}
+      onToggleLeft={onToggleLeft}
+      onToggleRight={onToggleRight}
+    />
+  )
+
   if (messages.length === 0 && !stream && !awaitingPlan) {
-    // 新会话空态：居中欢迎区 + 大输入框
+    // 新会话空态：顶部工具条 + 居中欢迎区 + 大输入框
     return (
-      <div className="flex min-w-0 flex-1 flex-col items-center justify-center px-6">
-        <h1 className="text-[20px] font-semibold text-ink">有什么可以帮你？</h1>
-        <div className="mt-6 w-full max-w-xl">
-          <Composer
-            large
-            running={running}
-            stopping={stopping}
-            planMode={planMode}
-            onPlanModeChange={onPlanModeChange}
-            onSend={onSend}
-            onStop={onStop}
-          />
-          <BackendHint />
+      <div className="flex min-w-0 flex-1 flex-col">
+        {toolbar}
+        <div className="flex flex-1 flex-col items-center justify-center px-6">
+          <h1 className="text-[20px] font-semibold text-ink">有什么可以帮你？</h1>
+          <div className="mt-6 w-full max-w-xl">
+            <Composer
+              large
+              running={running}
+              stopping={stopping}
+              planMode={planMode}
+              onPlanModeChange={onPlanModeChange}
+              onSend={onSend}
+              onStop={onStop}
+            />
+            <BackendHint />
+          </div>
+          <p className="mt-3 text-[12px] text-ink3">可开启 Plan，让 Agent 先提交研究计划供你批准。</p>
         </div>
-        <p className="mt-3 text-[12px] text-ink3">可开启 Plan，让 Agent 先提交研究计划供你批准。</p>
       </div>
     )
   }
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
+      {toolbar}
       {/* 消息流 */}
       <div
         ref={scrollRef}
@@ -161,6 +189,62 @@ export default function ChatArea({
           <BackendHint />
         </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * 中间栏顶部工具条：承载左右栏收起按钮，并作为可拖拽窗口区域（macOS 无标题栏时）。
+ * 左侧栏收起时，左按钮为左上角三点让出安全区。
+ */
+function WorkbenchToolbar({
+  title,
+  leftCollapsed,
+  rightCollapsed,
+  onToggleLeft,
+  onToggleRight,
+}: {
+  title?: string
+  leftCollapsed: boolean
+  rightCollapsed: boolean
+  onToggleLeft: () => void
+  onToggleRight: () => void
+}) {
+  return (
+    <div
+      data-tauri-drag-region
+      className="flex h-9 shrink-0 select-none items-center gap-1.5 px-1.5"
+      style={{ paddingLeft: leftCollapsed ? MAC_TRAFFIC_LIGHT_INSET : undefined }}
+    >
+      <button
+        type="button"
+        onClick={onToggleLeft}
+        className="btn-ghost shrink-0 rounded p-1.5"
+        title={leftCollapsed ? '展开左侧栏' : '收起左侧栏'}
+        aria-label={leftCollapsed ? '展开左侧栏' : '收起左侧栏'}
+        aria-pressed={!leftCollapsed}
+      >
+        <IconPanelLeft width={15} height={15} />
+      </button>
+
+      {/* 标题 */}
+      {title && (
+        <span className="min-w-0 truncate text-[13px] font-semibold text-ink">{title}</span>
+      )}
+
+      {/* 中间留白：可拖拽窗口 */}
+      <div className="h-full flex-1" data-tauri-drag-region />
+
+      <button
+        type="button"
+        onClick={onToggleRight}
+        className="btn-ghost shrink-0 rounded p-1.5"
+        title={rightCollapsed ? '展开右侧产物面板' : '收起右侧产物面板'}
+        aria-label={rightCollapsed ? '展开右侧产物面板' : '收起右侧产物面板'}
+        aria-pressed={!rightCollapsed}
+      >
+        <IconPanelRight width={15} height={15} />
+      </button>
     </div>
   )
 }

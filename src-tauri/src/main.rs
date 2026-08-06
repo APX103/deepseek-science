@@ -357,7 +357,7 @@ fn main() {
             } else {
                 "Deepseek Science"
             };
-            tauri::WebviewWindowBuilder::new(
+            let mut window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
@@ -367,8 +367,18 @@ fn main() {
             .min_inner_size(900.0, 600.0)
             .resizable(true)
             .fullscreen(false)
-            .initialization_script(&init_script)
-            .build()?;
+            .initialization_script(&init_script);
+
+            // macOS: 隐藏原生标题栏，让内容延伸到顶部；红黄绿三点悬浮在内容之上。
+            // 前端会为左上角三点预留安全区，并提供可拖拽区域移动窗口。
+            #[cfg(target_os = "macos")]
+            {
+                window_builder = window_builder
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true);
+            }
+
+            window_builder.build()?;
 
             Ok(())
         })

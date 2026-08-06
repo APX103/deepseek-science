@@ -54,10 +54,14 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
 
   return (
     <aside className="flex shrink-0 flex-col border-r border-border bg-surface" style={{ width }}>
-      {/* 项目名 */}
-      <div className="border-b border-border px-3 py-2.5">
-        <Link to="/" className="block truncate text-[13px] font-semibold text-ink hover:text-brand">
-          {project.name}
+      {/* 顶部：为 macOS 红黄绿三点让出安全区（可拖拽），其下放品牌文字 logo */}
+      <div className="shrink-0">
+        <div data-tauri-drag-region className="h-10" />
+        <Link
+          to="/"
+          className="block truncate px-3 pb-2 pt-0.5 text-[13px] font-semibold text-brand hover:text-brandHover"
+        >
+          DeepSeek Science
         </Link>
       </div>
 

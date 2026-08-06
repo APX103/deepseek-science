@@ -86,6 +86,8 @@ export default function HomePage() {
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-10">
+      {/* 无原生标题栏时的顶部窗口拖拽区 */}
+      <div data-tauri-drag-region className="fixed inset-x-0 top-0 z-30 h-7" />
       {/* 顶栏 */}
       <header className="flex items-center">
         <div>

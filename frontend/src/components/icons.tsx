@@ -237,3 +237,30 @@ export const IconStop = (p: P) => (
     <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
   </svg>
 )
+
+// 品牌 logo：品牌蓝圆角方块 + 白色原子轨道（科研意象）。自带配色，非线性图标。
+export const IconLogo = (p: P) => (
+  <svg width={20} height={20} viewBox="0 0 24 24" fill="none" {...p}>
+    <rect width="24" height="24" rx="6" fill="#4D6BFE" />
+    <g stroke="#fff" strokeWidth="1.4" fill="none">
+      <ellipse cx="12" cy="12" rx="7" ry="3" />
+      <ellipse cx="12" cy="12" rx="7" ry="3" transform="rotate(60 12 12)" />
+      <ellipse cx="12" cy="12" rx="7" ry="3" transform="rotate(120 12 12)" />
+    </g>
+    <circle cx="12" cy="12" r="2.1" fill="#fff" />
+  </svg>
+)
+
+export const IconPanelLeft = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M9 3v18" />
+  </svg>
+)
+
+export const IconPanelRight = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M15 3v18" />
+  </svg>
+)

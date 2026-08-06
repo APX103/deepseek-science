@@ -92,6 +92,8 @@ export default function LogsPage() {
 
   return (
     <div className="mx-auto max-w-5xl px-6 py-8">
+      {/* 无原生标题栏时的顶部窗口拖拽区 */}
+      <div data-tauri-drag-region className="fixed inset-x-0 top-0 z-30 h-7" />
       {/* 顶栏 */}
       <header className="flex items-center gap-3">
         <Link to="/" className="text-[13px] text-ink3 hover:text-brand">

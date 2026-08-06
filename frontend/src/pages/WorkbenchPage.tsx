@@ -29,6 +29,7 @@ import {
   finishStreamStop,
   loadFromBackend,
   loadMessages,
+  useProjects,
   resumeStreamAfterLateStop,
   sendUserMessage,
   setStreamAborter,
@@ -50,10 +51,17 @@ import Sidebar from '../components/workbench/Sidebar'
 
 const LEFT_KEY = 'dss_left_w'
 const RIGHT_KEY = 'dss_right_w'
+const LEFT_COLLAPSED_KEY = 'dss_left_collapsed'
+const RIGHT_COLLAPSED_KEY = 'dss_right_collapsed'
 
 function readWidth(key: string, fallback: number): number {
   const v = Number(localStorage.getItem(key))
   return Number.isFinite(v) && v > 0 ? v : fallback
+}
+
+function readBool(key: string, fallback: boolean): boolean {
+  const v = localStorage.getItem(key)
+  return v === null ? fallback : v === '1'
 }
 
 export default function WorkbenchPage() {
@@ -73,6 +81,12 @@ export default function WorkbenchPage() {
   useEffect(() => localStorage.setItem(LEFT_KEY, String(leftW)), [leftW])
   useEffect(() => localStorage.setItem(RIGHT_KEY, String(rightW)), [rightW])
 
+  // 左右栏收起状态：localStorage 持久化
+  const [leftCollapsed, setLeftCollapsed] = useState(() => readBool(LEFT_COLLAPSED_KEY, false))
+  const [rightCollapsed, setRightCollapsed] = useState(() => readBool(RIGHT_COLLAPSED_KEY, false))
+  useEffect(() => localStorage.setItem(LEFT_COLLAPSED_KEY, leftCollapsed ? '1' : '0'), [leftCollapsed])
+  useEffect(() => localStorage.setItem(RIGHT_COLLAPSED_KEY, rightCollapsed ? '1' : '0'), [rightCollapsed])
+
   // 右栏 tab 状态（可全部关闭；全部关完显示浏览视图）
   const [tabs, setTabs] = useState<PanelTab[]>(DEFAULT_TABS)
   const [activeTab, setActiveTab] = useState<string | null>(DEFAULT_TABS[0]?.id ?? null)
@@ -90,6 +104,8 @@ export default function WorkbenchPage() {
   }
   // 会话消息（store 驱动；新会话为空态）
   const session = useSession(sid)
+  const projects = useProjects()
+  const projectName = projects.find((p) => p.id === pid)?.name ?? ''
   const sessionState = useSessionState(sid)
   const messages = useMessages(sid)
   const stream = useStream(sid)
@@ -240,14 +256,18 @@ export default function WorkbenchPage() {
 
   return (
     <div className="flex h-full">
-      <Sidebar
-        pid={pid}
-        sid={sid}
-        width={leftW}
-        onOpenSkills={() => setShowSkills(true)}
-        onOpenFiles={() => openTab(FILES_TAB)}
-      />
-      <ResizeHandle side="left" value={leftW} min={200} max={360} onChange={setLeftW} />
+      {!leftCollapsed && (
+        <>
+          <Sidebar
+            pid={pid}
+            sid={sid}
+            width={leftW}
+            onOpenSkills={() => setShowSkills(true)}
+            onOpenFiles={() => openTab(FILES_TAB)}
+          />
+          <ResizeHandle side="left" value={leftW} min={200} max={360} onChange={setLeftW} />
+        </>
+      )}
 
       <ChatArea
         messages={messages}
@@ -264,11 +284,18 @@ export default function WorkbenchPage() {
         onExecutePlan={handleExecutePlan}
         onSend={handleComposerSend}
         onStop={() => void handleStop()}
+        title={projectName}
+        leftCollapsed={leftCollapsed}
+        rightCollapsed={rightCollapsed}
+        onToggleLeft={() => setLeftCollapsed((v) => !v)}
+        onToggleRight={() => setRightCollapsed((v) => !v)}
       />
 
-      <ResizeHandle side="right" value={rightW} min={360} max={760} onChange={setRightW} />
-      <div className="shrink-0 border-l border-border" style={{ width: rightW }}>
-        <ArtifactPanel
+      {!rightCollapsed && (
+        <>
+          <ResizeHandle side="right" value={rightW} min={360} max={760} onChange={setRightW} />
+          <div className="shrink-0 border-l border-border" style={{ width: rightW }}>
+            <ArtifactPanel
           artifacts={artifacts}
           files={files}
           filesLoading={filesLoading}
@@ -278,11 +305,13 @@ export default function WorkbenchPage() {
           activeTab={activeTab}
           onSelectTab={setActiveTab}
           onCloseTab={closeTab}
-          onOpenArtifact={openArtifact}
-          onPreviewFile={setPreviewFile}
-          onDeleteFile={handleDeleteFile}
-        />
-      </div>
+              onOpenArtifact={openArtifact}
+              onPreviewFile={setPreviewFile}
+              onDeleteFile={handleDeleteFile}
+            />
+          </div>
+        </>
+      )}
 
       {showSkills && <SkillsModal onClose={() => setShowSkills(false)} />}
       {previewFile &&
