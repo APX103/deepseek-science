@@ -82,6 +82,9 @@ export interface A2aAgentSettingsUpdate {
 
 export type LlmOverriddenField = 'api_key' | 'base_url' | 'model'
 
+/** Public settings expose only an empty value or the backend's fixed credential mask. */
+export type MaskedApiKey = '' | '••••••••'
+
 /** Skill 发现配置：内置开关 + 外部目录纳入 + 自定义目录。 */
 export interface SkillSettingsValue {
   /** 被禁用的 skill 名称。 */
@@ -108,8 +111,8 @@ export interface AppSettings {
   skills?: SkillSettingsValue
   /** MCP server 列表（含连接状态）；旧后端可能不返回。 */
   mcp_servers?: McpServer[]
-  /** 数据源 API keys（GET 时脱敏为 ••••••••）；旧后端可能不返回。 */
-  api_keys_masked?: Record<string, string>
+  /** 数据源 API keys（GET 时只能为空值或固定 mask）；旧后端可能不返回。 */
+  api_keys_masked?: Record<string, MaskedApiKey>
 }
 
 /** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */

@@ -2,6 +2,9 @@ import { describe, expect, test } from 'bun:test'
 import {
   backendReflectsSettings,
   buildSettingsPayload,
+  canSubmitDataSourceKey,
+  DATA_SOURCE_KEY_MASK,
+  isDataSourceKeyConfigured,
   normalizeMcpServers,
   parseMcpJsonConfig,
   sanitizeSettings,
@@ -13,6 +16,7 @@ function settings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
     providers: [
       {
+        id: 'DeepSeek',
         name: 'DeepSeek',
         base_url: 'https://api.example.invalid',
         api_key_masked: '••••••••',
@@ -61,6 +65,50 @@ describe('settings state safety', () => {
     expect(payload.revision).toBe(settings().revision)
     expect('overridden_fields' in payload).toBe(false)
     expect('restart_required' in payload).toBe(false)
+  })
+
+  test('drops unexpected plaintext data-source keys and accepts only the fixed mask', () => {
+    const received = {
+      ...settings(),
+      api_keys: { OPENALEX_API_KEY: 'server-response-must-be-discarded' },
+      api_keys_masked: {
+        OPENALEX_API_KEY: DATA_SOURCE_KEY_MASK,
+        UNSAFE_SOURCE: 'server-response-must-be-discarded',
+      },
+    } as AppSettings
+    const sanitized = sanitizeSettings(received)
+
+    expect('api_keys' in sanitized).toBe(false)
+    expect(sanitized.api_keys_masked).toEqual({
+      OPENALEX_API_KEY: DATA_SOURCE_KEY_MASK,
+      UNSAFE_SOURCE: '',
+    })
+    expect(isDataSourceKeyConfigured(sanitized, 'OPENALEX_API_KEY')).toBe(true)
+    expect(isDataSourceKeyConfigured(sanitized, 'UNSAFE_SOURCE')).toBe(false)
+    expect(JSON.stringify(sanitized)).not.toContain('server-response-must-be-discarded')
+  })
+
+  test('data-source payload omits blank drafts and submits only trimmed new values', () => {
+    const current = settings({ api_keys_masked: { OPENALEX_API_KEY: DATA_SOURCE_KEY_MASK } })
+    const preserve = buildSettingsPayload(current, {}, {}, new Set(), {
+      OPENALEX_API_KEY: '   ',
+    })
+    const replace = buildSettingsPayload(current, {}, {}, new Set(), {
+      OPENALEX_API_KEY: '  typed-openalex-key  ',
+      EMPTY_SOURCE: '\n',
+    })
+
+    expect('api_keys' in preserve).toBe(false)
+    expect(replace.api_keys).toEqual({ OPENALEX_API_KEY: 'typed-openalex-key' })
+    expect(replace.providers).toEqual(buildSettingsPayload(current, {}).providers)
+    expect(replace.revision).toBe(current.revision)
+  })
+
+  test('data-source save stays disabled until settings load and the draft is non-empty', () => {
+    expect(canSubmitDataSourceKey(null, 'typed-openalex-key', false)).toBe(false)
+    expect(canSubmitDataSourceKey(settings(), '   ', false)).toBe(false)
+    expect(canSubmitDataSourceKey(settings(), 'typed-openalex-key', true)).toBe(false)
+    expect(canSubmitDataSourceKey(settings(), ' typed-openalex-key ', false)).toBe(true)
   })
 
   test('requires an exact runtime revision, model, base URL, and configured state', () => {

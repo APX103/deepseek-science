@@ -434,18 +434,29 @@ impl LlmRuntimeSnapshot {
 }
 
 /// One pointer contains every hot-editable capability used to accept a run. A run clones this
-/// Arc once, so a settings save can never mix an old LLM with a new A2A catalog (or vice versa).
+/// Arc once, so a settings save can never mix an old LLM, A2A catalog, or data-source keys.
 pub struct AppRuntimeSnapshot {
     revision: u64,
     llm: Arc<LlmRuntimeSnapshot>,
     a2a: Arc<A2aRuntimeSnapshot>,
+    api_keys: Arc<HashMap<String, String>>,
 }
 
 impl AppRuntimeSnapshot {
-    pub fn new(revision: u64, llm: Arc<LlmRuntimeSnapshot>, a2a: Arc<A2aRuntimeSnapshot>) -> Self {
+    pub fn new(
+        revision: u64,
+        llm: Arc<LlmRuntimeSnapshot>,
+        a2a: Arc<A2aRuntimeSnapshot>,
+        api_keys: Arc<HashMap<String, String>>,
+    ) -> Self {
         debug_assert_eq!(llm.revision(), revision);
         debug_assert_eq!(a2a.revision, revision);
-        Self { revision, llm, a2a }
+        Self {
+            revision,
+            llm,
+            a2a,
+            api_keys,
+        }
     }
 
     pub fn revision(&self) -> u64 {
@@ -459,6 +470,10 @@ impl AppRuntimeSnapshot {
     pub fn a2a(&self) -> &Arc<A2aRuntimeSnapshot> {
         &self.a2a
     }
+
+    pub fn api_keys(&self) -> &HashMap<String, String> {
+        self.api_keys.as_ref()
+    }
 }
 
 #[derive(Clone)]
@@ -467,7 +482,7 @@ pub struct AppState {
     /// Packaged-app capability token. `None` keeps direct CLI launches backwards compatible.
     pub(crate) api_token: Option<Arc<str>>,
     /// A save builds a full replacement before the final pointer swap. Runs hold the read lock
-    /// only long enough to clone one coherent LLM+A2A snapshot.
+    /// only long enough to clone one coherent LLM+A2A/data-source snapshot.
     pub(crate) runtime: Arc<RwLock<Arc<AppRuntimeSnapshot>>>,
     /// Serializes settings root read/merge/atomic-write so two saves cannot lose each other.
     pub(crate) settings_save_lock: Arc<Mutex<()>>,
@@ -561,6 +576,7 @@ impl AppState {
             captured.revision(),
             captured.llm().clone(),
             Arc::new(refreshed),
+            captured.api_keys.clone(),
         ));
         let mut slot = self.runtime.write().await;
         if Arc::ptr_eq(&captured, &slot) {
@@ -665,7 +681,12 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
         );
     }
     let a2a_runtime = Arc::new(initial_a2a_snapshot(0, &settings.a2a_agents));
-    let runtime = Arc::new(AppRuntimeSnapshot::new(0, llm_runtime.clone(), a2a_runtime));
+    let runtime = Arc::new(AppRuntimeSnapshot::new(
+        0,
+        llm_runtime.clone(),
+        a2a_runtime,
+        Arc::new(settings.api_keys.clone()),
+    ));
 
     // 基础工具集（仅内置工具）。MCP 动态工具挂载到可热重建的 mcp_runtime 上，不污染这个基座。
     let mut base = ToolRegistry::new();

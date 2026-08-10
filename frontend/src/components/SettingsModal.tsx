@@ -4,7 +4,6 @@ import type {
   A2aAgentSettings,
   AppSettings,
   AppSettingsProvider,
-  AppSettingsUpdate,
   McpServer,
   Skill,
   SkillSettingsValue,
@@ -13,7 +12,9 @@ import { getSettings, listSkills, saveSettings } from '../api/client'
 import {
   backendReflectsSettings,
   buildSettingsPayload,
+  canSubmitDataSourceKey,
   createA2aAgentDraft,
+  isDataSourceKeyConfigured,
   normalizeMcpServers,
   normalizeSkillSettings,
   parseMcpJsonConfig,
@@ -1324,18 +1325,22 @@ function GeneralSection() {
 function AcademicKeysCard() {
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [openalexDraft, setOpenalexDraft] = useState('')
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  const [savedAt, setSavedAt] = useState<number | null>(null)
+  const [saveSucceeded, setSaveSucceeded] = useState(false)
 
   const load = async () => {
+    setLoadError(null)
+    setSaveError(null)
+    setSaveSucceeded(false)
     try {
       const s = sanitizeSettings(await getSettings())
       setSettings(s)
       // 草稿初始化为空（后端返回的是 mask 占位，不回填到输入框）。
       setOpenalexDraft('')
     } catch (error) {
-      setSaveError(errorMessage(error))
+      setLoadError(errorMessage(error))
     }
   }
 
@@ -1343,36 +1348,57 @@ function AcademicKeysCard() {
     void load()
   }, [])
 
-  const masked = settings?.api_keys_masked?.OPENALEX_API_KEY
-  const configured = !!masked
+  useEffect(() => {
+    if (!saveSucceeded) return
+    const timer = window.setTimeout(() => setSaveSucceeded(false), 4000)
+    return () => window.clearTimeout(timer)
+  }, [saveSucceeded])
+
+  const configured = isDataSourceKeyConfigured(settings, 'OPENALEX_API_KEY')
 
   const save = async () => {
+    if (!canSubmitDataSourceKey(settings, openalexDraft, saving)) return
+
     setSaving(true)
     setSaveError(null)
+    setSaveSucceeded(false)
     try {
-      // 空草稿 = 不改动（保留旧值）；非空 = 写入新值。
-      // 后端对 mask 占位（••••••••）保留旧值，这里只在用户输入了内容时才提交。
-      const payload: AppSettingsUpdate = {
-        providers: settings?.providers ?? [],
-        a2a_agents: settings?.a2a_agents ?? [],
-        model: settings?.model ?? '',
-        default_workspace: settings?.default_workspace ?? '',
-        revision: settings?.revision ?? 0,
-        mcp_servers: settings?.mcp_servers ?? [],
-        skills: settings?.skills,
-        api_keys: openalexDraft.trim()
-          ? { OPENALEX_API_KEY: openalexDraft.trim() }
-          : {},
-      }
+      const payload = buildSettingsPayload(
+        settings,
+        {},
+        {},
+        new Set(),
+        { OPENALEX_API_KEY: openalexDraft },
+      )
       const saved = sanitizeSettings(await saveSettings(payload))
       setSettings(saved)
-      setOpenalexDraft('')
-      setSavedAt(Date.now())
+      if (isDataSourceKeyConfigured(saved, 'OPENALEX_API_KEY')) {
+        setOpenalexDraft('')
+        setSaveSucceeded(true)
+      } else {
+        setSaveError('设置已返回，但未确认 OpenAlex API Key 已配置，请重试。')
+      }
     } catch (error) {
       setSaveError(errorMessage(error))
     } finally {
       setSaving(false)
     }
+  }
+
+  if (!settings) {
+    return (
+      <div className="card p-3">
+        <div className="text-[13px] font-medium text-ink">学术数据源</div>
+        {loadError ? (
+          <div className="mt-2 space-y-2 text-[11px]">
+            <p role="alert" className="text-danger">设置加载失败：{loadError}</p>
+            <button className="btn-outline" onClick={() => void load()}>重试</button>
+          </div>
+        ) : (
+          <p role="status" className="mt-2 text-[11px] text-ink3">正在加载 OpenAlex 配置…</p>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -1384,33 +1410,45 @@ function AcademicKeysCard() {
           type="password"
           className="input mt-1 py-1.5 font-mono"
           value={openalexDraft}
-          onChange={(e) => setOpenalexDraft(e.target.value)}
-          placeholder={configured ? '••••••••（已配置，输入新值覆盖）' : '（可选，不填走礼仪池）'}
+          autoComplete="off"
+          disabled={saving}
+          onChange={(e) => {
+            setOpenalexDraft(e.target.value)
+            setSaveError(null)
+            setSaveSucceeded(false)
+          }}
+          placeholder={configured ? '已配置，输入新值覆盖' : '输入 OpenAlex API key'}
         />
       </label>
       <p className="mt-1 text-[11px] text-ink3">
-        OpenAlex 免费但建议填 key（更稳定）。在{' '}
+        OpenAlex API key 可免费获取；未配置时只有少量匿名试用额度，不适合稳定使用。前往{' '}
         <a
-          href="https://openalex.org/users/me"
+          href="https://openalex.org/settings/api"
           target="_blank"
           rel="noreferrer"
           className="text-brand underline"
         >
-          openalex.org/users/me
+          OpenAlex API settings
         </a>{' '}
         获取。用于 search_papers / fetch_paper 工具。
       </p>
       <div className="mt-2 flex items-center gap-2">
-        <button className="btn-primary" disabled={saving || !openalexDraft.trim()} onClick={() => void save()}>
+        <button
+          className="btn-primary"
+          disabled={!canSubmitDataSourceKey(settings, openalexDraft, saving)}
+          onClick={() => void save()}
+        >
           {saving ? '保存中…' : '保存'}
         </button>
-        {configured && !openalexDraft.trim() && (
-          <span className="text-[11px] text-success">已配置</span>
+        {!openalexDraft.trim() && (
+          <span className={`text-[11px] ${configured ? 'text-success' : 'text-ink3'}`}>
+            {configured ? '已配置' : '未配置'}
+          </span>
         )}
-        {savedAt && Date.now() - savedAt < 4000 && (
+        {saveSucceeded && (
           <span className="text-[11px] text-success">已保存</span>
         )}
-        {saveError && <span className="text-[11px] text-danger">{saveError}</span>}
+        {saveError && <span role="alert" className="text-[11px] text-danger">{saveError}</span>}
       </div>
     </div>
   )

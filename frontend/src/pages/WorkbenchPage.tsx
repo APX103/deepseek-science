@@ -41,7 +41,9 @@ import {
   useSessionState,
   useStream,
 } from '../store'
+import { filePreviewKind } from '../api/filePreview'
 import FilePreviewModal from '../components/FilePreviewModal'
+import ImagePreviewModal from '../components/ImagePreviewModal'
 import PdfPreviewModal from '../components/PdfPreviewModal'
 import SkillsModal from '../components/SkillsModal'
 import ArtifactPanel, { DEFAULT_TABS, FILES_TAB, type PanelTab } from '../components/workbench/ArtifactPanel'
@@ -315,7 +317,7 @@ export default function WorkbenchPage() {
 
       {showSkills && <SkillsModal onClose={() => setShowSkills(false)} />}
       {previewFile &&
-        (previewFile.path.endsWith('.pdf') ? (
+        (filePreviewKind(previewFile.path) === 'pdf' ? (
           <PdfPreviewModal
             sid={sid}
             artifact={{
@@ -328,6 +330,8 @@ export default function WorkbenchPage() {
             }}
             onClose={() => setPreviewFile(null)}
           />
+        ) : filePreviewKind(previewFile.path) === 'image' ? (
+          <ImagePreviewModal sid={sid} file={previewFile} onClose={() => setPreviewFile(null)} />
         ) : (
           <FilePreviewModal sid={sid} file={previewFile} onClose={() => setPreviewFile(null)} />
         ))}

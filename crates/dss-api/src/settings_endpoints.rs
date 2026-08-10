@@ -1,4 +1,5 @@
-//! Persisted application settings with one atomically replaced LLM+A2A runtime snapshot.
+//! Persisted application settings with one atomically replaced LLM+A2A/data-source runtime
+//! snapshot.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -332,9 +333,8 @@ fn public_settings(
         a2a_agents: runtime.a2a().agents.iter().map(public_a2a_agent).collect(),
         skills: SkillSettingsPayload::from(persisted_skills),
         mcp_servers: persisted_mcp.iter().map(McpServerSettings::from).collect(),
-        api_keys_masked: state
-            .settings
-            .api_keys
+        api_keys_masked: runtime
+            .api_keys()
             .iter()
             .map(|(k, v)| {
                 let masked = if v.is_empty() {
@@ -719,7 +719,7 @@ pub async fn save_settings(
     );
     // api_keys：前端回传的值里，mask 占位（••••••••）保留后端旧值，其余（含空=清空）写入。
     // 未出现在 payload.api_keys 里的旧 key 也保留（不丢用户已存的 key）。
-    let mut merged_api_keys = state.settings.api_keys.clone();
+    let mut merged_api_keys = current_runtime.api_keys().clone();
     if let Some(submitted) = &payload.api_keys {
         for (k, v) in submitted {
             if v == "••••••••" {
@@ -788,6 +788,7 @@ pub async fn save_settings(
         next_revision,
         llm_replacement,
         a2a_replacement,
+        Arc::new(merged_api_keys),
     ));
 
     // Linearize durable replacement and run snapshot capture. Existing runs already own their
@@ -858,6 +859,12 @@ mod tests {
 
     const INITIAL_BASE_URL: &str = "https://initial.example.invalid";
     const INITIAL_MODEL: &str = "initial-model";
+    const OPENALEX_KEY: &str = "OPENALEX_API_KEY";
+    const SECONDARY_SOURCE_KEY: &str = "SECONDARY_SOURCE_API_KEY";
+
+    fn data_source_value(version: &str) -> String {
+        ["test", "only", "source", version].join("-")
+    }
 
     fn rerun_without_llm_env(test_name: &str) -> bool {
         const CHILD_ENV: &str = "DSS_SETTINGS_HOT_RELOAD_TEST_CHILD";
@@ -1127,6 +1134,198 @@ mod tests {
         assert_eq!(config.model, "configured-model");
         assert_eq!(config.revision, 1);
         assert!(config.overridden_fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_source_keys_hot_swap_mask_preserve_clear_and_restart() {
+        const RESTART_CHILD: &str = "DSS_API_KEYS_RESTART_TEST_CHILD";
+        const TEST_NAME: &str = "data_source_keys_hot_swap_mask_preserve_clear_and_restart";
+
+        if std::env::var_os(RESTART_CHILD).is_some() {
+            let restarted = Settings::load().expect("reload settings through the startup path");
+            let restarted_state = crate::state::build_state(restarted)
+                .await
+                .expect("rebuild application state from persisted settings");
+            let restarted_runtime = restarted_state.runtime_snapshot().await;
+            assert!(restarted_runtime
+                .api_keys()
+                .get(OPENALEX_KEY)
+                .is_some_and(|value| value == &data_source_value("v1")));
+            assert!(restarted_runtime
+                .api_keys()
+                .get(SECONDARY_SOURCE_KEY)
+                .is_some_and(|value| value == &data_source_value("secondary")));
+            let Json(restarted_public) = get_settings(State(restarted_state))
+                .await
+                .expect("read public settings after restart");
+            assert_eq!(
+                restarted_public
+                    .api_keys_masked
+                    .get(OPENALEX_KEY)
+                    .map(String::as_str),
+                Some("••••••••")
+            );
+            return;
+        }
+        if rerun_without_llm_env(TEST_NAME) {
+            return;
+        }
+
+        let test_dir = TestDir::new("data-source-keys");
+        let state = build_test_state(&test_dir, true).await;
+        let before_save = state.runtime_snapshot().await;
+        assert!(before_save.api_keys().is_empty());
+
+        let first_value = data_source_value("v1");
+        let secondary_value = data_source_value("secondary");
+        let mut first = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        first.api_keys = Some(std::collections::HashMap::from([
+            (OPENALEX_KEY.to_owned(), first_value.clone()),
+            (SECONDARY_SOURCE_KEY.to_owned(), secondary_value.clone()),
+        ]));
+        let Json(first_saved) = save_settings(State(state.clone()), Json(first))
+            .await
+            .expect("save data-source keys");
+
+        let after_first_save = state.runtime_snapshot().await;
+        assert!(!Arc::ptr_eq(&before_save, &after_first_save));
+        assert!(before_save.api_keys().is_empty());
+        assert!(after_first_save
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &first_value));
+        assert!(after_first_save
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+        assert_eq!(first_saved.revision, 1);
+        assert_eq!(
+            first_saved.api_keys_masked.get(OPENALEX_KEY),
+            Some(&"••••••••".to_owned())
+        );
+        assert_eq!(
+            first_saved.api_keys_masked.get(SECONDARY_SOURCE_KEY),
+            Some(&"••••••••".to_owned())
+        );
+        assert!(first_saved.api_keys.is_none());
+        let public_json = serde_json::to_string(&first_saved).expect("serialize public settings");
+        assert!(!public_json.contains(&first_value));
+        assert!(!public_json.contains(&secondary_value));
+
+        let Json(fetched) = get_settings(State(state.clone()))
+            .await
+            .expect("read freshly saved settings");
+        assert_eq!(fetched.revision, 1);
+        assert_eq!(
+            fetched.api_keys_masked.get(OPENALEX_KEY),
+            Some(&"••••••••".to_owned())
+        );
+        assert!(fetched.api_keys.is_none());
+
+        let restart = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .env(RESTART_CHILD, "1")
+        .env("DSS_DATA_DIR", test_dir.path())
+        .output()
+        .expect("rerun test through the startup settings loader");
+        assert!(
+            restart.status.success(),
+            "restart child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&restart.stdout),
+            String::from_utf8_lossy(&restart.stderr)
+        );
+
+        // A mask placeholder preserves the corresponding private value.
+        let mut mask_round_trip = first_saved;
+        mask_round_trip.api_keys = Some(std::collections::HashMap::from([(
+            OPENALEX_KEY.to_owned(),
+            "••••••••".to_owned(),
+        )]));
+        let Json(mask_saved) = save_settings(State(state.clone()), Json(mask_round_trip))
+            .await
+            .expect("round-trip a masked key");
+        assert_eq!(mask_saved.revision, 2);
+        assert!(state
+            .runtime_snapshot()
+            .await
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &first_value));
+
+        // Omitting api_keys on an unrelated settings save preserves all current sources.
+        let mut unrelated = mask_saved;
+        unrelated.model = "model-after-key-save".into();
+        unrelated.providers[0].model = Some(unrelated.model.clone());
+        let Json(unrelated_saved) = save_settings(State(state.clone()), Json(unrelated))
+            .await
+            .expect("save an unrelated setting");
+        let after_unrelated = state.runtime_snapshot().await;
+        assert_eq!(unrelated_saved.revision, 3);
+        assert!(after_unrelated
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &first_value));
+        assert!(after_unrelated
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+
+        // Replacing one source leaves unsubmitted sources untouched.
+        let replacement_value = data_source_value("v2");
+        let mut replace = unrelated_saved;
+        replace.api_keys = Some(std::collections::HashMap::from([(
+            OPENALEX_KEY.to_owned(),
+            replacement_value.clone(),
+        )]));
+        let Json(replaced) = save_settings(State(state.clone()), Json(replace))
+            .await
+            .expect("replace one data-source key");
+        let after_replace = state.runtime_snapshot().await;
+        assert_eq!(replaced.revision, 4);
+        assert!(after_replace
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &replacement_value));
+        assert!(after_replace
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+
+        // An explicit empty string clears just that source in runtime and on disk.
+        let mut clear = replaced;
+        clear.api_keys = Some(std::collections::HashMap::from([(
+            OPENALEX_KEY.to_owned(),
+            String::new(),
+        )]));
+        let Json(cleared) = save_settings(State(state.clone()), Json(clear))
+            .await
+            .expect("clear one data-source key");
+        let after_clear = state.runtime_snapshot().await;
+        assert_eq!(cleared.revision, 5);
+        assert!(!after_clear.api_keys().contains_key(OPENALEX_KEY));
+        assert!(after_clear
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+        assert!(cleared
+            .api_keys_masked
+            .get(OPENALEX_KEY)
+            .is_none_or(String::is_empty));
+
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after key clear"),
+        )
+        .expect("parse settings after key clear");
+        assert!(persisted["api_keys"].get(OPENALEX_KEY).is_none());
+        assert!(persisted["api_keys"]
+            .get(SECONDARY_SOURCE_KEY)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == secondary_value));
     }
 
     #[tokio::test]

@@ -68,6 +68,30 @@ pub struct ListFilesResponse {
     files: Vec<WorkspaceFile>,
 }
 
+fn content_type_for_path(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "json" => "application/json; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
+        "md" | "markdown" | "mdx" | "tex" | "txt" | "py" | "rs" | "toml" | "yaml" | "yml" => {
+            "text/plain; charset=utf-8"
+        }
+        _ => "application/octet-stream",
+    }
+}
+
 /// `GET /api/sessions/{sid}/files`.
 pub async fn list_files(
     State(state): State<AppState>,
@@ -116,22 +140,7 @@ pub async fn read_file(
         .metadata()
         .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
     let handle = tokio::fs::File::from_std(file);
-    let content_type = match std::path::Path::new(&path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "svg" => "image/svg+xml",
-        "json" => "application/json; charset=utf-8",
-        "csv" => "text/csv; charset=utf-8",
-        "md" | "tex" | "txt" | "py" | "rs" | "toml" | "yaml" | "yml" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
-    };
+    let content_type = content_type_for_path(&path);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -169,7 +178,27 @@ mod tests {
     use dss_core::{LlmEnvOverrides, LlmSettings, Settings};
     use dss_tools::{SecureWorkspace, ToolError};
 
-    use super::list_files;
+    use super::{content_type_for_path, list_files};
+
+    #[test]
+    fn content_type_mapping_is_case_insensitive_and_covers_preview_formats() {
+        for path in ["paper.PDF", "nested/PRESENTATION.PdF"] {
+            assert_eq!(content_type_for_path(path), "application/pdf");
+        }
+        for path in ["report.markdown", "report.mdx"] {
+            assert_eq!(content_type_for_path(path), "text/plain; charset=utf-8");
+        }
+        for (path, expected) in [
+            ("animation.gif", "image/gif"),
+            ("figure.WEBP", "image/webp"),
+            ("diagram.svg", "image/svg+xml"),
+            ("results.tsv", "text/tab-separated-values; charset=utf-8"),
+            ("archive.bin", "application/octet-stream"),
+            ("no-extension", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type_for_path(path), expected, "path: {path}");
+        }
+    }
 
     #[test]
     fn existing_file_is_confined_to_workspace() {

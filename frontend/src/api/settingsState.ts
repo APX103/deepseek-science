@@ -7,10 +7,13 @@ import type {
   LlmOverriddenField,
   McpServer,
   McpServerUpdate,
+  MaskedApiKey,
   SkillSettingsValue,
 } from '../types'
 
 export type SettingsKeyDrafts = Readonly<Record<string, string>>
+export type DataSourceKeyDrafts = Readonly<Record<string, string>>
+export const DATA_SOURCE_KEY_MASK: MaskedApiKey = '••••••••'
 
 /** Normalize skill settings so the shape is always complete regardless of backend version. */
 export function normalizeSkillSettings(value?: SkillSettingsValue | null): SkillSettingsValue {
@@ -107,13 +110,28 @@ export function normalizeMcpServers(value?: McpServer[] | null): McpServer[] {
 
 /** Never retain a plaintext key received from the server in frontend state. */
 export function sanitizeSettings(settings: AppSettings): AppSettings {
+  // `api_keys` is outbound-only. Destructure it defensively in case a broken or
+  // older backend includes plaintext data-source credentials in a response.
+  const {
+    api_keys: _sensitiveDataSourceKeys,
+    ...publicSettings
+  } = settings as AppSettings & { api_keys?: unknown }
+  const apiKeysMasked = publicSettings.api_keys_masked
+    ? Object.fromEntries(
+        Object.entries(publicSettings.api_keys_masked).map(([name, value]) => [
+          name,
+          value === DATA_SOURCE_KEY_MASK ? DATA_SOURCE_KEY_MASK : '',
+        ]),
+      ) as Record<string, MaskedApiKey>
+    : undefined
+
   return {
-    ...settings,
-    providers: settings.providers.map((provider) => {
+    ...publicSettings,
+    providers: publicSettings.providers.map((provider) => {
       const { api_key: _sensitiveKey, ...publicProvider } = provider
       return publicProvider
     }),
-    a2a_agents: (settings.a2a_agents ?? []).map((agent) => {
+    a2a_agents: (publicSettings.a2a_agents ?? []).map((agent) => {
       const {
         bearer_token: _sensitiveToken,
         clear_bearer_token: _serverControlledClear,
@@ -121,9 +139,27 @@ export function sanitizeSettings(settings: AppSettings): AppSettings {
       } = agent
       return publicAgent
     }),
-    skills: normalizeSkillSettings(settings.skills),
-    mcp_servers: normalizeMcpServers(settings.mcp_servers),
+    skills: normalizeSkillSettings(publicSettings.skills),
+    mcp_servers: normalizeMcpServers(publicSettings.mcp_servers),
+    api_keys_masked: apiKeysMasked,
   }
+}
+
+/** Only the backend's exact public mask may establish configured state. */
+export function isDataSourceKeyConfigured(
+  settings: AppSettings | null,
+  name: string,
+): boolean {
+  return settings?.api_keys_masked?.[name] === DATA_SOURCE_KEY_MASK
+}
+
+/** Loading, saving, and blank-draft states must never submit a settings form. */
+export function canSubmitDataSourceKey(
+  settings: AppSettings | null,
+  draft: string,
+  saving: boolean,
+): settings is AppSettings {
+  return settings !== null && !saving && draft.trim().length > 0
 }
 
 /** Build the one outbound payload where a freshly typed key is allowed to exist. */
@@ -132,8 +168,14 @@ export function buildSettingsPayload(
   keyDrafts: SettingsKeyDrafts,
   a2aTokenDrafts: A2aTokenDrafts = {},
   a2aTokenClears: A2aTokenClears = new Set(),
+  dataSourceKeyDrafts: DataSourceKeyDrafts = {},
 ): AppSettingsUpdate {
   const sanitized = sanitizeSettings(settings)
+  const apiKeys = Object.fromEntries(
+    Object.entries(dataSourceKeyDrafts)
+      .map(([name, value]) => [name, value.trim()] as const)
+      .filter(([, value]) => value.length > 0),
+  )
   return {
     model: sanitized.model,
     default_workspace: sanitized.default_workspace,
@@ -163,6 +205,7 @@ export function buildSettingsPayload(
       url: server.url,
       enabled: server.enabled,
     })),
+    ...(Object.keys(apiKeys).length > 0 ? { api_keys: apiKeys } : {}),
   }
 }
 

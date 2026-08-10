@@ -1198,7 +1198,7 @@ pub async fn stream_sse(
                 tc = tc.with_memory(state.memory.clone(), project_id.clone());
             }
             // 注入数据源 API keys（search_papers 等）。
-            tc = tc.with_api_keys(state.settings.api_keys.clone());
+            tc = tc.with_api_keys(runtime.api_keys().clone());
             tc
         };
         let llm_for_extract = llm.clone();

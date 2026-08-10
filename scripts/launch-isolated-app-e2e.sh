@@ -67,9 +67,31 @@ if [ -n "${HOME-}" ] && [ -f "$HOME/.deepseek-science/dss.db" ]; then
   production_db="$HOME/.deepseek-science/dss.db"
 fi
 
+production_db_fingerprint() {
+  # Normalize a private snapshot before hashing it. Copying the database and
+  # WAL keeps production read-only, while SQLite can rebuild SHM state in the
+  # snapshot without making WAL checkpoints look like content changes.
+  fingerprint_dir=$(mktemp -d "$test_data_dir/production-db-fingerprint.XXXXXX")
+  fingerprint_db="$fingerprint_dir/dss.db"
+  normalized_db="$fingerprint_dir/normalized.db"
+  install -m 600 "$production_db" "$fingerprint_db"
+  if [ -f "$production_db-wal" ]; then
+    install -m 600 "$production_db-wal" "$fingerprint_db-wal"
+  fi
+
+  # The private copy must be writable so SQLite can create its own SHM file and
+  # replay a copied WAL. The production files above are still only ever read.
+  if ! sqlite3 "$fingerprint_db" "VACUUM INTO '$normalized_db';"; then
+    printf '%s\n' "ERROR: could not fingerprint production dss.db" >&2
+    return 1
+  fi
+
+  (cd "$fingerprint_dir" && shasum -a 256 normalized.db)
+}
+
 before_hash=''
 if [ -n "$production_db" ]; then
-  before_hash=$(sqlite3 -readonly "$production_db" ".sha3sum --schema")
+  before_hash=$(production_db_fingerprint)
 fi
 
 printf '%s\n' "Isolated DSS_DATA_DIR: $test_data_dir"
@@ -83,7 +105,7 @@ app_status=$?
 set -e
 
 if [ -n "$production_db" ]; then
-  after_hash=$(sqlite3 -readonly "$production_db" ".sha3sum --schema")
+  after_hash=$(production_db_fingerprint)
   if [ "$before_hash" != "$after_hash" ]; then
     printf '%s\n' "ERROR: production dss.db changed during isolated E2E" >&2
     exit 1
