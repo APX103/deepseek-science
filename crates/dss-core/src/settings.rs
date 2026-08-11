@@ -38,6 +38,8 @@ pub struct Settings {
     pub a2a_agents: Vec<A2aAgentConfig>,
     /// 记忆系统配置（抽取/巩固/召回）。
     pub memory: MemorySettings,
+    /// 日志保留策略（按天 + 按量双限制）。
+    pub log: LogSettings,
     /// 数据源 API keys（OPENALEX_API_KEY 等）。工具通过 ToolContext.api_keys 读取。
     pub api_keys: HashMap<String, String>,
 }
@@ -136,6 +138,32 @@ impl Default for MemorySettings {
         }
     }
 }
+
+/// 日志保留策略（D-T07）。按天 + 按量双限制，先到先清。
+///
+/// 默认 14 天、10 万条；后台 sweep（启动一次 + 每 6h）幂等执行。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogSettings {
+    /// 超过此天数的日志自动删除。
+    pub retention_days: u32,
+    /// 日志总条数上限，超过则删最旧的。
+    pub max_rows: u32,
+}
+
+impl Default for LogSettings {
+    fn default() -> Self {
+        Self {
+            retention_days: DEFAULT_LOG_RETENTION_DAYS,
+            max_rows: DEFAULT_LOG_MAX_ROWS,
+        }
+    }
+}
+
+/// 默认日志保留天数（D-T07）。
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 14;
+/// 默认日志最大条数（D-T07）。
+pub const DEFAULT_LOG_MAX_ROWS: u32 = 100_000;
 
 /// MCP server 配置。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -266,6 +294,9 @@ struct FileSettings {
     /// 记忆系统配置（整体替换语义：高优先级文件的 memory 对象覆盖低层）。
     #[serde(default)]
     memory: Option<MemorySettings>,
+    /// 日志保留策略（整体替换语义：高优先级文件的 log 对象覆盖低层）。
+    #[serde(default)]
+    log: Option<LogSettings>,
     /// 数据源 API keys（OPENALEX_API_KEY 等）。整体替换语义。
     #[serde(default)]
     api_keys: Option<HashMap<String, String>>,
@@ -626,6 +657,7 @@ impl Settings {
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
         let mut memory = MemorySettings::default();
+        let mut log = LogSettings::default();
         let mut api_keys: HashMap<String, String> = HashMap::new();
 
         // config.toml（低优先级文件）
@@ -637,6 +669,7 @@ impl Settings {
                 message: e.to_string(),
             })?;
             let file_memory = file.memory.clone();
+            let file_log = file.log.clone();
             let file_api_keys = file.api_keys.clone();
             file.apply_to(
                 &mut server,
@@ -648,6 +681,9 @@ impl Settings {
             );
             if let Some(m) = file_memory {
                 memory = m;
+            }
+            if let Some(l) = file_log {
+                log = l;
             }
             if let Some(k) = file_api_keys {
                 api_keys = k;
@@ -665,6 +701,7 @@ impl Settings {
                 })?;
             // memory 整体替换语义（高优先级文件的 memory 覆盖低层）。
             let file_memory = file.memory.clone();
+            let file_log = file.log.clone();
             let file_api_keys = file.api_keys.clone();
             file.apply_to(
                 &mut server,
@@ -676,6 +713,9 @@ impl Settings {
             );
             if let Some(m) = file_memory {
                 memory = m;
+            }
+            if let Some(l) = file_log {
+                log = l;
             }
             if let Some(k) = file_api_keys {
                 api_keys = k;
@@ -703,6 +743,7 @@ impl Settings {
             mcp_servers,
             a2a_agents,
             memory,
+            log,
             api_keys,
         })
     }

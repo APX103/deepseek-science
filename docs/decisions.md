@@ -151,14 +151,17 @@
 #### D-T05 R 语言支持评估
 - 生信（DESeq2/Seurat）依赖 R。归属：沙箱（D-T01）的子项。
 
-#### D-T06 校准：DeepSeek 设计 token 精确值
-- 用浏览器 devtools 实测 chat.deepseek.com 的精确 hex（品牌蓝、各中性色、圆角、间距）。
-- 实现 P1 之后、主题重写前完成。校准后回填 [design-system.md](design-system.md) 中标 ⚠️ 的值。
-- 归属：前端主题阶段（08 路线图新增任务）。
+#### D-T06 校准：DeepSeek 设计 token 精确值 ✅ 已完成
+- **产出**：2026-08-11 浏览器实测 chat.deepseek.com（深色登录页 `:root`/`.ds-input--border` computed style）+ deepseek.com（亮色首页 CTA 卡片）。回填 [design-system.md](design-system.md) 色彩 token，去掉全部 ⚠️ 标记。
+- **关键校准**：亮色品牌蓝 `#4D6BFE` → `#3B82F6`；深色品牌蓝 `#5b7cff` → `#5686FE`；深色 surface `#1f1f23` → `#1B1B1C`；深色 border `rgba(255,255,255,0.08)` → `0.12`；亮色主文本 `#111827` → `#0F1115`、次文本 `#6B7280` → `#64748B`。
+- **偏离说明**：实测发现 DeepSeek 官网实际用大圆角（按钮 pill/`4096px`、输入框 `28px`、卡片 `16px`），与本文档当初「不用大圆角胶囊」矛盾。本工作台**有意保留克制圆角**（更适合高密度工作台界面），在 design-system.md「线条与圆角」段注明偏离理由。仅改色彩 token，不动组件。
+- 归属：前端主题阶段（已完成）。
 
-#### D-T07 定：日志保留策略默认值
-- 候选：按天（14 天）/按量（10 万条）。是否需要 `/api/logs/stream` 实时推送。
-- 归属：日志系统阶段。来源：logging.md。
+#### D-T07 定：日志保留策略默认值 ✅ 已完成
+- **已定**：按天 + 按量双限制。默认 14 天、10 万条，先到先清。
+- **实现**（2026-08-11）：`dss-core::LogSettings`（retention_days/max_rows，默认 14/100_000）；`dss-db::prune_logs`（先按天 `DELETE ts < before`，再按量删最旧的到 max_rows）；`dss-observability::LogStore::prune`；`dss-api::state::spawn_retention_loop`（启动跑一次 + 每 6h 循环，顺带激活 memory retention sweep）；settings 端点 GET/POST 暴露 `log_retention_days`/`log_max_rows`；前端 SettingsModal General 加「日志保留」卡片。每次 sweep 写一条 `source=system, kind=retention_sweep` 日志。
+- **未做（DEFER）**：`/api/logs/stream` 实时推送（复杂度，后置）；settings 热更新 retention loop 沿用启动快照（修改需重启后端生效，与 `log_level` 行为一致）。
+- 归属：日志系统阶段（已完成）。来源：logging.md。
 
 #### D-T08 调研：Orca（onorca.dev）竞品 ✅ 已完成
 - 产出：[research/orca.md](research/orca.md)（2026-08-05 快照，17 节功能层面全梳理 + 借鉴分析）。

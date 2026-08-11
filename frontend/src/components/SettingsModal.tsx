@@ -1316,6 +1316,7 @@ function GeneralSection() {
           <p className="mt-1 text-[11px] text-ink3">当前后端配置的会话工作区根目录（只读展示）。</p>
         )}
       </div>
+      <LogRetentionCard />
       <AcademicKeysCard />
     </div>
   )
@@ -1448,6 +1449,141 @@ function AcademicKeysCard() {
         {saveSucceeded && (
           <span className="text-[11px] text-success">已保存</span>
         )}
+        {saveError && <span role="alert" className="text-[11px] text-danger">{saveError}</span>}
+      </div>
+    </div>
+  )
+}
+
+// ---------- 日志保留策略（D-T07） ----------
+function LogRetentionCard() {
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [days, setDays] = useState('14')
+  const [maxRows, setMaxRows] = useState('100000')
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveSucceeded, setSaveSucceeded] = useState(false)
+
+  const load = async () => {
+    setLoadError(null)
+    setSaveError(null)
+    setSaveSucceeded(false)
+    try {
+      const s = sanitizeSettings(await getSettings())
+      setSettings(s)
+      setDays(String(s.log_retention_days ?? 14))
+      setMaxRows(String(s.log_max_rows ?? 100_000))
+    } catch (error) {
+      setLoadError(errorMessage(error))
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  useEffect(() => {
+    if (!saveSucceeded) return
+    const timer = window.setTimeout(() => setSaveSucceeded(false), 4000)
+    return () => window.clearTimeout(timer)
+  }, [saveSucceeded])
+
+  const daysNum = Number.parseInt(days, 10)
+  const maxRowsNum = Number.parseInt(maxRows, 10)
+  const daysValid = Number.isFinite(daysNum) && daysNum >= 1
+  const maxRowsValid = Number.isFinite(maxRowsNum) && maxRowsNum >= 1000
+  const dirty =
+    !!settings &&
+    (daysNum !== (settings.log_retention_days ?? 14) ||
+      maxRowsNum !== (settings.log_max_rows ?? 100_000))
+  const canSave = !!settings && !saving && daysValid && maxRowsValid && dirty
+
+  const save = async () => {
+    if (!settings || !canSave) return
+    setSaving(true)
+    setSaveError(null)
+    setSaveSucceeded(false)
+    try {
+      const payload = buildSettingsPayload(settings, {}, {}, new Set(), {})
+      payload.log_retention_days = daysNum
+      payload.log_max_rows = maxRowsNum
+      const saved = sanitizeSettings(await saveSettings(payload))
+      setSettings(saved)
+      setDays(String(saved.log_retention_days ?? daysNum))
+      setMaxRows(String(saved.log_max_rows ?? maxRowsNum))
+      setSaveSucceeded(true)
+    } catch (error) {
+      setSaveError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!settings) {
+    return (
+      <div className="card p-3">
+        <div className="text-[13px] font-medium text-ink">日志保留</div>
+        {loadError ? (
+          <div className="mt-2 space-y-2 text-[11px]">
+            <p role="alert" className="text-danger">设置加载失败：{loadError}</p>
+            <button className="btn-outline" onClick={() => void load()}>重试</button>
+          </div>
+        ) : (
+          <p role="status" className="mt-2 text-[11px] text-ink3">正在加载…</p>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="card p-3">
+      <div className="text-[13px] font-medium text-ink">日志保留</div>
+      <div className="mt-2 grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-[12px] text-ink2">保留天数</span>
+          <input
+            type="number"
+            min={1}
+            className="input mt-1 py-1.5"
+            value={days}
+            disabled={saving}
+            onChange={(e) => {
+              setDays(e.target.value)
+              setSaveError(null)
+              setSaveSucceeded(false)
+            }}
+          />
+          {!daysValid && <span className="mt-1 block text-[11px] text-danger">至少 1 天</span>}
+        </label>
+        <label className="block">
+          <span className="text-[12px] text-ink2">最大条数</span>
+          <input
+            type="number"
+            min={1000}
+            className="input mt-1 py-1.5"
+            value={maxRows}
+            disabled={saving}
+            onChange={(e) => {
+              setMaxRows(e.target.value)
+              setSaveError(null)
+              setSaveSucceeded(false)
+            }}
+          />
+          {!maxRowsValid && (
+            <span className="mt-1 block text-[11px] text-danger">至少 1000 条</span>
+          )}
+        </label>
+      </div>
+      <p className="mt-1 text-[11px] text-ink3">
+        超过天数或条数上限的日志会被自动清理（先到先清）。后台启动时跑一次，之后每 6
+        小时循环。修改后重启后端生效。
+      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <button className="btn-primary" disabled={!canSave} onClick={() => void save()}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+        {saveSucceeded && <span className="text-[11px] text-success">已保存</span>}
         {saveError && <span role="alert" className="text-[11px] text-danger">{saveError}</span>}
       </div>
     </div>

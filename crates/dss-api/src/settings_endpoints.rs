@@ -283,6 +283,11 @@ pub struct AppSettingsPayload {
     api_keys_masked: std::collections::HashMap<String, String>,
     #[serde(default)]
     api_keys: Option<std::collections::HashMap<String, String>>,
+    /// 日志保留策略（D-T07：按天 + 按量双限制）。
+    #[serde(default)]
+    log_retention_days: u32,
+    #[serde(default)]
+    log_max_rows: u32,
 }
 
 fn public_settings(
@@ -346,6 +351,8 @@ fn public_settings(
             })
             .collect(),
         api_keys: None,
+        log_retention_days: state.settings.log.retention_days,
+        log_max_rows: state.settings.log.max_rows,
     }
 }
 
@@ -739,6 +746,30 @@ pub async fn save_settings(
             .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
     );
 
+    // log retention（D-T07）：按天 + 按量双限制，写入 settings.json 的 `log` 对象。
+    // 校验：retention_days >= 1（0 会清空所有日志）；max_rows >= 1000（防误填过小）。
+    if payload.log_retention_days == 0 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "log_retention_days must be >= 1",
+        ));
+    }
+    if payload.log_max_rows < 1000 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "log_max_rows must be >= 1000",
+        ));
+    }
+    let log_cfg = dss_core::settings::LogSettings {
+        retention_days: payload.log_retention_days,
+        max_rows: payload.log_max_rows,
+    };
+    object.insert(
+        "log".into(),
+        serde_json::to_value(&log_cfg)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    );
+
     let bytes = serde_json::to_vec_pretty(&root)
         .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
@@ -958,6 +989,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -985,6 +1017,8 @@ mod tests {
             mcp_servers: Vec::new(),
             api_keys_masked: std::collections::HashMap::new(),
             api_keys: None,
+            log_retention_days: 14,
+            log_max_rows: 100_000,
         }
     }
 

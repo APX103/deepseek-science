@@ -357,6 +357,7 @@ mod active_run_tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await;
@@ -737,6 +738,10 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
         })
         .await;
 
+    // 后台保留策略 sweep（D-T07）：启动跑一次 + 每 6h 循环。
+    // 同时激活 memory retention（crates/dss-memory retention::sweep 幂等）。
+    spawn_retention_loop(logs.clone(), memory.clone(), settings.log.clone());
+
     Ok(AppState {
         settings: Arc::new(settings),
         api_token,
@@ -753,6 +758,98 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
         session_restore_lock: Arc::new(Mutex::new(())),
         run_controls: Arc::new(RunControlRegistry::default()),
     })
+}
+
+/// 后台保留策略 sweep（D-T07）。
+///
+/// 启动跑一次 + 每 6 小时循环：
+/// - **日志**：按天删（`ts < now - retention_days`）+ 按量删（超过 `max_rows` 删最旧的）。
+/// - **记忆**：激活 `dss-memory` 的 retention sweep（valid_until 过期 → expired；
+///   长期未召回 + 低置信 → candidate）。幂等。
+///
+/// 每次 sweep 结果写一条 `source=system, kind=retention_sweep` 日志（observability）。
+/// 配置取启动时的快照；settings 热更新后保留任务沿用旧值（接受，memory retention 同模式）。
+fn spawn_retention_loop(
+    logs: Arc<dss_observability::LogStore>,
+    memory: Arc<dss_memory::MemoryStore>,
+    log_cfg: dss_core::settings::LogSettings,
+) {
+    use std::time::Duration as StdDuration;
+
+    const SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60); // 6h
+
+    tokio::spawn(async move {
+        // 启动后稍等，避开启动日志洪峰与 MCP 连接竞争。
+        tokio::time::sleep(StdDuration::from_secs(15)).await;
+
+        let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+        // interval 首次 tick 立即返回（即启动首轮）；上面已 sleep 15s。
+        ticker.tick().await;
+
+        loop {
+            run_one_retention_sweep(&logs, &memory, &log_cfg).await;
+            ticker.tick().await;
+        }
+    });
+}
+
+/// 跑一次保留策略 sweep：日志 prune + memory retention，结果写一条 system 日志。
+async fn run_one_retention_sweep(
+    logs: &Arc<dss_observability::LogStore>,
+    memory: &Arc<dss_memory::MemoryStore>,
+    log_cfg: &dss_core::settings::LogSettings,
+) {
+    use chrono::{Duration, Utc};
+
+    let now = Utc::now();
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let log_before_iso = now - Duration::days(log_cfg.retention_days as i64);
+
+    // 1) 日志 prune（D-T07：按天 + 按量）。
+    let log_stats = logs
+        .prune(
+            log_before_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            log_cfg.max_rows,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "log prune failed");
+            dss_db::repo::PruneStats::default()
+        });
+
+    // 2) memory retention sweep（激活幂等 sweep）。
+    let mem_cfg = dss_memory::retention::RetentionConfig::default();
+    let mem_stale_iso = (now - Duration::days(mem_cfg.stale_days))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mem_stats =
+        dss_memory::retention::sweep(memory.as_ref(), &mem_cfg, &now_iso, &mem_stale_iso).await;
+
+    // 3) 结果写一条 system 日志（observability）。
+    let _ = logs
+        .append(dss_observability::LogEntry {
+            level: "info".into(),
+            source: "system".into(),
+            kind: "retention_sweep".into(),
+            session_id: None,
+            frame_id: None,
+            iteration: None,
+            message: format!(
+                "retention sweep: logs pruned {} (age) + {} (count); memory expired {} demoted {} errors {}",
+                log_stats.by_age,
+                log_stats.by_count,
+                mem_stats.expired,
+                mem_stats.demoted_to_candidate,
+                mem_stats.errors,
+            ),
+            detail: Some(serde_json::json!({
+                "logs_by_age": log_stats.by_age,
+                "logs_by_count": log_stats.by_count,
+                "memory_expired": mem_stats.expired,
+                "memory_demoted": mem_stats.demoted_to_candidate,
+                "memory_errors": mem_stats.errors,
+            })),
+        })
+        .await;
 }
 
 fn initial_a2a_snapshot(revision: u64, configs: &[dss_core::A2aAgentConfig]) -> A2aRuntimeSnapshot {

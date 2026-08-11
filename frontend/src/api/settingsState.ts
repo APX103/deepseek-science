@@ -206,6 +206,8 @@ export function buildSettingsPayload(
       enabled: server.enabled,
     })),
     ...(Object.keys(apiKeys).length > 0 ? { api_keys: apiKeys } : {}),
+    log_retention_days: sanitized.log_retention_days ?? 14,
+    log_max_rows: sanitized.log_max_rows ?? 100_000,
   }
 }
 

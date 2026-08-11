@@ -77,4 +77,16 @@ impl LogStore {
             .await
             .map_err(|e| DbError::Other(format!("log delete interact: {e:?}")))?
     }
+
+    /// 保留策略清理（D-T07：按天 + 按量双限制）。幂等。
+    pub async fn prune(
+        &self,
+        before_iso: String,
+        max_rows: u32,
+    ) -> Result<dss_db::repo::PruneStats, DbError> {
+        let conn = self.pool.get().await.map_err(DbError::Pool)?;
+        conn.interact(move |c| dss_db::repo::prune_logs(c, &before_iso, max_rows))
+            .await
+            .map_err(|e| DbError::Other(format!("log prune interact: {e:?}")))?
+    }
 }

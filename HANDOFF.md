@@ -43,11 +43,15 @@
 | **GUI 测试方案** | ✅ 文档 | `docs/plans/gui-test-guide.md`：10 个前端测试点（T1-T10），含操作/预期/截图检查/排查办法。供能读图的 agent（CodeX）或人工执行。 |
 | skills/templates 真实端点 | ✅ 完成 | GET /api/skills、/api/templates、/api/templates/{id}（dss-api/meta.rs，include_dir!）；前端 listSkills/listTemplates/getTemplate 切真实。curl 实测真实数据。 |
 
-**roadmap 主线已完成**：P0-P8 + F2 + P5b + P2b-gates + 前端接 P3。**40 测试全绿**。剩余收尾项：
-- 前端仍有 Files/Artifacts/Compile/runOnce 走 mock（后端端点已存在，前端未接线）。
-- Settings/MCP 列表前端仍用 localStorage（后端无对应管理端点）。
+**roadmap 主线已完成**：P0-P8 + F2 + P5b + P2b-gates + 前端接 P3。**全量测试绿**。剩余收尾项：
+- ~~前端 Files/Artifacts/Compile/runOnce 走 mock~~ ✅ 已接真实后端。
+- ~~Settings/MCP 列表用 localStorage~~ ✅ 已接后端 `/api/settings`。
+- ~~D-T06 设计 token 校准~~ ✅ 2026-08-11 浏览器实测校准色彩 token（design-system.md 去 ⚠️）。
+- ~~D-T07 日志保留策略~~ ✅ 按天(14)+按量(10万)双限制，启动+每6h sweep（顺带激活 memory retention）。
 - `cargo tauri build` 出完整 .app/.dmg 需用户本地执行。
 - CodeX/人工执行 GUI 测试（`docs/plans/gui-test-guide.md`）。
+- 前端 `mock/data.ts` 死代码清理 + Templates fallback 去 mock（`client.ts:189`）—— 小清理项。
+- D-T 系列 DEFER：D-T01 沙箱 / D-T02 向量索引 / D-T04 DeepSeek 能力（见 decisions.md）。
 
 ## 3. 环境事实（不要重新踩坑）
 
@@ -64,11 +68,12 @@
 
 **主线已实现到 P8**；后续是收尾/加固，不再按 roadmap 顺序推进：
 
-1. **前端 mock 清理**：Files/Artifacts/Compile/runOnce 接真实后端（`listFiles/readFile`、`/compile`、`stream-sse` 已存在，前端未调用）。
-2. **Settings/MCP 管理端点**（可选）：若需要前端与后端共享 settings/MCP server 配置，需补后端 CRUD 端点并替换 localStorage。
+1. ~~前端 mock 清理~~ ✅ 已接真实后端。
+2. ~~Settings/MCP 管理端点~~ ✅ 已接后端 `/api/settings`。
 3. **Tauri 打包验证**：执行 `cargo tauri build`，确认 .app/.dmg 能正常拉起后端+前端。
 4. **GUI 人工测试**：按 `docs/plans/gui-test-guide.md` T1-T10 逐项验证，重点检查多轮工具、会话恢复、plan 审批、PDF 预览。
-5. **P9+ 增强方向**：沙箱化 bash/python、Deepseek 深度集成、文献知识库、学科插件等，按 `docs/roadmap.md` 与 `docs/enhancements.md` 排期。
+5. **前端死代码清理**：`mock/data.ts` + `client.ts` Templates fallback 去 mock（小清理项）。
+6. **P9+ 增强方向**：沙箱化 bash/python（D-T01）、Deepseek 深度集成（D-T04）、文献知识库（D-T02）、学科插件等，按 `docs/roadmap.md` 与 `docs/enhancements.md` 排期。
 
 ## 5. 工作规则（必须遵守）
 

@@ -113,6 +113,10 @@ export interface AppSettings {
   mcp_servers?: McpServer[]
   /** 数据源 API keys（GET 时只能为空值或固定 mask）；旧后端可能不返回。 */
   api_keys_masked?: Record<string, MaskedApiKey>
+  /** 日志保留天数（D-T07）；旧后端可能不返回。 */
+  log_retention_days?: number
+  /** 日志最大条数（D-T07）；旧后端可能不返回。 */
+  log_max_rows?: number
 }
 
 /** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */
@@ -127,6 +131,10 @@ export interface AppSettingsUpdate {
   mcp_servers?: McpServerUpdate[]
   /** 数据源 API keys。mask 占位（••••••••）后端保留旧值；空串清除该 key。 */
   api_keys?: Record<string, string>
+  /** 日志保留天数（D-T07）。 */
+  log_retention_days: number
+  /** 日志最大条数（D-T07）。 */
+  log_max_rows: number
 }
 
 // ---------- MCP ----------
