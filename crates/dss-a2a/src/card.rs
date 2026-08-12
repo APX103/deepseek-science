@@ -13,6 +13,11 @@ const MAX_TENANT_BYTES: usize = 2_048;
 const MAX_CARD_LIST_ITEMS: usize = 256;
 const MAX_MODE_BYTES: usize = 128;
 
+pub const REGISTRY_ENDPOINT_OVERRIDE_WARNING: &str =
+    "registry_endpoint_override_for_wildcard_card_interface";
+pub const REGISTRY_API_KEY_WARNING: &str =
+    "registry_anonymous_override_for_x_api_key_card_requirement";
+
 /// Response media types this client can faithfully expose to the harness and UI.
 ///
 /// The order is the client's preference order and is retained when intersecting it with an
@@ -121,6 +126,213 @@ pub fn parse_agent_card(
     }
 }
 
+/// Parse a card for an explicitly Registry-provenanced anonymous invocation.
+///
+/// The ordinary parser is always attempted first. Compatibility is considered only for a v1
+/// card and retains the original card JSON while narrowly repairing the two observed deployment
+/// inconsistencies: a literal wildcard bind interface and an exact X-API-Key requirement.
+pub(crate) fn parse_registry_agent_card(
+    card_url: &Url,
+    raw: Value,
+    descriptor_endpoint: &Url,
+    allow_loopback_http: bool,
+) -> Result<(ParsedAgentCard, Vec<String>), A2aError> {
+    let allowed_test_endpoint = allow_loopback_http
+        && descriptor_endpoint.scheme() == "http"
+        && descriptor_endpoint
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if descriptor_endpoint.scheme() != "https" && !allowed_test_endpoint {
+        return Err(A2aError::InvalidEndpoint(
+            "Registry-derived A2A endpoints must use HTTPS".into(),
+        ));
+    }
+    if !same_origin(card_url, descriptor_endpoint) {
+        return Err(A2aError::CrossOrigin);
+    }
+    if let Ok(parsed) = parse_agent_card(card_url, raw.clone(), false) {
+        let selected = validate_endpoint(&parsed.selected_interface.url)?;
+        if selected == *descriptor_endpoint {
+            return Ok((parsed, Vec::new()));
+        }
+        return Err(A2aError::UnsupportedCard(
+            "Registry card interface differs from the exact descriptor endpoint".into(),
+        ));
+    }
+    if !raw
+        .as_object()
+        .is_some_and(|object| object.contains_key("supportedInterfaces"))
+    {
+        return parse_agent_card(card_url, raw, false).map(|parsed| (parsed, Vec::new()));
+    }
+    parse_registry_v1_card(card_url, raw, descriptor_endpoint)
+}
+
+fn parse_registry_v1_card(
+    card_url: &Url,
+    raw: Value,
+    descriptor_endpoint: &Url,
+) -> Result<(ParsedAgentCard, Vec<String>), A2aError> {
+    let name = required_string(&raw, "name", 256)?;
+    let description = required_string(&raw, "description", 2_048)?;
+    let agent_version = required_string(&raw, "version", 128)?;
+    validate_v1_capabilities(&raw)?;
+    required_string_array(
+        &raw,
+        "defaultInputModes",
+        MAX_CARD_LIST_ITEMS,
+        MAX_MODE_BYTES,
+    )?;
+    negotiate_output_modes(&raw)?;
+    validate_v1_skills(&raw)?;
+    let api_key_mismatch = validate_registry_anonymous_security(&raw)?;
+
+    let interfaces = raw
+        .get("supportedInterfaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| A2aError::InvalidCard("v1 supportedInterfaces must be an array".into()))?;
+    if interfaces.is_empty() {
+        return Err(A2aError::InvalidCard(
+            "v1 supportedInterfaces must not be empty".into(),
+        ));
+    }
+    for (index, interface) in interfaces.iter().enumerate() {
+        validate_v1_interface_fields(interface, index)?;
+    }
+
+    let mut selected = None;
+    for interface in interfaces {
+        if let Some(candidate) =
+            parse_registry_v1_interface(card_url, interface, descriptor_endpoint)?
+        {
+            selected = Some(candidate);
+            break;
+        }
+    }
+    let (selected_interface, endpoint_repaired) = selected.ok_or_else(|| {
+        A2aError::UnsupportedCard("expected JSONRPC or HTTP+JSON with protocolVersion 1.0".into())
+    })?;
+
+    let mut warnings = Vec::with_capacity(2);
+    if endpoint_repaired {
+        warnings.push(REGISTRY_ENDPOINT_OVERRIDE_WARNING.to_string());
+    }
+    if api_key_mismatch {
+        warnings.push(REGISTRY_API_KEY_WARNING.to_string());
+    }
+    Ok((
+        ParsedAgentCard {
+            summary: CardSummary {
+                name,
+                description,
+                agent_version,
+                protocol_version: ProtocolVersion::V1,
+                streaming: raw
+                    .pointer("/capabilities/streaming")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                skills: parse_skills(&raw),
+            },
+            selected_interface,
+            raw,
+        },
+        warnings,
+    ))
+}
+
+fn parse_registry_v1_interface(
+    card_url: &Url,
+    value: &Value,
+    descriptor_endpoint: &Url,
+) -> Result<Option<(SelectedInterface, bool)>, A2aError> {
+    let object = value.as_object().ok_or_else(|| {
+        A2aError::InvalidCard("v1 supportedInterfaces entries must be objects".into())
+    })?;
+    if object.get("protocolVersion").and_then(Value::as_str) != Some("1.0") {
+        return Ok(None);
+    }
+    let binding = match object.get("protocolBinding").and_then(Value::as_str) {
+        Some("JSONRPC") => ProtocolBinding::JsonRpc,
+        Some("HTTP+JSON") => ProtocolBinding::HttpJson,
+        _ => return Ok(None),
+    };
+    let advertised = object
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| A2aError::InvalidCard("interface URL must be a string".into()))?;
+    let advertised = validate_endpoint(advertised)?;
+    let (effective, repaired) = if advertised == *descriptor_endpoint {
+        (advertised, false)
+    } else if is_literal_wildcard_interface(&advertised)
+        && advertised.path() == descriptor_endpoint.path()
+        && advertised.query() == descriptor_endpoint.query()
+    {
+        (descriptor_endpoint.clone(), true)
+    } else if same_origin(card_url, &advertised) {
+        return Err(A2aError::UnsupportedCard(
+            "Registry card interface differs from the exact descriptor endpoint".into(),
+        ));
+    } else {
+        return Err(A2aError::CrossOrigin);
+    };
+    let tenant = parse_interface_tenant(object)?;
+    Ok(Some((
+        SelectedInterface {
+            url: effective.to_string(),
+            binding,
+            protocol_version: ProtocolVersion::V1,
+            tenant,
+        },
+        repaired,
+    )))
+}
+
+fn is_literal_wildcard_interface(url: &Url) -> bool {
+    matches!(url.host_str(), Some("0.0.0.0" | "::" | "[::]"))
+}
+
+fn validate_registry_anonymous_security(raw: &Value) -> Result<bool, A2aError> {
+    let Some(requirements) = raw.get("securityRequirements") else {
+        return Ok(false);
+    };
+    let requirements = requirements
+        .as_array()
+        .ok_or_else(|| A2aError::InvalidCard("securityRequirements must be an array".into()))?;
+    if requirements.is_empty() || requirements.iter().any(requirement_is_empty) {
+        return Ok(false);
+    }
+    let schemes = raw.get("securitySchemes").and_then(Value::as_object);
+    let exact_api_key_only = requirements.iter().all(|requirement| {
+        requirement_names(requirement).is_some_and(|names| {
+            names.len() == 1
+                && schemes
+                    .and_then(|schemes| schemes.get(names[0]))
+                    .is_some_and(is_exact_registry_api_key_scheme)
+        })
+    });
+    if exact_api_key_only {
+        Ok(true)
+    } else {
+        Err(A2aError::UnsupportedCard(
+            "Registry-anonymous compatibility only tolerates the confirmed X-API-Key card requirement"
+                .into(),
+        ))
+    }
+}
+
+fn is_exact_registry_api_key_scheme(value: &Value) -> bool {
+    value
+        .pointer("/apiKeySecurityScheme/in")
+        .and_then(Value::as_str)
+        == Some("header")
+        && value
+            .pointer("/apiKeySecurityScheme/name")
+            .and_then(Value::as_str)
+            == Some("X-API-Key")
+}
+
 fn parse_v1_card(
     card_url: &Url,
     raw: Value,
@@ -199,7 +411,19 @@ fn parse_v1_interface(
         _ => return Ok(None),
     };
     let url = parse_interface_url(card_url, object.get("url"))?;
-    let tenant = match object.get("tenant") {
+    let tenant = parse_interface_tenant(object)?;
+    Ok(Some(SelectedInterface {
+        url: url.to_string(),
+        binding,
+        protocol_version: ProtocolVersion::V1,
+        tenant,
+    }))
+}
+
+fn parse_interface_tenant(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, A2aError> {
+    Ok(match object.get("tenant") {
         None | Some(Value::Null) => None,
         Some(Value::String(value))
             if value.len() <= MAX_TENANT_BYTES && !value.chars().any(char::is_control) =>
@@ -218,13 +442,7 @@ fn parse_v1_interface(
                 "interface tenant must be a string".into(),
             ))
         }
-    };
-    Ok(Some(SelectedInterface {
-        url: url.to_string(),
-        binding,
-        protocol_version: ProtocolVersion::V1,
-        tenant,
-    }))
+    })
 }
 
 fn validate_v1_interface_fields(value: &Value, index: usize) -> Result<(), A2aError> {
@@ -805,6 +1023,110 @@ mod tests {
             "required": false
         }]);
         assert!(parse_agent_card(&card_url, optional, false).is_ok());
+    }
+
+    #[test]
+    fn registry_policy_narrowly_repairs_wildcard_and_exact_api_key_metadata() {
+        let card_url =
+            Url::parse("https://agent.example.test/.well-known/agent-card.json").unwrap();
+        let descriptor = Url::parse("https://agent.example.test/a2a").unwrap();
+        for wildcard in ["http://0.0.0.0:8888/a2a", "http://[::]:8888/a2a"] {
+            let mut card = valid_v1_card();
+            card["supportedInterfaces"][0]["url"] = Value::String(wildcard.into());
+            card["securitySchemes"] = json!({
+                "apiKey": {
+                    "apiKeySecurityScheme": {"in":"header", "name":"X-API-Key"}
+                }
+            });
+            card["securityRequirements"] = json!([{"schemes":{"apiKey":{}}}]);
+
+            assert!(parse_agent_card(&card_url, card.clone(), false).is_err());
+            let (parsed, warnings) =
+                parse_registry_agent_card(&card_url, card, &descriptor, false).unwrap();
+            assert_eq!(parsed.selected_interface.url, descriptor.as_str());
+            assert_eq!(
+                parsed.raw.pointer("/supportedInterfaces/0/url"),
+                Some(&Value::String(wildcard.into()))
+            );
+            assert_eq!(
+                warnings,
+                vec![REGISTRY_ENDPOINT_OVERRIDE_WARNING, REGISTRY_API_KEY_WARNING]
+            );
+        }
+    }
+
+    #[test]
+    fn registry_policy_prefers_a_canonical_strict_card_without_warnings() {
+        let card_url = Url::parse("https://example.test/.well-known/agent-card.json").unwrap();
+        let descriptor = Url::parse("https://example.test/rpc").unwrap();
+        let card = valid_v1_card();
+        let strict = parse_agent_card(&card_url, card.clone(), false).unwrap();
+        let (registry, warnings) =
+            parse_registry_agent_card(&card_url, card, &descriptor, false).unwrap();
+        assert_eq!(registry, strict);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn registry_policy_rejects_a_canonical_same_origin_interface_at_a_different_path() {
+        let card_url = Url::parse("https://example.test/.well-known/agent-card.json").unwrap();
+        let descriptor = Url::parse("https://example.test/a2a").unwrap();
+        let error =
+            parse_registry_agent_card(&card_url, valid_v1_card(), &descriptor, false).unwrap_err();
+        assert!(
+            matches!(error, A2aError::UnsupportedCard(message) if message.contains("exact descriptor endpoint"))
+        );
+    }
+
+    #[test]
+    fn registry_policy_rejects_cross_origin_path_query_and_auth_expansion() {
+        let card_url =
+            Url::parse("https://agent.example.test/.well-known/agent-card.json").unwrap();
+        let descriptor = Url::parse("https://agent.example.test/a2a").unwrap();
+
+        let mut non_wildcard = valid_v1_card();
+        non_wildcard["supportedInterfaces"][0]["url"] =
+            Value::String("https://other.example.test/a2a".into());
+        assert_eq!(
+            parse_registry_agent_card(&card_url, non_wildcard, &descriptor, false).unwrap_err(),
+            A2aError::CrossOrigin
+        );
+
+        for advertised in [
+            "http://127.0.0.1:8888/a2a",
+            "http://0.0.0.0:8888/other",
+            "http://0.0.0.0:8888/a2a?tenant=other",
+        ] {
+            let mut card = valid_v1_card();
+            card["supportedInterfaces"][0]["url"] = Value::String(advertised.into());
+            assert_eq!(
+                parse_registry_agent_card(&card_url, card, &descriptor, false).unwrap_err(),
+                A2aError::CrossOrigin,
+                "advertised interface {advertised} should fail closed"
+            );
+        }
+
+        let other_card_url =
+            Url::parse("https://card.example.test/.well-known/agent-card.json").unwrap();
+        assert_eq!(
+            parse_registry_agent_card(&other_card_url, valid_v1_card(), &descriptor, false)
+                .unwrap_err(),
+            A2aError::CrossOrigin
+        );
+
+        for scheme in [
+            json!({"httpAuthSecurityScheme":{"scheme":"Bearer"}}),
+            json!({"apiKeySecurityScheme":{"in":"header", "name":"X-Other-Key"}}),
+        ] {
+            let mut card = valid_v1_card();
+            card["supportedInterfaces"][0]["url"] = Value::String("http://0.0.0.0:8888/a2a".into());
+            card["securitySchemes"] = json!({"required": scheme});
+            card["securityRequirements"] = json!([{"schemes":{"required":{}}}]);
+            assert!(matches!(
+                parse_registry_agent_card(&card_url, card, &descriptor, false),
+                Err(A2aError::UnsupportedCard(_))
+            ));
+        }
     }
 
     #[test]

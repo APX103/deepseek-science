@@ -3,6 +3,9 @@ name = "dss-a2a"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 base64 = "0.22"
 chrono.workspace = true

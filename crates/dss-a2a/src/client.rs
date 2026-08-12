@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use base64::Engine;
@@ -13,22 +14,26 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::card::{
-    negotiate_output_modes, parse_agent_card, resolve_agent_card_url, CardRefreshKind,
+    negotiate_output_modes, parse_agent_card, parse_registry_agent_card, resolve_agent_card_url,
+    CardRefreshKind,
 };
 use crate::protocol::{
     build_cancel_task, build_get_task, build_send, parse_cancel_task_response,
-    parse_get_task_response, parse_send_response, OutboundOperation, ResponseMeaning,
-    TaskDisposition,
+    parse_get_task_response, parse_registry_send_response, parse_send_response, OutboundOperation,
+    ResponseMeaning, TaskDisposition,
 };
 use crate::result::{
     A2aAgentRef, A2aRequestRecord, A2aTerminal, A2aToolResult, ResponseFrame, TerminalKind,
-    A2A_RESULT_SCHEMA,
+    A2A_RESULT_SCHEMA, REGISTRY_DIRECT_TASK_WARNING,
 };
 use crate::types::{
-    validate_config, InvokeAction, InvokeRequest, ProtocolBinding, ProtocolVersion, MAX_CARD_BYTES,
-    MAX_RESPONSE_BYTES, MAX_TOTAL_RESPONSE_BYTES,
+    validate_config, A2aRouteOptions, InvokeAction, InvokeRequest, ProtocolBinding,
+    ProtocolVersion, RegistryInvocationPolicy, MAX_CARD_BYTES, MAX_RESPONSE_BYTES,
+    MAX_TOTAL_RESPONSE_BYTES,
 };
 use crate::{A2aError, CardSnapshot, SelectedInterface};
+
+const MAX_REGISTRY_RESOLVED_ADDRESSES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct A2aClientOptions {
@@ -55,6 +60,7 @@ impl Default for A2aClientOptions {
 pub struct A2aClient {
     http: reqwest::Client,
     options: A2aClientOptions,
+    route_options: A2aRouteOptions,
 }
 
 impl std::fmt::Debug for A2aClient {
@@ -71,12 +77,102 @@ impl A2aClient {
     }
 
     pub fn with_options(options: A2aClientOptions) -> Result<Self, A2aError> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(options.connect_timeout)
-            .build()
-            .map_err(A2aError::transport)?;
-        Ok(Self { http, options })
+        Self::with_options_and_route_options(options, A2aRouteOptions::default())
+    }
+
+    pub fn with_route_options(route_options: A2aRouteOptions) -> Result<Self, A2aError> {
+        Self::with_options_and_route_options(A2aClientOptions::default(), route_options)
+    }
+
+    pub fn with_options_and_route_options(
+        options: A2aClientOptions,
+        route_options: A2aRouteOptions,
+    ) -> Result<Self, A2aError> {
+        validate_route_options(&route_options)?;
+        let http = build_http_client(&options, &route_options, None)?;
+        Ok(Self {
+            http,
+            options,
+            route_options,
+        })
+    }
+
+    async fn registry_pinned_client(
+        &self,
+        policy: &RegistryInvocationPolicy,
+        deadline: Instant,
+    ) -> Result<Self, A2aError> {
+        let endpoint = policy.descriptor_endpoint();
+        let host = endpoint
+            .host_str()
+            .ok_or_else(|| A2aError::InvalidEndpoint("endpoint has no host".into()))?;
+        let addresses = self.resolve_registry_addresses(policy, deadline).await?;
+        ensure_before_deadline(deadline)?;
+        let http = build_http_client(&self.options, &self.route_options, Some((host, &addresses)))?;
+        ensure_before_deadline(deadline)?;
+        Ok(Self {
+            http,
+            options: self.options.clone(),
+            route_options: self.route_options.clone(),
+        })
+    }
+
+    async fn resolve_registry_addresses(
+        &self,
+        policy: &RegistryInvocationPolicy,
+        deadline: Instant,
+    ) -> Result<Vec<SocketAddr>, A2aError> {
+        ensure_before_deadline(deadline)?;
+        let endpoint = policy.descriptor_endpoint();
+        let host = endpoint
+            .host_str()
+            .ok_or_else(|| A2aError::InvalidEndpoint("endpoint has no host".into()))?;
+        let port = endpoint.port_or_known_default().ok_or_else(|| {
+            A2aError::InvalidEndpoint("Registry endpoint has no usable port".into())
+        })?;
+
+        if policy.allows_loopback_http() {
+            let address = parse_ip_literal(host)
+                .filter(IpAddr::is_loopback)
+                .ok_or_else(|| {
+                    A2aError::InvalidEndpoint(
+                        "test Registry endpoint is not a literal loopback address".into(),
+                    )
+                })?;
+            return Ok(vec![SocketAddr::new(address, port)]);
+        }
+
+        if let Some(address) =
+            self.route_options
+                .resolve
+                .iter()
+                .find_map(|(route_host, address)| {
+                    route_host.eq_ignore_ascii_case(host).then_some(*address)
+                })
+        {
+            let addresses = vec![address];
+            validate_registry_public_addresses(&addresses)?;
+            ensure_before_deadline(deadline)?;
+            return Ok(addresses);
+        }
+
+        let lookup_timeout = timeout_within_deadline(self.options.connect_timeout, deadline)?;
+        let lookup = tokio::time::timeout(lookup_timeout, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| A2aError::Timeout)?
+            .map_err(|_| A2aError::transport("Registry endpoint DNS lookup failed"))?;
+        let mut addresses: Vec<SocketAddr> =
+            lookup.take(MAX_REGISTRY_RESOLVED_ADDRESSES + 1).collect();
+        if addresses.len() > MAX_REGISTRY_RESOLVED_ADDRESSES {
+            return Err(A2aError::InvalidEndpoint(format!(
+                "Registry endpoint resolved to more than {MAX_REGISTRY_RESOLVED_ADDRESSES} addresses"
+            )));
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        validate_registry_public_addresses(&addresses)?;
+        ensure_before_deadline(deadline)?;
+        Ok(addresses)
     }
 
     /// Perform a real conditional HTTP revalidation of the configured Agent Card.
@@ -88,22 +184,49 @@ impl A2aClient {
         config: &A2aAgentConfig,
         cached: Option<&CardSnapshot>,
     ) -> Result<CardSnapshot, A2aError> {
+        self.refresh_card_with_policy(config, cached, None, None)
+            .await
+            .map(|(card, _warnings)| card)
+    }
+
+    async fn refresh_card_with_policy(
+        &self,
+        config: &A2aAgentConfig,
+        cached: Option<&CardSnapshot>,
+        registry_policy: Option<&RegistryInvocationPolicy>,
+        deadline: Option<Instant>,
+    ) -> Result<(CardSnapshot, Vec<String>), A2aError> {
         validate_config(config)?;
+        if let Some(policy) = registry_policy {
+            policy.validate_config_binding(config)?;
+        }
         let card_url = resolve_agent_card_url(&config.endpoint)?;
+        let request_timeout = match deadline {
+            Some(deadline) => timeout_within_deadline(self.options.card_timeout, deadline)?,
+            None => self.options.card_timeout,
+        };
         let mut request = self
             .http
             .get(card_url.clone())
             .header(CACHE_CONTROL, "no-cache")
             .header(ACCEPT, "application/json")
-            .timeout(self.options.card_timeout);
+            .timeout(request_timeout);
         if let Some(token) = config.bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
         if let Some(cached) = cached.filter(|cached| cached.card_url == card_url.as_str()) {
-            if let Some(etag) = cached.etag.as_deref().and_then(header_value) {
+            if let Some(etag) = cached
+                .etag
+                .as_deref()
+                .and_then(|value| conditional_header_value(value, config.bearer_token.as_deref()))
+            {
                 request = request.header(IF_NONE_MATCH, etag);
             }
-            if let Some(last_modified) = cached.last_modified.as_deref().and_then(header_value) {
+            if let Some(last_modified) = cached
+                .last_modified
+                .as_deref()
+                .and_then(|value| conditional_header_value(value, config.bearer_token.as_deref()))
+            {
                 request = request.header(IF_MODIFIED_SINCE, last_modified);
             }
         }
@@ -121,23 +244,27 @@ impl A2aClient {
             let mut refreshed = cached.clone();
             // A persisted cache may have been validated by an older application version. Re-run
             // current validation on 304 so newly enforced card requirements cannot be bypassed.
-            let parsed = parse_agent_card(
-                &card_url,
-                cached.raw.clone(),
-                config
-                    .bearer_token
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty()),
-            )?;
+            let (parsed, warnings) =
+                parse_card_for_policy(&card_url, cached.raw.clone(), config, registry_policy)?;
             refreshed.fetched_at = Utc::now().to_rfc3339();
             refreshed.refresh_kind = CardRefreshKind::NotModified;
-            refreshed.etag = header_string(headers, ETAG).or_else(|| cached.etag.clone());
+            refreshed.etag = safe_validator_header(headers, ETAG, config.bearer_token.as_deref())
+                .or_else(|| {
+                    cached.etag.clone().filter(|value| {
+                        !contains_bearer_token(value, config.bearer_token.as_deref())
+                    })
+                });
             refreshed.last_modified =
-                header_string(headers, LAST_MODIFIED).or_else(|| cached.last_modified.clone());
+                safe_validator_header(headers, LAST_MODIFIED, config.bearer_token.as_deref())
+                    .or_else(|| {
+                        cached.last_modified.clone().filter(|value| {
+                            !contains_bearer_token(value, config.bearer_token.as_deref())
+                        })
+                    });
             refreshed.summary = parsed.summary;
             refreshed.selected_interface = parsed.selected_interface;
             refreshed.raw = parsed.raw;
-            return Ok(refreshed);
+            return Ok((refreshed, warnings));
         }
         if response.status().is_redirection() {
             return Err(A2aError::card_refresh(
@@ -163,25 +290,25 @@ impl A2aClient {
         let mut raw: Value = serde_json::from_slice(&bytes)
             .map_err(|error| A2aError::InvalidCard(format!("invalid JSON: {error}")))?;
         redact_value(&mut raw, config.bearer_token.as_deref());
-        let parsed = parse_agent_card(
-            &card_url,
-            raw,
-            config
-                .bearer_token
-                .as_deref()
-                .is_some_and(|v| !v.is_empty()),
-        )?;
-        Ok(CardSnapshot {
-            card_url: card_url.to_string(),
-            fetched_at: Utc::now().to_rfc3339(),
-            sha256: sha256_hex(&bytes),
-            refresh_kind: CardRefreshKind::Modified,
-            etag: header_string(&headers, ETAG),
-            last_modified: header_string(&headers, LAST_MODIFIED),
-            summary: parsed.summary,
-            selected_interface: parsed.selected_interface,
-            raw: parsed.raw,
-        })
+        let (parsed, warnings) = parse_card_for_policy(&card_url, raw, config, registry_policy)?;
+        Ok((
+            CardSnapshot {
+                card_url: card_url.to_string(),
+                fetched_at: Utc::now().to_rfc3339(),
+                sha256: sha256_hex(&bytes),
+                refresh_kind: CardRefreshKind::Modified,
+                etag: safe_validator_header(&headers, ETAG, config.bearer_token.as_deref()),
+                last_modified: safe_validator_header(
+                    &headers,
+                    LAST_MODIFIED,
+                    config.bearer_token.as_deref(),
+                ),
+                summary: parsed.summary,
+                selected_interface: parsed.selected_interface,
+                raw: parsed.raw,
+            },
+            warnings,
+        ))
     }
 
     /// Refresh the card exactly once, then execute the requested send/submit/GetTask action.
@@ -195,14 +322,67 @@ impl A2aClient {
         cached: Option<&CardSnapshot>,
         request: InvokeRequest,
     ) -> A2aToolResult {
+        self.invoke_with_policy(config, cached, request, None, None)
+            .await
+    }
+
+    /// Invoke an Agent through an exact, anonymously callable Registry descriptor endpoint.
+    ///
+    /// This is the only entry point that enables Registry compatibility. It never sends A2A
+    /// credentials and records each compatibility decision in `A2aToolResult::warnings`.
+    pub async fn invoke_registry_anonymous(
+        &self,
+        config: &A2aAgentConfig,
+        cached: Option<&CardSnapshot>,
+        policy: &RegistryInvocationPolicy,
+        request: InvokeRequest,
+    ) -> A2aToolResult {
+        if let Err(error) = validate_config(config)
+            .and_then(|_| request.validate())
+            .and_then(|_| policy.validate_config_binding(config))
+        {
+            return invocation_preflight_error(
+                config,
+                &request,
+                TerminalKind::ProtocolError,
+                redact_text(&error.to_string(), config),
+            );
+        }
+        let timeout_seconds = effective_timeout_seconds(config, &request);
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        let pinned = match self.registry_pinned_client(policy, deadline).await {
+            Ok(client) => client,
+            Err(error) => {
+                let kind = registry_preflight_terminal_kind(&error);
+                return invocation_preflight_error(
+                    config,
+                    &request,
+                    kind,
+                    format!(
+                        "Registry endpoint validation failed before HTTP access: {}",
+                        redact_text(&error.to_string(), config)
+                    ),
+                );
+            }
+        };
+        pinned
+            .invoke_with_policy(config, cached, request, Some(policy), Some(deadline))
+            .await
+    }
+
+    async fn invoke_with_policy(
+        &self,
+        config: &A2aAgentConfig,
+        cached: Option<&CardSnapshot>,
+        request: InvokeRequest,
+        registry_policy: Option<&RegistryInvocationPolicy>,
+        deadline: Option<Instant>,
+    ) -> A2aToolResult {
         let invocation_id = Uuid::new_v4().to_string();
         let message_id = matches!(request.action, InvokeAction::Send | InvokeAction::Submit)
             .then(|| Uuid::new_v4().to_string());
         // A model-provided override may tighten the user's configured budget, never expand it.
-        let timeout_seconds = request
-            .timeout_seconds
-            .unwrap_or(config.timeout_seconds)
-            .min(config.timeout_seconds);
+        let timeout_seconds = effective_timeout_seconds(config, &request);
         let mut result = empty_result(
             config,
             &request,
@@ -210,7 +390,14 @@ impl A2aClient {
             message_id.clone(),
             timeout_seconds,
         );
-        if let Err(error) = validate_config(config).and_then(|_| request.validate()) {
+        let validation = validate_config(config)
+            .and_then(|_| request.validate())
+            .and_then(|_| {
+                registry_policy
+                    .map(|policy| policy.validate_config_binding(config))
+                    .unwrap_or(Ok(()))
+            });
+        if let Err(error) = validation {
             result.terminal = A2aTerminal::error(
                 TerminalKind::ProtocolError,
                 redact_text(&error.to_string(), config),
@@ -218,28 +405,43 @@ impl A2aClient {
             return result;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
-        let refresh_timeout = remaining(deadline).min(self.options.card_timeout);
-        let card =
-            match tokio::time::timeout(refresh_timeout, self.refresh_card(config, cached)).await {
-                Ok(Ok(card)) => card,
-                Ok(Err(error)) => {
-                    result.terminal = A2aTerminal::error(
-                        TerminalKind::CardRefreshError,
-                        redact_text(&error.to_string(), config),
-                    );
-                    return result;
-                }
-                Err(_) => {
-                    result.terminal = A2aTerminal::error(
-                        TerminalKind::CardRefreshError,
-                        "Agent Card refresh timed out",
-                    );
-                    return result;
-                }
-            };
+        let deadline =
+            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(timeout_seconds));
+        let refresh_timeout = match timeout_within_deadline(self.options.card_timeout, deadline) {
+            Ok(timeout) => timeout,
+            Err(_) => {
+                result.terminal = A2aTerminal::error(
+                    TerminalKind::CardRefreshError,
+                    "Agent Card refresh timed out",
+                );
+                return result;
+            }
+        };
+        let (card, card_warnings) = match tokio::time::timeout(
+            refresh_timeout,
+            self.refresh_card_with_policy(config, cached, registry_policy, Some(deadline)),
+        )
+        .await
+        {
+            Ok(Ok(card)) => card,
+            Ok(Err(error)) => {
+                result.terminal = A2aTerminal::error(
+                    TerminalKind::CardRefreshError,
+                    redact_text(&error.to_string(), config),
+                );
+                return result;
+            }
+            Err(_) => {
+                result.terminal = A2aTerminal::error(
+                    TerminalKind::CardRefreshError,
+                    "Agent Card refresh timed out",
+                );
+                return result;
+            }
+        };
         let interface = card.selected_interface.clone();
         result.card = Some(card);
+        result.warnings.extend(card_warnings);
 
         let mut meaning = match request.action {
             InvokeAction::Send | InvokeAction::Submit => {
@@ -304,23 +506,39 @@ impl A2aClient {
                 }
                 let send_frame = result.responses.last().expect("send frame was just pushed");
                 if !(200..300).contains(&send_frame.http_status) {
-                    result.terminal = A2aTerminal::error(
-                        TerminalKind::ProtocolError,
-                        format!("SendMessage returned HTTP {}", send_frame.http_status),
+                    result.terminal = operation_http_error(
+                        "SendMessage",
+                        send_frame.http_status,
+                        registry_policy.is_some(),
                     );
                     return result;
                 }
-                let meaning = match parse_send_response(
-                    &interface,
-                    &send_frame.payload,
-                    send_frame.request_id.as_deref(),
-                ) {
-                    Ok(meaning) => meaning,
+                let parsed = if registry_policy.is_some() {
+                    parse_registry_send_response(
+                        &interface,
+                        &send_frame.payload,
+                        send_frame.request_id.as_deref(),
+                    )
+                } else {
+                    parse_send_response(
+                        &interface,
+                        &send_frame.payload,
+                        send_frame.request_id.as_deref(),
+                    )
+                    .map(|meaning| (meaning, false))
+                };
+                let (meaning, direct_task_fallback) = match parsed {
+                    Ok(parsed) => parsed,
                     Err(error) => {
                         result.terminal = protocol_terminal(error, config);
                         return result;
                     }
                 };
+                if direct_task_fallback {
+                    result
+                        .warnings
+                        .push(REGISTRY_DIRECT_TASK_WARNING.to_string());
+                }
                 match meaning {
                     ResponseMeaning::Task {
                         task_id,
@@ -385,6 +603,7 @@ impl A2aClient {
                         None,
                         &invocation_id,
                         deadline,
+                        registry_policy.is_some(),
                     )
                     .await
                 {
@@ -410,6 +629,7 @@ impl A2aClient {
                         request.context_id.as_deref(),
                         &cancel_request_id,
                         deadline,
+                        registry_policy.is_some(),
                     )
                     .await
                 {
@@ -520,6 +740,7 @@ impl A2aClient {
                                 Some(state),
                                 &get_request_id,
                                 deadline,
+                                registry_policy.is_some(),
                             )
                             .await
                         {
@@ -546,6 +767,7 @@ impl A2aClient {
         state: Option<&str>,
         request_id: &str,
         deadline: Instant,
+        registry_anonymous: bool,
     ) -> Result<ResponseMeaning, A2aTerminal> {
         let operation = build_get_task(interface, task_id, request_id).map_err(|error| {
             task_error_terminal(
@@ -599,13 +821,14 @@ impl A2aClient {
             .last()
             .expect("GetTask frame was just pushed");
         if !(200..300).contains(&frame.http_status) {
-            return Err(task_error_terminal(
-                TerminalKind::ProtocolError,
-                task_id,
-                context_id,
-                state,
-                format!("GetTask returned HTTP {}", frame.http_status),
-            ));
+            let operation_error =
+                operation_http_error("GetTask", frame.http_status, registry_anonymous);
+            return Err(A2aTerminal {
+                task_id: Some(task_id.into()),
+                context_id: context_id.map(str::to_string),
+                state: state.map(str::to_string),
+                ..operation_error
+            });
         }
         match parse_get_task_response(interface, &frame.payload, frame.request_id.as_deref()) {
             Ok(ResponseMeaning::Task {
@@ -677,6 +900,7 @@ impl A2aClient {
         context_id: Option<&str>,
         request_id: &str,
         deadline: Instant,
+        registry_anonymous: bool,
     ) -> Result<ResponseMeaning, A2aTerminal> {
         let operation = build_cancel_task(interface, task_id, request_id).map_err(|error| {
             task_error_terminal(
@@ -733,13 +957,13 @@ impl A2aClient {
             .last()
             .expect("CancelTask frame was just pushed");
         if !(200..300).contains(&frame.http_status) {
-            return Err(task_error_terminal(
-                TerminalKind::ProtocolError,
-                task_id,
-                context_id,
-                None,
-                format!("CancelTask returned HTTP {}", frame.http_status),
-            ));
+            let operation_error =
+                operation_http_error("CancelTask", frame.http_status, registry_anonymous);
+            return Err(A2aTerminal {
+                task_id: Some(task_id.into()),
+                context_id: context_id.map(str::to_string),
+                ..operation_error
+            });
         }
         match parse_cancel_task_response(interface, &frame.payload, frame.request_id.as_deref()) {
             Ok(ResponseMeaning::Task {
@@ -867,6 +1091,246 @@ impl A2aClient {
     }
 }
 
+fn registry_preflight_terminal_kind(error: &A2aError) -> TerminalKind {
+    match error {
+        A2aError::Timeout => TerminalKind::Timeout,
+        A2aError::Transport(_) => TerminalKind::TransportError,
+        _ => TerminalKind::CardRefreshError,
+    }
+}
+
+fn build_http_client(
+    options: &A2aClientOptions,
+    route_options: &A2aRouteOptions,
+    pinned: Option<(&str, &[SocketAddr])>,
+) -> Result<reqwest::Client, A2aError> {
+    if pinned.is_some_and(|(_, addresses)| addresses.is_empty()) {
+        return Err(A2aError::InvalidEndpoint(
+            "Registry endpoint has no validated addresses".into(),
+        ));
+    }
+    let routed =
+        route_options.interface.is_some() || !route_options.resolve.is_empty() || pinned.is_some();
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(options.connect_timeout);
+    if routed {
+        // A proxy can resolve the target hostname again and defeat an explicit host pin or
+        // interface route. Explicit routing therefore always creates a direct-only client.
+        builder = builder.no_proxy();
+    }
+    if let Some(interface) = route_options.interface.as_deref() {
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        ))]
+        {
+            builder = builder.interface(interface);
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )))]
+        {
+            let _ = interface;
+            return Err(A2aError::InvalidConfig(
+                "network interface routing is unsupported on this platform".into(),
+            ));
+        }
+    }
+    for (host, address) in &route_options.resolve {
+        builder = builder.resolve(host, *address);
+    }
+    if let Some((host, addresses)) = pinned {
+        // This is applied last so the one invocation's validated DNS set supersedes any original
+        // route entry for that hostname while retaining the URL hostname for TLS SNI and Host.
+        builder = builder.resolve_to_addrs(host, addresses);
+    }
+    builder.build().map_err(A2aError::transport)
+}
+
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+fn validate_registry_public_addresses(addresses: &[SocketAddr]) -> Result<(), A2aError> {
+    if addresses.is_empty() {
+        return Err(A2aError::InvalidEndpoint(
+            "Registry endpoint DNS resolution returned no addresses".into(),
+        ));
+    }
+    if addresses
+        .iter()
+        .any(|address| !is_public_registry_ip(address.ip()))
+    {
+        return Err(A2aError::InvalidEndpoint(
+            "Registry endpoint did not resolve exclusively to public addresses".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_public_registry_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(ipv4) = ip.to_ipv4() {
+                return is_public_registry_ip(IpAddr::V4(ipv4));
+            }
+            let segments = ip.segments();
+            let allocated_global_unicast = (segments[0] & 0xe000) == 0x2000;
+            allocated_global_unicast
+                && !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                && (segments[0] & 0xffc0) != 0xfec0
+                // IETF protocol assignments, including Teredo and benchmarking.
+                && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                // Deprecated transition and retired/documentation allocations.
+                && segments[0] != 0x2002
+                && segments[0] != 0x3ffe
+                && !(segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
+        }
+    }
+}
+
+fn validate_route_options(route_options: &A2aRouteOptions) -> Result<(), A2aError> {
+    if route_options.interface.as_deref().is_some_and(|interface| {
+        interface.is_empty()
+            || interface.len() > 128
+            || interface.trim() != interface
+            || interface.chars().any(char::is_whitespace)
+    }) {
+        return Err(A2aError::InvalidConfig(
+            "network interface must contain 1 to 128 safe bytes".into(),
+        ));
+    }
+    if route_options.resolve.len() > 64 {
+        return Err(A2aError::InvalidConfig(
+            "at most 64 route host overrides are supported".into(),
+        ));
+    }
+    let mut normalized_hosts = std::collections::HashSet::new();
+    for host in route_options.resolve.keys() {
+        if host.is_empty()
+            || host.len() > 253
+            || host.trim() != host
+            || host.chars().any(char::is_control)
+            || host
+                .chars()
+                .any(|character| character.is_whitespace() || "/:@?#[]".contains(character))
+        {
+            return Err(A2aError::InvalidConfig(
+                "route override host must be a bare hostname or IP literal".into(),
+            ));
+        }
+        if !normalized_hosts.insert(host.to_ascii_lowercase()) {
+            return Err(A2aError::InvalidConfig(
+                "route override hosts must be unique ignoring ASCII case".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_card_for_policy(
+    card_url: &reqwest::Url,
+    raw: Value,
+    config: &A2aAgentConfig,
+    registry_policy: Option<&RegistryInvocationPolicy>,
+) -> Result<(crate::ParsedAgentCard, Vec<String>), A2aError> {
+    match registry_policy {
+        Some(policy) => parse_registry_agent_card(
+            card_url,
+            raw,
+            policy.descriptor_endpoint(),
+            policy.allows_loopback_http(),
+        ),
+        None => parse_agent_card(
+            card_url,
+            raw,
+            config
+                .bearer_token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty()),
+        )
+        .map(|parsed| (parsed, Vec::new())),
+    }
+}
+
+fn operation_http_error(operation: &str, status: u16, registry_anonymous: bool) -> A2aTerminal {
+    let message = if registry_anonymous && matches!(status, 401 | 403) {
+        format!(
+            "Registry descriptor declared anonymous access, but {operation} returned HTTP {status}; no credentials were sent and the request was not retried"
+        )
+    } else {
+        format!("{operation} returned HTTP {status}")
+    };
+    A2aTerminal::error(TerminalKind::ProtocolError, message)
+}
+
+fn invocation_preflight_error(
+    config: &A2aAgentConfig,
+    request: &InvokeRequest,
+    kind: TerminalKind,
+    message: impl Into<String>,
+) -> A2aToolResult {
+    let invocation_id = Uuid::new_v4().to_string();
+    let timeout_seconds = effective_timeout_seconds(config, request);
+    // Preflight failures happen before constructing or sending a Message. Keep
+    // `message_id` absent so persisted/UI evidence cannot imply a remote side effect.
+    let mut result = empty_result(config, request, invocation_id, None, timeout_seconds);
+    result.terminal = A2aTerminal::error(kind, message);
+    result
+}
+
+fn effective_timeout_seconds(config: &A2aAgentConfig, request: &InvokeRequest) -> u64 {
+    request
+        .timeout_seconds
+        .unwrap_or(config.timeout_seconds)
+        .min(config.timeout_seconds)
+}
+
 fn empty_result(
     config: &A2aAgentConfig,
     request: &InvokeRequest,
@@ -881,6 +1345,7 @@ fn empty_result(
             display_name: config.name.clone(),
             configured_endpoint: config.endpoint.clone(),
         },
+        registry: None,
         card: None,
         request: A2aRequestRecord {
             invocation_id,
@@ -1100,6 +1565,18 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
+fn timeout_within_deadline(limit: Duration, deadline: Instant) -> Result<Duration, A2aError> {
+    let remaining = remaining(deadline);
+    if remaining.is_zero() {
+        return Err(A2aError::Timeout);
+    }
+    Ok(limit.min(remaining))
+}
+
+fn ensure_before_deadline(deadline: Instant) -> Result<(), A2aError> {
+    timeout_within_deadline(Duration::MAX, deadline).map(|_| ())
+}
+
 fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
     headers
         .get(name)
@@ -1107,8 +1584,25 @@ fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Opti
         .map(str::to_string)
 }
 
-fn header_value(value: &str) -> Option<HeaderValue> {
+fn safe_validator_header(
+    headers: &HeaderMap,
+    name: reqwest::header::HeaderName,
+    bearer_token: Option<&str>,
+) -> Option<String> {
+    header_string(headers, name).filter(|value| !contains_bearer_token(value, bearer_token))
+}
+
+fn conditional_header_value(value: &str, bearer_token: Option<&str>) -> Option<HeaderValue> {
+    if contains_bearer_token(value, bearer_token) {
+        return None;
+    }
     HeaderValue::from_str(value).ok()
+}
+
+fn contains_bearer_token(value: &str, bearer_token: Option<&str>) -> bool {
+    bearer_token
+        .filter(|token| !token.is_empty())
+        .is_some_and(|token| value.contains(token))
 }
 
 fn redact_text(value: &str, config: &A2aAgentConfig) -> String {
@@ -1153,6 +1647,10 @@ fn redact_value(value: &mut Value, token: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderMap as AxumHeaderMap;
+    use axum::routing::get;
+    use axum::Router;
+
     use super::*;
 
     #[test]
@@ -1205,5 +1703,185 @@ mod tests {
 
         assert_eq!(record.action, InvokeAction::Send);
         assert_eq!(record.message_id.as_deref(), Some("message-1"));
+    }
+
+    #[test]
+    fn route_options_build_with_interface_and_reject_url_shaped_hosts() {
+        let client = A2aClient::with_route_options(A2aRouteOptions {
+            interface: Some("fixture-interface".into()),
+            resolve: [(
+                "agent.example.test".into(),
+                "192.0.2.10:443".parse().unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        assert!(client.is_ok());
+
+        let invalid = A2aClient::with_route_options(A2aRouteOptions {
+            interface: None,
+            resolve: [(
+                "https://agent.example.test".into(),
+                "192.0.2.10:443".parse().unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        assert!(matches!(invalid, Err(A2aError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn registry_address_validation_requires_a_nonempty_all_public_set() {
+        let public = [
+            "1.1.1.1:443".parse().unwrap(),
+            "[2606:4700:4700::1111]:443".parse().unwrap(),
+        ];
+        assert!(validate_registry_public_addresses(&public).is_ok());
+        assert!(validate_registry_public_addresses(&[]).is_err());
+
+        for blocked in [
+            "10.0.0.1:443",
+            "127.0.0.1:443",
+            "169.254.1.1:443",
+            "100.64.0.1:443",
+            "198.18.0.1:443",
+            "192.0.2.1:443",
+            "[::1]:443",
+            "[fc00::1]:443",
+            "[fe80::1]:443",
+            "[2001:db8::1]:443",
+            "[::ffff:127.0.0.1]:443",
+        ] {
+            let address = blocked.parse().unwrap();
+            assert!(
+                validate_registry_public_addresses(&[address]).is_err(),
+                "Registry validation unexpectedly accepted {blocked}"
+            );
+        }
+
+        let mixed = [
+            "1.1.1.1:443".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        ];
+        assert!(validate_registry_public_addresses(&mixed).is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_resolution_validates_existing_route_overrides() {
+        let policy = RegistryInvocationPolicy::anonymous("https://agent.example.test/a2a").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let public_address = "1.1.1.1:443".parse().unwrap();
+        let public = A2aClient::with_route_options(A2aRouteOptions {
+            interface: None,
+            resolve: [("agent.example.test".into(), public_address)]
+                .into_iter()
+                .collect(),
+        })
+        .unwrap();
+        assert_eq!(
+            public
+                .resolve_registry_addresses(&policy, deadline)
+                .await
+                .unwrap(),
+            vec![public_address]
+        );
+
+        let private = A2aClient::with_route_options(A2aRouteOptions {
+            interface: None,
+            resolve: [("agent.example.test".into(), "10.0.0.1:443".parse().unwrap())]
+                .into_iter()
+                .collect(),
+        })
+        .unwrap();
+        assert!(private
+            .resolve_registry_addresses(&policy, deadline)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_resolution_fails_when_the_single_invocation_deadline_is_exhausted() {
+        let policy = RegistryInvocationPolicy::anonymous("https://agent.example.test/a2a").unwrap();
+        let client = A2aClient::with_route_options(A2aRouteOptions {
+            interface: None,
+            resolve: [("agent.example.test".into(), "1.1.1.1:443".parse().unwrap())]
+                .into_iter()
+                .collect(),
+        })
+        .unwrap();
+        let expired = Instant::now() - Duration::from_secs(1);
+
+        assert_eq!(
+            client
+                .resolve_registry_addresses(&policy, expired)
+                .await
+                .unwrap_err(),
+            A2aError::Timeout
+        );
+        assert_eq!(
+            timeout_within_deadline(Duration::from_secs(30), expired),
+            Err(A2aError::Timeout)
+        );
+        assert_eq!(
+            registry_preflight_terminal_kind(&A2aError::Timeout),
+            TerminalKind::Timeout
+        );
+        assert_eq!(
+            registry_preflight_terminal_kind(&A2aError::Transport("dns".into())),
+            TerminalKind::TransportError
+        );
+
+        let config = A2aAgentConfig {
+            id: "registry-agent".into(),
+            name: "Registry Agent".into(),
+            endpoint: "https://agent.example.test/a2a".into(),
+            enabled: true,
+            bearer_token: None,
+            timeout_seconds: 5,
+        };
+        let preflight = invocation_preflight_error(
+            &config,
+            &InvokeRequest::new("marker"),
+            TerminalKind::Timeout,
+            "resolution timed out",
+        );
+        assert_eq!(preflight.terminal.kind, TerminalKind::Timeout);
+        assert!(preflight.request.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_pin_preserves_the_original_hostname_header() {
+        async fn capture_host(headers: AxumHeaderMap) -> String {
+            headers
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/probe", get(capture_host)))
+                .await
+                .unwrap();
+        });
+        let pinned = [address];
+        let http = build_http_client(
+            &A2aClientOptions::default(),
+            &A2aRouteOptions::default(),
+            Some(("registry-pin.test", &pinned)),
+        )
+        .unwrap();
+        let observed = http
+            .get(format!("http://registry-pin.test:{}/probe", address.port()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(observed, format!("registry-pin.test:{}", address.port()));
+        server.abort();
     }
 }

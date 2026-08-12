@@ -43,13 +43,19 @@ fn find_free_port(start: u16) -> u16 {
 
 /// 后端数据目录：与后端约定一致 `~/.deepseek-science`。
 fn data_dir(app: &tauri::AppHandle) -> PathBuf {
-    if let Some(path) = std::env::var_os("DSS_DATA_DIR").filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
+    if let Some(path) = data_dir_override() {
+        return path;
     }
     app.path()
         .home_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".deepseek-science")
+}
+
+fn data_dir_override() -> Option<PathBuf> {
+    std::env::var_os("DSS_DATA_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// 解析后端二进制路径：
@@ -130,6 +136,7 @@ fn spawn_backend(
     binary: &Path,
     log: Option<std::fs::File>,
     api_token: &str,
+    data_dir_override: Option<&Path>,
 ) -> Result<Child, String> {
     let stdout = log
         .as_ref()
@@ -138,7 +145,13 @@ fn spawn_backend(
     let stderr = log.map(Stdio::from);
 
     let mut cmd = Command::new(binary);
-    configure_backend_command(&mut cmd, port, api_token, std::process::id());
+    configure_backend_command(
+        &mut cmd,
+        port,
+        api_token,
+        std::process::id(),
+        data_dir_override,
+    );
     cmd.stdin(Stdio::null());
 
     if let Some(s) = stdout {
@@ -173,7 +186,13 @@ fn spawn_backend(
 /// `BackendChild::drop` and the normal close handler cannot run. Explicitly pinning `DSS_HOST`
 /// prevents an inherited shell environment from accidentally exposing the privileged API on
 /// another interface.
-fn configure_backend_command(cmd: &mut Command, port: u16, api_token: &str, parent_pid: u32) {
+fn configure_backend_command(
+    cmd: &mut Command,
+    port: u16,
+    api_token: &str,
+    parent_pid: u32,
+    data_dir_override: Option<&Path>,
+) {
     cmd.arg("serve")
         .arg("--port")
         .arg(port.to_string())
@@ -181,6 +200,16 @@ fn configure_backend_command(cmd: &mut Command, port: u16, api_token: &str, pare
         .arg(parent_pid.to_string())
         .env("DSS_HOST", "127.0.0.1")
         .env("DSS_API_TOKEN", api_token);
+
+    if let Some(data_dir) = data_dir_override {
+        // Do not rely on LaunchServices/Command environment inheritance for isolation: the
+        // exact directory selected by the desktop shell must also reach its backend child.
+        cmd.env("DSS_DATA_DIR", data_dir);
+    } else {
+        // An inherited empty DSS_DATA_DIR is a real path (the current directory) to the
+        // backend. Remove it so normal launches retain the documented home-directory default.
+        cmd.env_remove("DSS_DATA_DIR");
+    }
 }
 
 /// 等后端健康；若子进程提前退出，立即返回具体状态。
@@ -319,6 +348,7 @@ fn main() {
         .setup(|app| {
             let port = find_free_port(DEFAULT_PORT);
             let api_token = generate_api_token();
+            let data_dir_override = data_dir_override();
             let log_path = backend_log_path(app.handle());
             let mut child = None;
 
@@ -328,7 +358,13 @@ fn main() {
                         "[dss-tauri] starting backend: {} on port {port}",
                         binary.display()
                     );
-                    match spawn_backend(port, &binary, open_backend_log(&log_path), &api_token) {
+                    match spawn_backend(
+                        port,
+                        &binary,
+                        open_backend_log(&log_path),
+                        &api_token,
+                        data_dir_override.as_deref(),
+                    ) {
                         Ok(mut spawned) => {
                             let readiness = wait_for_backend(&mut spawned, port);
                             child = Some(spawned);
@@ -476,7 +512,13 @@ mod tests {
         use std::ffi::OsStr;
 
         let mut command = Command::new("/tmp/dss-backend");
-        configure_backend_command(&mut command, 17901, "launch-token", 4242);
+        configure_backend_command(
+            &mut command,
+            17901,
+            "launch-token",
+            4242,
+            Some(Path::new("/private/tmp/dss-isolated")),
+        );
 
         let args = command.get_args().collect::<Vec<_>>();
         assert_eq!(
@@ -500,5 +542,23 @@ mod tests {
             env.get(OsStr::new("DSS_API_TOKEN")),
             Some(&Some(OsStr::new("launch-token")))
         );
+        assert_eq!(
+            env.get(OsStr::new("DSS_DATA_DIR")),
+            Some(&Some(OsStr::new("/private/tmp/dss-isolated")))
+        );
+    }
+
+    #[test]
+    fn packaged_backend_removes_missing_data_dir_override() {
+        use std::ffi::OsStr;
+
+        let mut command = Command::new("/tmp/dss-backend");
+        command.env("DSS_DATA_DIR", "/private/tmp/stale");
+        configure_backend_command(&mut command, 17901, "launch-token", 4242, None);
+
+        let env = command
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(env.get(OsStr::new("DSS_DATA_DIR")), Some(&None));
     }
 }

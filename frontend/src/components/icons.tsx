@@ -238,6 +238,37 @@ export const IconStop = (p: P) => (
   </svg>
 )
 
+export const IconGrip = (p: P) => (
+  <svg {...base(p)}>
+    <circle cx="8" cy="6" r="1" fill="currentColor" stroke="none" />
+    <circle cx="16" cy="6" r="1" fill="currentColor" stroke="none" />
+    <circle cx="8" cy="12" r="1" fill="currentColor" stroke="none" />
+    <circle cx="16" cy="12" r="1" fill="currentColor" stroke="none" />
+    <circle cx="8" cy="18" r="1" fill="currentColor" stroke="none" />
+    <circle cx="16" cy="18" r="1" fill="currentColor" stroke="none" />
+  </svg>
+)
+
+export const IconEdit = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z" />
+  </svg>
+)
+
+export const IconCheck = (p: P) => (
+  <svg {...base(p)}>
+    <path d="m5 12 4 4L19 6" />
+  </svg>
+)
+
+export const IconCornerArrow = (p: P) => (
+  <svg {...base(p)}>
+    <path d="m9 14-4-4 4-4" />
+    <path d="M5 10h9a5 5 0 0 1 5 5v3" />
+  </svg>
+)
+
 // 品牌 logo：品牌蓝圆角方块 + 白色原子轨道（科研意象）。自带配色，非线性图标。
 export const IconLogo = (p: P) => (
   <svg width={20} height={20} viewBox="0 0 24 24" fill="none" {...p}>

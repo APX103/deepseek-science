@@ -74,6 +74,10 @@ pub struct ToolContext {
     pub skill_catalog: Arc<dss_skills::SkillCatalog>,
     /// MCP server 管理器（P7：让 mcp__{server}__{tool} 动态工具转发）。
     pub mcp: Arc<dss_mcp::MCPServerManager>,
+    /// Per-user-run circuit breaker for MCP tools whose remote annotations do not establish safe
+    /// retry semantics. Reserve before network I/O because a timeout may follow a committed side
+    /// effect. Cloned contexts share the guard; every newly accepted run creates a fresh context.
+    mcp_mutation_attempts: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
     /// plan 模式共享态（P6a：generate_plan 写入，Runner 读以转 awaiting）。
     pub plan: Arc<Mutex<Option<PlanState>>>,
     /// LLM 客户端 + 模型（P6b：delegate 工具用，做单次子任务 LLM 调用）。
@@ -147,6 +151,7 @@ impl ToolContext {
             pending_ask: Arc::new(Mutex::new(None)),
             skill_catalog: Arc::new(dss_skills::SkillCatalog::new()),
             mcp: Arc::new(dss_mcp::MCPServerManager::new()),
+            mcp_mutation_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plan: Arc::new(Mutex::new(None)),
             llm: None,
             model: String::new(),
@@ -196,6 +201,15 @@ impl ToolContext {
     pub fn with_mcp_arc(mut self, mcp: Arc<dss_mcp::MCPServerManager>) -> Self {
         self.mcp = mcp;
         self
+    }
+
+    /// Atomically reserve the only permitted network attempt for one possibly-mutating MCP tool
+    /// in this run. Returns false after any prior attempt, including one that timed out.
+    pub async fn reserve_mcp_mutation_attempt(&self, server: &str, tool: &str) -> bool {
+        self.mcp_mutation_attempts
+            .lock()
+            .await
+            .insert((server.to_owned(), tool.to_owned()))
     }
 
     /// 注入已有的 plan 状态（P6：跨 run 恢复/同步）。

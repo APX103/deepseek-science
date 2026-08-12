@@ -1486,6 +1486,53 @@ pub fn delete_logs(conn: &Connection, before: Option<&str>) -> Result<i64, DbErr
     Ok(n as i64)
 }
 
+/// 保留策略清理统计（D-T07：按天 + 按量双限制）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PruneStats {
+    /// 按「过期天数」删除的条数。
+    pub by_age: i64,
+    /// 按「最大条数」删除的条数（删最旧的）。
+    pub by_count: i64,
+}
+
+impl PruneStats {
+    pub fn total(&self) -> i64 {
+        self.by_age + self.by_count
+    }
+}
+
+/// 保留策略清理（D-T07）。
+///
+/// - `before_iso`：删 `ts < before_iso` 的行（ISO8601 字典序即时间序）。
+/// - `max_rows`：按天删完后，若总条数仍超 `max_rows`，删最旧的直到不超。
+///
+/// 幂等，可周期调用。两步分别记数，便于 observability。
+pub fn prune_logs(
+    conn: &Connection,
+    before_iso: &str,
+    max_rows: u32,
+) -> Result<PruneStats, DbError> {
+    // 1) 按天：删 ts < before_iso。
+    let by_age = conn.execute("DELETE FROM logs WHERE ts < ?1", params![before_iso])? as i64;
+
+    // 2) 按量：若总条数仍超 max_rows，删最旧的到 max_rows。
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))?;
+    let max_rows = max_rows as i64;
+    let by_count = if total > max_rows {
+        let excess = total - max_rows;
+        conn.execute(
+            "DELETE FROM logs WHERE id IN (\
+                SELECT id FROM logs ORDER BY ts ASC LIMIT ?1\
+            )",
+            params![excess],
+        )? as i64
+    } else {
+        0
+    };
+
+    Ok(PruneStats { by_age, by_count })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2120,5 +2167,128 @@ mod tests {
                 .as_deref(),
             Some("session-rollback")
         );
+    }
+
+    // ---------- logs prune 测试（D-T07） ----------
+
+    fn logs_test_connection() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE logs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts            TEXT NOT NULL,
+                level         TEXT NOT NULL,
+                source        TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                session_id    TEXT,
+                frame_id      TEXT,
+                iteration     INTEGER,
+                message       TEXT NOT NULL,
+                detail        TEXT,
+                trace_id      TEXT
+            );
+            "#,
+        )
+        .expect("create logs test schema");
+        conn
+    }
+
+    fn insert_log(conn: &Connection, ts: &str, message: &str) {
+        append_log(
+            conn, "info", "system", "startup", None, None, None, message, None,
+        )
+        .expect("insert log");
+        // append_log 用 now() 写 ts；手动覆盖以构造历史时间戳。
+        conn.execute(
+            "UPDATE logs SET ts = ?1 WHERE id = last_insert_rowid()",
+            params![ts],
+        )
+        .expect("set ts");
+    }
+
+    #[test]
+    fn prune_logs_by_age() {
+        let conn = logs_test_connection();
+        insert_log(&conn, "2026-01-01T00:00:00Z", "old-1");
+        insert_log(&conn, "2026-01-02T00:00:00Z", "old-2");
+        insert_log(&conn, "2026-02-01T00:00:00Z", "recent-1");
+
+        let stats = prune_logs(&conn, "2026-02-01T00:00:00Z", 100_000).expect("prune");
+        assert_eq!(stats.by_age, 2, "two rows older than cutoff deleted");
+        assert_eq!(stats.by_count, 0, "under max_rows, no count-based delete");
+        assert_eq!(stats.total(), 2);
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "only the recent row remains");
+    }
+
+    #[test]
+    fn prune_logs_by_count() {
+        let conn = logs_test_connection();
+        for i in 0..10 {
+            insert_log(
+                &conn,
+                &format!("2026-02-{:02}T00:00:00Z", i + 1),
+                &format!("row-{i}"),
+            );
+        }
+        // 不超期（before 设很早），但总量超 5 → 删最旧的 5 条。
+        let stats = prune_logs(&conn, "2000-01-01T00:00:00Z", 5).expect("prune");
+        assert_eq!(stats.by_age, 0, "nothing older than the very-early cutoff");
+        assert_eq!(
+            stats.by_count, 5,
+            "excess rows over max deleted (oldest first)"
+        );
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 5, "row count trimmed to max_rows");
+    }
+
+    #[test]
+    fn prune_logs_age_and_count_combined() {
+        let conn = logs_test_connection();
+        // 3 条过期 + 5 条近期，共 8 条；max_rows=4。
+        insert_log(&conn, "2026-01-01T00:00:00Z", "expired-1");
+        insert_log(&conn, "2026-01-02T00:00:00Z", "expired-2");
+        insert_log(&conn, "2026-01-03T00:00:00Z", "expired-3");
+        insert_log(&conn, "2026-02-01T00:00:00Z", "recent-1");
+        insert_log(&conn, "2026-02-02T00:00:00Z", "recent-2");
+        insert_log(&conn, "2026-02-03T00:00:00Z", "recent-3");
+        insert_log(&conn, "2026-02-04T00:00:00Z", "recent-4");
+        insert_log(&conn, "2026-02-05T00:00:00Z", "recent-5");
+
+        // 先按天删 3 条过期，剩 5 条；再按量删到 4，删最旧 1 条（recent-1）。
+        let stats = prune_logs(&conn, "2026-02-01T00:00:00Z", 4).expect("prune");
+        assert_eq!(stats.by_age, 3);
+        assert_eq!(stats.by_count, 1);
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 4);
+        // 剩余应为 recent-2..recent-5。
+        let msgs: Vec<String> = conn
+            .prepare("SELECT message FROM logs ORDER BY ts ASC")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(msgs, vec!["recent-2", "recent-3", "recent-4", "recent-5"]);
+    }
+
+    #[test]
+    fn prune_logs_idempotent() {
+        let conn = logs_test_connection();
+        insert_log(&conn, "2026-02-01T00:00:00Z", "row-1");
+        let stats1 = prune_logs(&conn, "2026-02-01T00:00:00Z", 100_000).expect("prune 1");
+        let stats2 = prune_logs(&conn, "2026-02-01T00:00:00Z", 100_000).expect("prune 2");
+        assert_eq!(stats1.total(), 0, "nothing to delete");
+        assert_eq!(stats2.total(), 0, "second sweep is a no-op");
     }
 }

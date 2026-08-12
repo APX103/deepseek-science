@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
-use dss_agent::{AgentEvent, CompleteKind, FrameStatus, Runner, Session, MAX_ITERATIONS};
+use dss_agent::{AgentEvent, CompleteKind, FrameStatus, Runner, Session};
 use dss_llm::ChatMessage;
 use dss_tools::{HistoryCheckpoint, SecureWorkspace, ToolContext, ToolError};
 use futures::StreamExt;
@@ -1015,19 +1015,31 @@ pub async fn stream_sse(
         None
     };
 
-    // Capture one coherent hot-settings snapshot before publishing the run. Build a private
-    // registry overlay so configured A2A tools cannot mutate or shadow the process-wide base.
+    // Capture app and MCP capabilities under the same settings linearization lock. A save keeps
+    // this lock through its derived catalog/MCP rebuild, so a run can never pair a newly revoked
+    // Registry setting with the previous connected manager (or vice versa).
+    let settings_capture_guard = state.settings_save_lock.lock().await;
     let runtime = state.runtime_snapshot_with_refreshed_a2a().await;
     let llm_runtime = runtime.llm().clone();
     let llm = llm_runtime.client().cloned();
     let model = llm_runtime.settings().model.clone();
     let mcp_runtime = state.mcp_runtime_snapshot().await;
+    drop(settings_capture_guard);
+    // Build a private registry overlay so configured/Registry A2A tools cannot mutate or shadow
+    // the process-wide base.
     let mut run_tools = mcp_runtime.tools.snapshot();
     dss_tools::builtin::a2a::register_tools(
         &mut run_tools,
         runtime.a2a(),
         state.a2a_client.as_ref(),
     )
+    .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    dss_tools::builtin::agent_registry::register_tool_if_available(
+        &mut run_tools,
+        mcp_runtime.manager.as_ref(),
+        state.a2a_client.as_ref(),
+    )
+    .await
     .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
     let tools = Arc::new(run_tools);
     let a2a_catalog_notice = dss_tools::builtin::a2a::harness_catalog_notice(runtime.a2a());
@@ -1198,7 +1210,7 @@ pub async fn stream_sse(
                 tc = tc.with_memory(state.memory.clone(), project_id.clone());
             }
             // 注入数据源 API keys（search_papers 等）。
-            tc = tc.with_api_keys(state.settings.api_keys.clone());
+            tc = tc.with_api_keys(runtime.api_keys().clone());
             tc
         };
         let llm_for_extract = llm.clone();
@@ -1259,7 +1271,7 @@ pub async fn stream_sse(
                     &prompt,
                     tools.as_ref(),
                     &ctx,
-                    MAX_ITERATIONS,
+                    runtime.max_iterations(),
                     dss_compact::constants::DEFAULT_CONTEXT_CEILING,
                     Some(&memory),
                     project_id.as_deref(),
@@ -1671,10 +1683,16 @@ fn find_original_plan_request(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use axum::body::to_bytes;
     use axum::extract::{Path as AxumPath, State};
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
     use axum::Json;
+    use axum::Router;
     use dss_agent::{AgentEvent, CompleteKind, FrameStatus, Session};
     use dss_core::settings::ServerSettings;
     use dss_core::{LlmEnvOverrides, LlmSettings, Settings};
@@ -1684,7 +1702,7 @@ mod tests {
     use super::{
         approve_plan, cancel_run, create_session, delete_session, find_original_plan_request,
         get_session, plan_requires_execution, relay_agent_events, restore_session, select_run_plan,
-        should_extract_memory, CancelRunReq, RunPlanError,
+        should_extract_memory, stream_sse, CancelRunReq, RunPlanError, RunReq,
     };
     use crate::state::{ActiveRunControl, ActiveSession};
 
@@ -1724,6 +1742,24 @@ mod tests {
                 .collect(),
             research_question: None,
         }
+    }
+
+    async fn repeated_tool_call_response(
+        State(request_count): State<Arc<AtomicUsize>>,
+    ) -> impl IntoResponse {
+        let request_number = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let body = format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,",
+                "\"id\":\"call-{}\",\"type\":\"function\",",
+                "\"function\":{{\"name\":\"list_files\",\"arguments\":\"{{}}\"}}}}]}},",
+                "\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            request_number
+        );
+        ([(header::CONTENT_TYPE, "text/event-stream")], body)
     }
 
     #[test]
@@ -1822,11 +1858,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_sse_uses_the_captured_runtime_iteration_limit() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let provider = Router::new()
+            .route("/chat/completions", post(repeated_tool_call_response))
+            .with_state(request_count.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake provider");
+        let provider_base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("fake provider address")
+        );
+        let provider_task = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .await
+                .expect("serve fake provider");
+        });
+
+        let test_dir = TestDir::new("dynamic-runtime-iteration-limit");
+        let model = "fake-openai-compatible".to_string();
+        let state = crate::state::build_state(Settings {
+            data_dir: test_dir.path().to_path_buf(),
+            data_dir_is_default: false,
+            max_iterations: 2,
+            thinking: dss_core::ThinkingSettings::default(),
+            server: ServerSettings::default(),
+            llm: LlmSettings {
+                base_url: provider_base_url.clone(),
+                model: model.clone(),
+                api_key: Some("test-only-key".into()),
+            },
+            providers: vec![dss_core::LlmProvider {
+                id: "fake".into(),
+                name: "Fake".into(),
+                base_url: provider_base_url,
+                model,
+                api_key: Some("test-only-key".into()),
+                enabled: true,
+            }],
+            llm_env_overrides: LlmEnvOverrides::default(),
+            log_level: None,
+            mcp_servers: Vec::new(),
+            a2a_agents: Vec::new(),
+            memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
+            api_keys: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("build test application state");
+        assert_eq!(state.runtime_snapshot().await.max_iterations(), 2);
+
+        let Json(created) = create_session(State(state.clone()), None)
+            .await
+            .expect("create test session");
+        let response = stream_sse(
+            State(state),
+            AxumPath(created.id),
+            Json(RunReq {
+                run_id: "dynamic-limit-run".into(),
+                prompt: "keep calling the listed tool".into(),
+                plan_mode: Some(false),
+                execute_plan: Some(false),
+                deep_review: None,
+            }),
+        )
+        .await
+        .expect("start streamed run")
+        .into_response();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("collect streamed events");
+        let body = String::from_utf8(body.to_vec()).expect("SSE is UTF-8");
+
+        assert!(body.contains("\"kind\":\"max_iters\""), "{body}");
+        assert!(body.contains("\"iterations\":2"), "{body}");
+        assert!(body.contains("reached max iterations (2)"), "{body}");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        provider_task.abort();
+    }
+
+    #[tokio::test]
     async fn approved_plan_survives_reload_as_retryable_awaiting_execution() {
         let test_dir = TestDir::new("plan-approval-reload");
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -1835,6 +1955,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -1898,6 +2019,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -1906,6 +2029,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2003,6 +2127,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2011,6 +2137,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2043,6 +2170,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2051,6 +2180,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2091,6 +2221,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2099,6 +2231,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2159,6 +2292,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2167,6 +2302,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2213,6 +2349,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2221,6 +2359,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2276,6 +2415,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2284,6 +2425,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2488,6 +2630,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2496,6 +2640,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -2666,6 +2811,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -2674,6 +2821,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await

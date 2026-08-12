@@ -4,6 +4,8 @@ use futures::future::BoxFuture;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use dss_core::ThinkingEffort;
+
 use crate::error::LlmError;
 
 /// 流式事件流（`Stream<Item = Result<StreamEvent, LlmError>>`）。
@@ -163,6 +165,9 @@ pub struct ChatRequest {
     /// compatibility-based default; generic OpenAI-compatible providers never
     /// receive a `thinking` field, even when this is set.
     pub thinking_enabled: Option<bool>,
+    /// Per-request reasoning-depth override. `None` uses the immutable client
+    /// default captured with the run's runtime settings snapshot.
+    pub reasoning_effort: Option<ThinkingEffort>,
     /// 可用工具定义（function-calling）。
     pub tools: Option<Vec<ToolDef>>,
     /// `"auto"` / `"none"` / 指定；None 时不发该字段。
@@ -177,6 +182,7 @@ impl ChatRequest {
             max_tokens: None,
             temperature: None,
             thinking_enabled: None,
+            reasoning_effort: None,
             tools: None,
             tool_choice: None,
         }
@@ -241,6 +247,11 @@ pub enum StreamEvent {
     Thinking(String),
     /// 正文 `content` 增量。
     Text(String),
+    /// 同一个 provider delta 同时携带的 reasoning / content 增量。
+    ///
+    /// 保留原始 delta 的原子边界，避免下游在看到同包另一字段的
+    /// control-plane 标记前先发布其中一个字段。
+    AssistantDelta { thinking: String, text: String },
     /// 工具调用增量（OpenAI 流式 `delta.tool_calls[]`，按 index 累积）。
     ToolCallDelta(ToolCallDelta),
     /// 用量（`stream_options.include_usage` 的末包）。

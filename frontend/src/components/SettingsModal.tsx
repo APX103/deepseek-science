@@ -4,21 +4,34 @@ import type {
   A2aAgentSettings,
   AppSettings,
   AppSettingsProvider,
-  AppSettingsUpdate,
   McpServer,
   Skill,
   SkillSettingsValue,
+  ThinkingEffort,
 } from '../types'
 import { getSettings, listSkills, saveSettings } from '../api/client'
 import {
   backendReflectsSettings,
   buildSettingsPayload,
+  canSubmitDataSourceKey,
   createA2aAgentDraft,
+  DEFAULT_MAX_ITERATIONS,
+  DEFAULT_THINKING_EFFORT,
+  DEFAULT_THINKING_ENABLED,
+  isDataSourceKeyConfigured,
+  isThinkingEffort,
+  MAX_CONFIGURABLE_ITERATIONS,
+  MIN_MAX_ITERATIONS,
   normalizeMcpServers,
   normalizeSkillSettings,
+  normalizeMaxIterations,
+  normalizeThinkingSettings,
   parseMcpJsonConfig,
+  parseMaxIterationsDraft,
+  reconcileAgentThinkingSaveResponse,
   sanitizeSettings,
   settingsSaveNotice,
+  type AgentThinkingValues,
   type SettingsSaveNotice,
 } from '../api/settingsState'
 import { useApp } from '../App'
@@ -1315,27 +1328,171 @@ function GeneralSection() {
           <p className="mt-1 text-[11px] text-ink3">当前后端配置的会话工作区根目录（只读展示）。</p>
         )}
       </div>
+      <AgentThinkingCard />
+      <LogRetentionCard />
       <AcademicKeysCard />
     </div>
   )
 }
 
-// ---------- 学术数据源 API keys ----------
-function AcademicKeysCard() {
+// ---------- Agent Think / 思考强度 / 最大迭代次数 ----------
+interface AgentThinkingEditorProps {
+  thinkingEnabled: boolean
+  effort: ThinkingEffort
+  maxIterationsDraft: string
+  saving: boolean
+  canSave: boolean
+  validationError: string | null
+  saveError: string | null
+  saveSucceeded: boolean
+  onThinkingEnabledChange: (value: boolean) => void
+  onEffortChange: (value: ThinkingEffort) => void
+  onMaxIterationsDraftChange: (value: string) => void
+  onSave: () => void
+}
+
+export function AgentThinkingEditor({
+  thinkingEnabled,
+  effort,
+  maxIterationsDraft,
+  saving,
+  canSave,
+  validationError,
+  saveError,
+  saveSucceeded,
+  onThinkingEnabledChange,
+  onEffortChange,
+  onMaxIterationsDraftChange,
+  onSave,
+}: AgentThinkingEditorProps) {
+  return (
+    <div className="card p-3" data-agent-thinking-settings="true">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div id="agent-thinking-enabled-label" className="text-[13px] font-medium text-ink">
+            Think
+          </div>
+          <p id="agent-thinking-enabled-description" className="mt-0.5 text-[11px] leading-relaxed text-ink3">
+            为支持该能力的模型请求显式推理。具体效果取决于 provider 和模型。
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={thinkingEnabled}
+          aria-labelledby="agent-thinking-enabled-label"
+          aria-describedby="agent-thinking-enabled-description"
+          disabled={saving}
+          onClick={() => onThinkingEnabledChange(!thinkingEnabled)}
+          className={`relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+            thinkingEnabled ? 'bg-brand' : 'bg-borderStrong'
+          }`}
+        >
+          <span
+            aria-hidden="true"
+            className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+              thinkingEnabled ? 'left-[18px]' : 'left-0.5'
+            }`}
+          />
+        </button>
+      </div>
+
+      <label className="mt-3 block">
+        <span className="text-[12px] font-medium text-ink2">思考深度</span>
+        <select
+          className="input mt-1.5 py-1.5"
+          value={effort}
+          disabled={saving || !thinkingEnabled}
+          onChange={(event) => {
+            if (isThinkingEffort(event.target.value)) onEffortChange(event.target.value)
+          }}
+        >
+          <option value="low">低</option>
+          <option value="high">高</option>
+          <option value="max">最大</option>
+        </select>
+      </label>
+      {!thinkingEnabled && (
+        <p className="mt-1 text-[11px] text-ink3">已保留当前思考深度；重新开启 Think 后继续使用。</p>
+      )}
+
+      <label className="block">
+        <span className="mt-3 block text-[12px] font-medium text-ink2">最大思考轮次</span>
+        <input
+          type="number"
+          min={MIN_MAX_ITERATIONS}
+          max={MAX_CONFIGURABLE_ITERATIONS}
+          step={1}
+          className="input mt-1.5 py-1.5"
+          value={maxIterationsDraft}
+          disabled={saving}
+          onChange={(event) => onMaxIterationsDraftChange(event.target.value)}
+        />
+      </label>
+      {validationError && (
+        <p role="alert" className="mt-1 text-[11px] text-danger">{validationError}</p>
+      )}
+      <p className="mt-1 text-[11px] leading-relaxed text-ink3">
+        每次 Agent 运行的模型/工具迭代总上限，不是模型的推理深度，默认 {DEFAULT_MAX_ITERATIONS}。
+        后续新请求立即生效；已经运行中的请求保持开始时的设置。更高的思考深度或轮次会增加耗时和费用。
+      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <button type="button" className="btn-primary" disabled={!canSave} onClick={onSave}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+        {saveSucceeded && (
+          <span role="status" className="text-[11px] text-success">
+            已保存，后续新请求立即生效
+          </span>
+        )}
+        {saveError && <span role="alert" className="text-[11px] text-danger">{saveError}</span>}
+      </div>
+    </div>
+  )
+}
+
+const DEFAULT_AGENT_THINKING_VALUES: AgentThinkingValues = {
+  thinking: {
+    enabled: DEFAULT_THINKING_ENABLED,
+    effort: DEFAULT_THINKING_EFFORT,
+  },
+  maxIterations: DEFAULT_MAX_ITERATIONS,
+}
+
+function agentThinkingValues(settings: AppSettings): AgentThinkingValues {
+  return {
+    thinking: normalizeThinkingSettings(settings.thinking),
+    maxIterations: normalizeMaxIterations(settings.max_iterations),
+  }
+}
+
+function AgentThinkingCard() {
   const [settings, setSettings] = useState<AppSettings | null>(null)
-  const [openalexDraft, setOpenalexDraft] = useState('')
+  const [thinkingEnabledDraft, setThinkingEnabledDraft] = useState(DEFAULT_THINKING_ENABLED)
+  const [effortDraft, setEffortDraft] = useState<ThinkingEffort>(DEFAULT_THINKING_EFFORT)
+  const [maxIterationsDraft, setMaxIterationsDraft] = useState(String(DEFAULT_MAX_ITERATIONS))
+  const [confirmedValues, setConfirmedValues] = useState<AgentThinkingValues>(
+    DEFAULT_AGENT_THINKING_VALUES,
+  )
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  const [savedAt, setSavedAt] = useState<number | null>(null)
+  const [saveSucceeded, setSaveSucceeded] = useState(false)
 
   const load = async () => {
+    setLoadError(null)
+    setSaveError(null)
+    setSaveSucceeded(false)
     try {
-      const s = sanitizeSettings(await getSettings())
-      setSettings(s)
-      // 草稿初始化为空（后端返回的是 mask 占位，不回填到输入框）。
-      setOpenalexDraft('')
+      const loaded = sanitizeSettings(await getSettings())
+      setSettings(loaded)
+      const loadedValues = agentThinkingValues(loaded)
+      setConfirmedValues(loadedValues)
+      setThinkingEnabledDraft(loadedValues.thinking.enabled)
+      setEffortDraft(loadedValues.thinking.effort)
+      setMaxIterationsDraft(String(loadedValues.maxIterations))
     } catch (error) {
-      setSaveError(errorMessage(error))
+      setLoadError(errorMessage(error))
     }
   }
 
@@ -1343,36 +1500,193 @@ function AcademicKeysCard() {
     void load()
   }, [])
 
-  const masked = settings?.api_keys_masked?.OPENALEX_API_KEY
-  const configured = !!masked
+  useEffect(() => {
+    if (!saveSucceeded) return
+    const timer = window.setTimeout(() => setSaveSucceeded(false), 4000)
+    return () => window.clearTimeout(timer)
+  }, [saveSucceeded])
+
+  const parsedMaxIterations = parseMaxIterationsDraft(maxIterationsDraft)
+  const validationError = parsedMaxIterations === null
+    ? `请输入 ${MIN_MAX_ITERATIONS}–${MAX_CONFIGURABLE_ITERATIONS} 之间的十进制整数（不支持小数或科学计数法）。`
+    : null
+  const dirty = settings !== null
+    && parsedMaxIterations !== null
+    && (
+      thinkingEnabledDraft !== confirmedValues.thinking.enabled
+      || effortDraft !== confirmedValues.thinking.effort
+      || parsedMaxIterations !== confirmedValues.maxIterations
+    )
+  const canSave = settings !== null && !saving && validationError === null && dirty
 
   const save = async () => {
+    if (!settings || parsedMaxIterations === null || !canSave) return
+    const requested: AgentThinkingValues = {
+      thinking: { enabled: thinkingEnabledDraft, effort: effortDraft },
+      maxIterations: parsedMaxIterations,
+    }
     setSaving(true)
     setSaveError(null)
+    setSaveSucceeded(false)
     try {
-      // 空草稿 = 不改动（保留旧值）；非空 = 写入新值。
-      // 后端对 mask 占位（••••••••）保留旧值，这里只在用户输入了内容时才提交。
-      const payload: AppSettingsUpdate = {
-        providers: settings?.providers ?? [],
-        a2a_agents: settings?.a2a_agents ?? [],
-        model: settings?.model ?? '',
-        default_workspace: settings?.default_workspace ?? '',
-        revision: settings?.revision ?? 0,
-        mcp_servers: settings?.mcp_servers ?? [],
-        skills: settings?.skills,
-        api_keys: openalexDraft.trim()
-          ? { OPENALEX_API_KEY: openalexDraft.trim() }
-          : {},
+      const payload = buildSettingsPayload(settings, {}, {}, new Set(), {})
+      payload.thinking = { ...requested.thinking }
+      payload.max_iterations = requested.maxIterations
+      const response = await saveSettings(payload)
+      const reconciled = reconcileAgentThinkingSaveResponse(
+        response,
+        requested,
+        confirmedValues,
+      )
+      // Keep the returned revision even when an older/incompatible backend fails to echo the field.
+      // The separate coherent baseline remains unchanged, so every user's draft stays retryable.
+      setSettings(reconciled.settings)
+      setConfirmedValues(reconciled.confirmedValues)
+      if (!reconciled.confirmed) {
+        setSaveError('设置已返回，但后端未精确确认 Think、思考深度和最大思考轮次，请重试或升级后端。')
+        return
       }
+      setSaveSucceeded(true)
+    } catch (error) {
+      setSaveError(`保存失败：${errorMessage(error)}`)
+      // Another independently loaded General card may have committed a newer full-form revision.
+      // Refresh that revision without replacing this card's draft, so the next click can retry it.
+      try {
+        const latest = sanitizeSettings(await getSettings())
+        setSettings(latest)
+        setConfirmedValues(agentThinkingValues(latest))
+      } catch {
+        // Preserve the original save error and loaded snapshot when refresh is also unavailable.
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!settings) {
+    return (
+      <div className="card p-3" data-agent-thinking-settings="true">
+        <div className="text-[13px] font-medium text-ink">Agent 思考</div>
+        {loadError ? (
+          <div className="mt-2 space-y-2 text-[11px]">
+            <p role="alert" className="text-danger">设置加载失败：{loadError}</p>
+            <button type="button" className="btn-outline" onClick={() => void load()}>重试</button>
+          </div>
+        ) : (
+          <p role="status" className="mt-2 text-[11px] text-ink3">正在加载…</p>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <AgentThinkingEditor
+      thinkingEnabled={thinkingEnabledDraft}
+      effort={effortDraft}
+      maxIterationsDraft={maxIterationsDraft}
+      saving={saving}
+      canSave={canSave}
+      validationError={validationError}
+      saveError={saveError}
+      saveSucceeded={saveSucceeded}
+      onThinkingEnabledChange={(value) => {
+        setThinkingEnabledDraft(value)
+        setSaveError(null)
+        setSaveSucceeded(false)
+      }}
+      onEffortChange={(value) => {
+        setEffortDraft(value)
+        setSaveError(null)
+        setSaveSucceeded(false)
+      }}
+      onMaxIterationsDraftChange={(value) => {
+        setMaxIterationsDraft(value)
+        setSaveError(null)
+        setSaveSucceeded(false)
+      }}
+      onSave={() => void save()}
+    />
+  )
+}
+
+// ---------- 学术数据源 API keys ----------
+function AcademicKeysCard() {
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [openalexDraft, setOpenalexDraft] = useState('')
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveSucceeded, setSaveSucceeded] = useState(false)
+
+  const load = async () => {
+    setLoadError(null)
+    setSaveError(null)
+    setSaveSucceeded(false)
+    try {
+      const s = sanitizeSettings(await getSettings())
+      setSettings(s)
+      // 草稿初始化为空（后端返回的是 mask 占位，不回填到输入框）。
+      setOpenalexDraft('')
+    } catch (error) {
+      setLoadError(errorMessage(error))
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  useEffect(() => {
+    if (!saveSucceeded) return
+    const timer = window.setTimeout(() => setSaveSucceeded(false), 4000)
+    return () => window.clearTimeout(timer)
+  }, [saveSucceeded])
+
+  const configured = isDataSourceKeyConfigured(settings, 'OPENALEX_API_KEY')
+
+  const save = async () => {
+    if (!canSubmitDataSourceKey(settings, openalexDraft, saving)) return
+
+    setSaving(true)
+    setSaveError(null)
+    setSaveSucceeded(false)
+    try {
+      const payload = buildSettingsPayload(
+        settings,
+        {},
+        {},
+        new Set(),
+        { OPENALEX_API_KEY: openalexDraft },
+      )
       const saved = sanitizeSettings(await saveSettings(payload))
       setSettings(saved)
-      setOpenalexDraft('')
-      setSavedAt(Date.now())
+      if (isDataSourceKeyConfigured(saved, 'OPENALEX_API_KEY')) {
+        setOpenalexDraft('')
+        setSaveSucceeded(true)
+      } else {
+        setSaveError('设置已返回，但未确认 OpenAlex API Key 已配置，请重试。')
+      }
     } catch (error) {
       setSaveError(errorMessage(error))
     } finally {
       setSaving(false)
     }
+  }
+
+  if (!settings) {
+    return (
+      <div className="card p-3">
+        <div className="text-[13px] font-medium text-ink">学术数据源</div>
+        {loadError ? (
+          <div className="mt-2 space-y-2 text-[11px]">
+            <p role="alert" className="text-danger">设置加载失败：{loadError}</p>
+            <button className="btn-outline" onClick={() => void load()}>重试</button>
+          </div>
+        ) : (
+          <p role="status" className="mt-2 text-[11px] text-ink3">正在加载 OpenAlex 配置…</p>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -1384,33 +1698,180 @@ function AcademicKeysCard() {
           type="password"
           className="input mt-1 py-1.5 font-mono"
           value={openalexDraft}
-          onChange={(e) => setOpenalexDraft(e.target.value)}
-          placeholder={configured ? '••••••••（已配置，输入新值覆盖）' : '（可选，不填走礼仪池）'}
+          autoComplete="off"
+          disabled={saving}
+          onChange={(e) => {
+            setOpenalexDraft(e.target.value)
+            setSaveError(null)
+            setSaveSucceeded(false)
+          }}
+          placeholder={configured ? '已配置，输入新值覆盖' : '输入 OpenAlex API key'}
         />
       </label>
       <p className="mt-1 text-[11px] text-ink3">
-        OpenAlex 免费但建议填 key（更稳定）。在{' '}
+        OpenAlex API key 可免费获取；未配置时只有少量匿名试用额度，不适合稳定使用。前往{' '}
         <a
-          href="https://openalex.org/users/me"
+          href="https://openalex.org/settings/api"
           target="_blank"
           rel="noreferrer"
           className="text-brand underline"
         >
-          openalex.org/users/me
+          OpenAlex API settings
         </a>{' '}
         获取。用于 search_papers / fetch_paper 工具。
       </p>
       <div className="mt-2 flex items-center gap-2">
-        <button className="btn-primary" disabled={saving || !openalexDraft.trim()} onClick={() => void save()}>
+        <button
+          className="btn-primary"
+          disabled={!canSubmitDataSourceKey(settings, openalexDraft, saving)}
+          onClick={() => void save()}
+        >
           {saving ? '保存中…' : '保存'}
         </button>
-        {configured && !openalexDraft.trim() && (
-          <span className="text-[11px] text-success">已配置</span>
+        {!openalexDraft.trim() && (
+          <span className={`text-[11px] ${configured ? 'text-success' : 'text-ink3'}`}>
+            {configured ? '已配置' : '未配置'}
+          </span>
         )}
-        {savedAt && Date.now() - savedAt < 4000 && (
+        {saveSucceeded && (
           <span className="text-[11px] text-success">已保存</span>
         )}
-        {saveError && <span className="text-[11px] text-danger">{saveError}</span>}
+        {saveError && <span role="alert" className="text-[11px] text-danger">{saveError}</span>}
+      </div>
+    </div>
+  )
+}
+
+// ---------- 日志保留策略（D-T07） ----------
+function LogRetentionCard() {
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [days, setDays] = useState('14')
+  const [maxRows, setMaxRows] = useState('100000')
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveSucceeded, setSaveSucceeded] = useState(false)
+
+  const load = async () => {
+    setLoadError(null)
+    setSaveError(null)
+    setSaveSucceeded(false)
+    try {
+      const s = sanitizeSettings(await getSettings())
+      setSettings(s)
+      setDays(String(s.log_retention_days ?? 14))
+      setMaxRows(String(s.log_max_rows ?? 100_000))
+    } catch (error) {
+      setLoadError(errorMessage(error))
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  useEffect(() => {
+    if (!saveSucceeded) return
+    const timer = window.setTimeout(() => setSaveSucceeded(false), 4000)
+    return () => window.clearTimeout(timer)
+  }, [saveSucceeded])
+
+  const daysNum = Number.parseInt(days, 10)
+  const maxRowsNum = Number.parseInt(maxRows, 10)
+  const daysValid = Number.isFinite(daysNum) && daysNum >= 1
+  const maxRowsValid = Number.isFinite(maxRowsNum) && maxRowsNum >= 1000
+  const dirty =
+    !!settings &&
+    (daysNum !== (settings.log_retention_days ?? 14) ||
+      maxRowsNum !== (settings.log_max_rows ?? 100_000))
+  const canSave = !!settings && !saving && daysValid && maxRowsValid && dirty
+
+  const save = async () => {
+    if (!settings || !canSave) return
+    setSaving(true)
+    setSaveError(null)
+    setSaveSucceeded(false)
+    try {
+      const payload = buildSettingsPayload(settings, {}, {}, new Set(), {})
+      payload.log_retention_days = daysNum
+      payload.log_max_rows = maxRowsNum
+      const saved = sanitizeSettings(await saveSettings(payload))
+      setSettings(saved)
+      setDays(String(saved.log_retention_days ?? daysNum))
+      setMaxRows(String(saved.log_max_rows ?? maxRowsNum))
+      setSaveSucceeded(true)
+    } catch (error) {
+      setSaveError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!settings) {
+    return (
+      <div className="card p-3">
+        <div className="text-[13px] font-medium text-ink">日志保留</div>
+        {loadError ? (
+          <div className="mt-2 space-y-2 text-[11px]">
+            <p role="alert" className="text-danger">设置加载失败：{loadError}</p>
+            <button className="btn-outline" onClick={() => void load()}>重试</button>
+          </div>
+        ) : (
+          <p role="status" className="mt-2 text-[11px] text-ink3">正在加载…</p>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="card p-3">
+      <div className="text-[13px] font-medium text-ink">日志保留</div>
+      <div className="mt-2 grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-[12px] text-ink2">保留天数</span>
+          <input
+            type="number"
+            min={1}
+            className="input mt-1 py-1.5"
+            value={days}
+            disabled={saving}
+            onChange={(e) => {
+              setDays(e.target.value)
+              setSaveError(null)
+              setSaveSucceeded(false)
+            }}
+          />
+          {!daysValid && <span className="mt-1 block text-[11px] text-danger">至少 1 天</span>}
+        </label>
+        <label className="block">
+          <span className="text-[12px] text-ink2">最大条数</span>
+          <input
+            type="number"
+            min={1000}
+            className="input mt-1 py-1.5"
+            value={maxRows}
+            disabled={saving}
+            onChange={(e) => {
+              setMaxRows(e.target.value)
+              setSaveError(null)
+              setSaveSucceeded(false)
+            }}
+          />
+          {!maxRowsValid && (
+            <span className="mt-1 block text-[11px] text-danger">至少 1000 条</span>
+          )}
+        </label>
+      </div>
+      <p className="mt-1 text-[11px] text-ink3">
+        超过天数或条数上限的日志会被自动清理（先到先清）。后台启动时跑一次，之后每 6
+        小时循环。修改后重启后端生效。
+      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <button className="btn-primary" disabled={!canSave} onClick={() => void save()}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+        {saveSucceeded && <span className="text-[11px] text-success">已保存</span>}
+        {saveError && <span role="alert" className="text-[11px] text-danger">{saveError}</span>}
       </div>
     </div>
   )

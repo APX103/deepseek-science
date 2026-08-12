@@ -130,6 +130,7 @@ fn compact_a2a_tool_result(content: &str) -> Option<String> {
         "source_schema": A2A_RESULT_SCHEMA,
         "projection_note": "LLM-only compact view; the canonical session record retains the complete Agent Card and every accepted wire response.",
         "agent": source.get("agent"),
+        "registry": source.get("registry"),
         "card": card,
         "request": source.get("request"),
         "response_columns": ["sequence", "operation", "http_status", "protocol_version", "binding", "wire_bytes"],
@@ -386,6 +387,11 @@ mod tests {
         let canonical = json!({
             "schema": A2A_RESULT_SCHEMA,
             "agent": {"config_id":"nuclear", "display_name":"Nuclear specialist"},
+            "registry": {
+                "server": "agent-registry",
+                "resource_uri": "agent://nuclear",
+                "resource_name": "Nuclear specialist"
+            },
             "card": {
                 "card_url":"http://127.0.0.1/.well-known/agent-card.json",
                 "summary":{"name":"Specialist", "description":"science"},
@@ -413,6 +419,8 @@ mod tests {
         assert_eq!(projected["source_schema"], A2A_RESULT_SCHEMA);
         assert_eq!(projected["responses"].as_array().unwrap().len(), 2);
         assert_eq!(projected["terminal"]["state"], "completed");
+        assert_eq!(projected["registry"]["server"], "agent-registry");
+        assert_eq!(projected["registry"]["resource_uri"], "agent://nuclear");
         assert!(projected_text.contains("Remote conclusion"));
         assert!(!projected_text.contains("large_untrusted_card"));
         assert!(projected_text.chars().count() < MICROCOMPACT_TOOLRESULT_THRESHOLD);

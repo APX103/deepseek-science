@@ -2,10 +2,24 @@ import { describe, expect, test } from 'bun:test'
 import {
   backendReflectsSettings,
   buildSettingsPayload,
+  canSubmitDataSourceKey,
+  DATA_SOURCE_KEY_MASK,
+  DEFAULT_MAX_ITERATIONS,
+  DEFAULT_THINKING_EFFORT,
+  DEFAULT_THINKING_ENABLED,
+  isDataSourceKeyConfigured,
+  MAX_CONFIGURABLE_ITERATIONS,
+  MIN_MAX_ITERATIONS,
   normalizeMcpServers,
+  normalizeMaxIterations,
+  normalizeThinkingSettings,
   parseMcpJsonConfig,
+  parseMaxIterationsDraft,
+  reconcileAgentThinkingSaveResponse,
   sanitizeSettings,
+  settingsResponseConfirmsAgentThinking,
   settingsSaveNotice,
+  type AgentThinkingValues,
 } from '../src/api/settingsState'
 import type { AppSettings, BackendStatus } from '../src/types'
 
@@ -13,6 +27,7 @@ function settings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
     providers: [
       {
+        id: 'DeepSeek',
         name: 'DeepSeek',
         base_url: 'https://api.example.invalid',
         api_key_masked: '••••••••',
@@ -61,6 +76,50 @@ describe('settings state safety', () => {
     expect(payload.revision).toBe(settings().revision)
     expect('overridden_fields' in payload).toBe(false)
     expect('restart_required' in payload).toBe(false)
+  })
+
+  test('drops unexpected plaintext data-source keys and accepts only the fixed mask', () => {
+    const received = {
+      ...settings(),
+      api_keys: { OPENALEX_API_KEY: 'server-response-must-be-discarded' },
+      api_keys_masked: {
+        OPENALEX_API_KEY: DATA_SOURCE_KEY_MASK,
+        UNSAFE_SOURCE: 'server-response-must-be-discarded',
+      },
+    } as AppSettings
+    const sanitized = sanitizeSettings(received)
+
+    expect('api_keys' in sanitized).toBe(false)
+    expect(sanitized.api_keys_masked).toEqual({
+      OPENALEX_API_KEY: DATA_SOURCE_KEY_MASK,
+      UNSAFE_SOURCE: '',
+    })
+    expect(isDataSourceKeyConfigured(sanitized, 'OPENALEX_API_KEY')).toBe(true)
+    expect(isDataSourceKeyConfigured(sanitized, 'UNSAFE_SOURCE')).toBe(false)
+    expect(JSON.stringify(sanitized)).not.toContain('server-response-must-be-discarded')
+  })
+
+  test('data-source payload omits blank drafts and submits only trimmed new values', () => {
+    const current = settings({ api_keys_masked: { OPENALEX_API_KEY: DATA_SOURCE_KEY_MASK } })
+    const preserve = buildSettingsPayload(current, {}, {}, new Set(), {
+      OPENALEX_API_KEY: '   ',
+    })
+    const replace = buildSettingsPayload(current, {}, {}, new Set(), {
+      OPENALEX_API_KEY: '  typed-openalex-key  ',
+      EMPTY_SOURCE: '\n',
+    })
+
+    expect('api_keys' in preserve).toBe(false)
+    expect(replace.api_keys).toEqual({ OPENALEX_API_KEY: 'typed-openalex-key' })
+    expect(replace.providers).toEqual(buildSettingsPayload(current, {}).providers)
+    expect(replace.revision).toBe(current.revision)
+  })
+
+  test('data-source save stays disabled until settings load and the draft is non-empty', () => {
+    expect(canSubmitDataSourceKey(null, 'typed-openalex-key', false)).toBe(false)
+    expect(canSubmitDataSourceKey(settings(), '   ', false)).toBe(false)
+    expect(canSubmitDataSourceKey(settings(), 'typed-openalex-key', true)).toBe(false)
+    expect(canSubmitDataSourceKey(settings(), ' typed-openalex-key ', false)).toBe(true)
   })
 
   test('requires an exact runtime revision, model, base URL, and configured state', () => {
@@ -129,6 +188,163 @@ describe('settings state safety', () => {
       kind: 'success',
       message: '已保存并立即生效。后续新请求将使用模型 deepseek-research。',
     })
+  })
+})
+
+describe('agent thinking settings', () => {
+  test('normalizes a legacy response and carries complete defaults through every full-form save', () => {
+    const legacy = settings()
+    const sanitized = sanitizeSettings(legacy)
+
+    expect(legacy.max_iterations).toBeUndefined()
+    expect(legacy.thinking).toBeUndefined()
+    expect(sanitized.max_iterations).toBe(DEFAULT_MAX_ITERATIONS)
+    expect(sanitized.thinking).toEqual({
+      enabled: DEFAULT_THINKING_ENABLED,
+      effort: DEFAULT_THINKING_EFFORT,
+    })
+    expect(buildSettingsPayload(legacy, {}).max_iterations).toBe(DEFAULT_MAX_ITERATIONS)
+    expect(buildSettingsPayload(sanitized, {}).max_iterations).toBe(DEFAULT_MAX_ITERATIONS)
+    expect(buildSettingsPayload(legacy, {}).thinking).toEqual({ enabled: true, effort: 'high' })
+    expect(buildSettingsPayload(sanitized, {}).thinking).toEqual({ enabled: true, effort: 'high' })
+  })
+
+  test('strictly normalizes partial or malformed thinking members', () => {
+    expect(normalizeThinkingSettings(undefined)).toEqual({ enabled: true, effort: 'high' })
+    expect(normalizeThinkingSettings({ enabled: false, effort: 'max' })).toEqual({
+      enabled: false,
+      effort: 'max',
+    })
+    expect(normalizeThinkingSettings({ enabled: false, effort: 'medium' })).toEqual({
+      enabled: false,
+      effort: 'high',
+    })
+    expect(normalizeThinkingSettings({ enabled: 'false', effort: 'low' })).toEqual({
+      enabled: true,
+      effort: 'low',
+    })
+    for (const malformed of [null, [], 'high', 1, { enabled: true, effort: 'xhigh' }]) {
+      expect(normalizeThinkingSettings(malformed)).toEqual({ enabled: true, effort: 'high' })
+    }
+  })
+
+  test('preserves explicit values, including a disabled switch with its retained effort', () => {
+    const configured = settings({
+      max_iterations: 640,
+      thinking: { enabled: false, effort: 'max' },
+    })
+    const payload = buildSettingsPayload(configured, {})
+
+    expect(normalizeMaxIterations(configured.max_iterations)).toBe(640)
+    expect(sanitizeSettings(configured).max_iterations).toBe(640)
+    expect(payload.max_iterations).toBe(640)
+    expect(payload.thinking).toEqual({ enabled: false, effort: 'max' })
+    expect(JSON.stringify(payload)).not.toContain('server-response-must-be-discarded')
+  })
+
+  test('accepts only plain decimal safe integers in the shared inclusive range', () => {
+    expect(parseMaxIterationsDraft(String(MIN_MAX_ITERATIONS))).toBe(MIN_MAX_ITERATIONS)
+    expect(parseMaxIterationsDraft(String(DEFAULT_MAX_ITERATIONS))).toBe(DEFAULT_MAX_ITERATIONS)
+    expect(parseMaxIterationsDraft(String(MAX_CONFIGURABLE_ITERATIONS))).toBe(
+      MAX_CONFIGURABLE_ITERATIONS,
+    )
+
+    for (const invalid of ['', ' ', '0', '-1', '1.5', '1e2', '1001', 'NaN', '+1']) {
+      expect(parseMaxIterationsDraft(invalid)).toBeNull()
+    }
+  })
+
+  test('fails safe to the default for malformed values received from a backend', () => {
+    for (const invalid of [0, -1, 1.5, 1001, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(normalizeMaxIterations(invalid)).toBe(DEFAULT_MAX_ITERATIONS)
+    }
+  })
+
+  test('requires the raw POST response to explicitly echo all three requested values', () => {
+    const requested: AgentThinkingValues = {
+      thinking: { enabled: false, effort: 'max' },
+      maxIterations: 240,
+    }
+
+    expect(settingsResponseConfirmsAgentThinking(settings({ max_iterations: 240 }), requested)).toBe(false)
+    expect(settingsResponseConfirmsAgentThinking(settings({
+      thinking: { enabled: true, effort: 'max' },
+      max_iterations: 240,
+    }), requested)).toBe(false)
+    expect(settingsResponseConfirmsAgentThinking(settings({
+      thinking: { enabled: false, effort: 'high' },
+      max_iterations: 240,
+    }), requested)).toBe(false)
+    expect(settingsResponseConfirmsAgentThinking(settings({
+      thinking: { enabled: false, effort: 'max' },
+      max_iterations: 241,
+    }), requested)).toBe(false)
+    expect(settingsResponseConfirmsAgentThinking(settings({
+      thinking: { enabled: false, effort: 'max' },
+      max_iterations: 240,
+    }), requested)).toBe(true)
+  })
+
+  test('keeps a default-colliding mismatched save retryable while adopting its newer revision', () => {
+    const requested: AgentThinkingValues = {
+      thinking: { enabled: true, effort: 'high' },
+      maxIterations: DEFAULT_MAX_ITERATIONS,
+    }
+    const previousConfirmed: AgentThinkingValues = {
+      thinking: { enabled: true, effort: 'high' },
+      maxIterations: 160,
+    }
+    const reconciled = reconcileAgentThinkingSaveResponse(
+      settings({ revision: 8 }),
+      requested,
+      previousConfirmed,
+    )
+
+    expect(reconciled.confirmed).toBe(false)
+    expect(reconciled.settings.revision).toBe(8)
+    // Sanitization fills legacy defaults, but the independent confirmed baseline must not move.
+    expect(reconciled.settings.thinking).toEqual(requested.thinking)
+    expect(reconciled.settings.max_iterations).toBe(requested.maxIterations)
+    expect(reconciled.confirmedValues).toEqual(previousConfirmed)
+    expect(requested.maxIterations).not.toBe(reconciled.confirmedValues.maxIterations)
+  })
+
+  test('one mismatched thinking member preserves the whole coherent confirmed baseline', () => {
+    const requested: AgentThinkingValues = {
+      thinking: { enabled: false, effort: 'max' },
+      maxIterations: 240,
+    }
+    const previousConfirmed: AgentThinkingValues = {
+      thinking: { enabled: true, effort: 'low' },
+      maxIterations: 160,
+    }
+    const reconciled = reconcileAgentThinkingSaveResponse(
+      settings({ revision: 8, thinking: { enabled: false, effort: 'high' }, max_iterations: 240 }),
+      requested,
+      previousConfirmed,
+    )
+
+    expect(reconciled.confirmed).toBe(false)
+    expect(reconciled.confirmedValues).toEqual(previousConfirmed)
+  })
+
+  test('advances the whole confirmed baseline only after an exact response echo', () => {
+    const requested: AgentThinkingValues = {
+      thinking: { enabled: false, effort: 'max' },
+      maxIterations: 240,
+    }
+    const reconciled = reconcileAgentThinkingSaveResponse(
+      settings({ revision: 8, thinking: requested.thinking, max_iterations: requested.maxIterations }),
+      requested,
+      {
+        thinking: { enabled: true, effort: 'high' },
+        maxIterations: DEFAULT_MAX_ITERATIONS,
+      },
+    )
+
+    expect(reconciled.confirmed).toBe(true)
+    expect(reconciled.settings.revision).toBe(8)
+    expect(reconciled.confirmedValues).toEqual(requested)
   })
 })
 

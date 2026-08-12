@@ -10,6 +10,8 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde_json::json;
 
+use dss_core::ThinkingSettings;
+
 use crate::error::LlmError;
 use crate::types::{BoxedEventStream, ChatRequest, LlmClient, LlmResponse, StreamEvent, Usage};
 
@@ -62,6 +64,7 @@ pub struct OpenAICompatClient {
     base_url: String,
     api_key: String,
     model: String,
+    thinking: ThinkingSettings,
 }
 
 // api_key 不进入 Debug 输出。
@@ -70,6 +73,7 @@ impl fmt::Debug for OpenAICompatClient {
         f.debug_struct("OpenAICompatClient")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("thinking", &self.thinking)
             .field("api_key", &"<redacted>")
             .finish()
     }
@@ -90,7 +94,19 @@ impl OpenAICompatClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
+            thinking: ThinkingSettings::default(),
         }
+    }
+
+    /// Attach the immutable reasoning policy captured with this configured
+    /// client. Request-level overrides remain authoritative.
+    pub fn with_thinking_settings(mut self, thinking: ThinkingSettings) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    pub fn thinking_settings(&self) -> ThinkingSettings {
+        self.thinking
     }
 
     pub fn base_url(&self) -> &str {
@@ -103,23 +119,26 @@ impl OpenAICompatClient {
 
     fn build_body(&self, req: &ChatRequest, stream: bool) -> serde_json::Value {
         let deepseek_v4 = is_deepseek_v4_model(&req.model);
+        let requested_thinking_enabled = req.thinking_enabled.unwrap_or(self.thinking.enabled);
+        let reasoning_effort = req.reasoning_effort.unwrap_or(self.thinking.effort);
         // Without an explicit override, old sessions and cross-provider history can contain
         // assistant tool calls that predate reasoning persistence. DeepSeek rejects such
         // history in thinking mode; disable thinking for the complete request instead of
         // inventing chain-of-thought.
         let v4_thinking_enabled = deepseek_v4
             && req.thinking_enabled.unwrap_or_else(|| {
-                !req.messages.iter().any(|message| {
-                    message.role == "assistant"
-                        && message
-                            .tool_calls
-                            .as_ref()
-                            .is_some_and(|tool_calls| !tool_calls.is_empty())
-                        && message
-                            .reasoning_content
-                            .as_deref()
-                            .is_none_or(str::is_empty)
-                })
+                self.thinking.enabled
+                    && !req.messages.iter().any(|message| {
+                        message.role == "assistant"
+                            && message
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|tool_calls| !tool_calls.is_empty())
+                            && message
+                                .reasoning_content
+                                .as_deref()
+                                .is_none_or(str::is_empty)
+                    })
             });
         // Persisted UI-only metadata (usage/error/harness flags) must not be
         // replayed. DeepSeek V4 is the exception for reasoning attached to any
@@ -171,6 +190,15 @@ impl OpenAICompatClient {
             body["thinking"] = json!({
                 "type": if v4_thinking_enabled { "enabled" } else { "disabled" }
             });
+            if v4_thinking_enabled {
+                body["reasoning_effort"] = json!(reasoning_effort.as_str());
+            }
+        } else if is_known_openai_reasoning_target(&self.base_url, &req.model) {
+            body["reasoning_effort"] = if requested_thinking_enabled {
+                json!(reasoning_effort.as_str())
+            } else {
+                json!("none")
+            };
         }
         if let Some(max_tokens) = req.max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -307,6 +335,24 @@ impl OpenAICompatClient {
 
 fn is_deepseek_v4_model(model: &str) -> bool {
     model.starts_with("deepseek-v4-")
+}
+
+/// Reasoning extensions are not guaranteed across OpenAI-compatible servers.
+/// Fail closed unless both the authority and a currently documented model
+/// family are known to support this product's low/high/max/none contract.
+fn is_known_openai_reasoning_target(base_url: &str, model: &str) -> bool {
+    let official_openai = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"));
+    if !official_openai {
+        return false;
+    }
+
+    model == "gpt-5.6"
+        || model == "gpt-5.6-sol"
+        || model == "gpt-5.6-terra"
+        || model == "gpt-5.6-luna"
 }
 
 #[derive(Debug)]
@@ -1097,15 +1143,18 @@ fn parse_sse_line(line: &[u8]) -> LineOutcome {
 
     if let Some(choice) = v["choices"].as_array().and_then(|c| c.first()) {
         let delta = &choice["delta"];
-        if let Some(t) = delta["reasoning_content"].as_str() {
-            if !t.is_empty() {
-                events.push(StreamEvent::Thinking(t.to_string()));
-            }
-        }
-        if let Some(t) = delta["content"].as_str() {
-            if !t.is_empty() {
-                events.push(StreamEvent::Text(t.to_string()));
-            }
+        let thinking = delta["reasoning_content"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        let text = delta["content"].as_str().filter(|value| !value.is_empty());
+        match (thinking, text) {
+            (Some(thinking), Some(text)) => events.push(StreamEvent::AssistantDelta {
+                thinking: thinking.to_string(),
+                text: text.to_string(),
+            }),
+            (Some(thinking), None) => events.push(StreamEvent::Thinking(thinking.to_string())),
+            (None, Some(text)) => events.push(StreamEvent::Text(text.to_string())),
+            (None, None) => {}
         }
         // 流式 tool_calls：每个 delta 带一个 tool_calls 数组，按 index 累积。
         if let Some(arr) = delta["tool_calls"].as_array() {
@@ -1140,6 +1189,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use dss_core::{ThinkingEffort, ThinkingSettings};
     use futures::{stream, StreamExt};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use reqwest::StatusCode;
@@ -1150,9 +1200,10 @@ mod tests {
 
     use super::{
         bounded_retry_after, checked_bounded_add, chunk_lines_fit, collect_bounded_body,
-        is_retryable_status, parse_usage, retry_delay, sse_event_stream_with_timeouts,
-        OpenAICompatClient, RequestTimeouts, ERROR_BODY_BYTE_LIMIT, ERROR_BODY_CHAR_LIMIT,
-        MAX_REQUEST_ATTEMPTS, MAX_RETRY_DELAY, MAX_SSE_LINE_BYTES, RETRY_BASE_DELAY,
+        is_retryable_status, parse_sse_line, parse_usage, retry_delay,
+        sse_event_stream_with_timeouts, LineOutcome, OpenAICompatClient, RequestTimeouts,
+        ERROR_BODY_BYTE_LIMIT, ERROR_BODY_CHAR_LIMIT, MAX_REQUEST_ATTEMPTS, MAX_RETRY_DELAY,
+        MAX_SSE_LINE_BYTES, RETRY_BASE_DELAY,
     };
     use crate::{
         ChatMessage, ChatRequest, LlmClient, LlmError, StreamEvent, ToolCall, ToolDef, Usage,
@@ -1209,6 +1260,62 @@ mod tests {
         assert_eq!(usage.output_tokens, 3);
         assert_eq!(usage.cache_hit_tokens, 0);
         assert_eq!(usage.cache_miss_tokens, 0);
+    }
+
+    #[test]
+    fn sse_dual_content_delta_preserves_atomic_boundary_and_following_order() {
+        let line = br#"data: {"choices":[{"delta":{"reasoning_content":"same-line thought","content":"same-line answer","tool_calls":[{"index":2,"id":"call-2","function":{"name":"probe","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let LineOutcome::Events(events) = parse_sse_line(line) else {
+            panic!("dual-field SSE line must parse into events");
+        };
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::AssistantDelta { thinking, text }
+                if thinking == "same-line thought" && text == "same-line answer"
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ToolCallDelta(delta)
+                if delta.index == 2
+                    && delta.id.as_deref() == Some("call-2")
+                    && delta.name.as_deref() == Some("probe")
+                    && delta.arguments.as_deref() == Some("{}")
+        ));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::Finish { reason: Some(reason) } if reason == "tool_calls"
+        ));
+
+        for (line, expect_thinking) in [
+            (
+                br#"data: {"choices":[{"delta":{"reasoning_content":"only thought"},"finish_reason":null}]}"#
+                    .as_slice(),
+                true,
+            ),
+            (
+                br#"data: {"choices":[{"delta":{"content":"only answer"},"finish_reason":null}]}"#
+                    .as_slice(),
+                false,
+            ),
+        ] {
+            let LineOutcome::Events(events) = parse_sse_line(line) else {
+                panic!("single-field SSE line must parse into events");
+            };
+            assert_eq!(events.len(), 1);
+            if expect_thinking {
+                assert!(matches!(
+                    &events[0],
+                    StreamEvent::Thinking(value) if value == "only thought"
+                ));
+            } else {
+                assert!(matches!(
+                    &events[0],
+                    StreamEvent::Text(value) if value == "only answer"
+                ));
+            }
+        }
     }
 
     enum TestServerAction {
@@ -1504,6 +1611,124 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert!(sent["content"].is_null());
         assert!(sent.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_v4_client_policy_controls_switch_effort_and_replay() {
+        let client =
+            OpenAICompatClient::new("https://api.deepseek.com", "secret", "deepseek-v4-flash")
+                .with_thinking_settings(ThinkingSettings {
+                    enabled: true,
+                    effort: ThinkingEffort::Low,
+                });
+        let mut history = ChatMessage::assistant("answer");
+        history.reasoning_content = Some("provider reasoning".into());
+        let body = client.build_body(&ChatRequest::new("deepseek-v4-flash", vec![history]), false);
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            "provider reasoning"
+        );
+
+        let disabled =
+            OpenAICompatClient::new("https://api.deepseek.com", "secret", "deepseek-v4-flash")
+                .with_thinking_settings(ThinkingSettings {
+                    enabled: false,
+                    effort: ThinkingEffort::Max,
+                });
+        let mut history = ChatMessage::assistant("answer");
+        history.reasoning_content = Some("must stay local".into());
+        let body =
+            disabled.build_body(&ChatRequest::new("deepseek-v4-flash", vec![history]), false);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_legacy_fallback_and_request_overrides_keep_exact_precedence() {
+        let client =
+            OpenAICompatClient::new("https://api.deepseek.com", "secret", "deepseek-v4-flash")
+                .with_thinking_settings(ThinkingSettings {
+                    enabled: true,
+                    effort: ThinkingEffort::Max,
+                });
+        let legacy = ChatMessage::assistant_tool_calls(vec![ToolCall::function(
+            "legacy",
+            "read_file",
+            "{}".into(),
+        )]);
+        let body = client.build_body(
+            &ChatRequest::new("deepseek-v4-flash", vec![legacy.clone()]),
+            false,
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning_effort").is_none());
+
+        let mut forced = ChatRequest::new("deepseek-v4-flash", vec![legacy]);
+        forced.thinking_enabled = Some(true);
+        forced.reasoning_effort = Some(ThinkingEffort::High);
+        let body = client.build_body(&forced, false);
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let mut forced_off = ChatRequest::new(
+            "deepseek-v4-flash",
+            vec![ChatMessage::user("answer directly")],
+        );
+        forced_off.thinking_enabled = Some(false);
+        forced_off.reasoning_effort = Some(ThinkingEffort::Low);
+        let body = client.build_body(&forced_off, false);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_fields_are_capability_gated_and_never_use_deepseek_shape() {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let openai = OpenAICompatClient::new("https://api.openai.com/v1", "secret", model)
+                .with_thinking_settings(ThinkingSettings {
+                    enabled: true,
+                    effort: ThinkingEffort::Max,
+                });
+            let body = openai.build_body(
+                &ChatRequest::new(model, vec![ChatMessage::user("hello")]),
+                true,
+            );
+            assert_eq!(body["reasoning_effort"], "max", "{model}");
+            assert!(body.get("thinking").is_none(), "{model}");
+        }
+
+        let openai = OpenAICompatClient::new("https://api.openai.com/v1", "secret", "gpt-5.6-sol");
+        let mut off = ChatRequest::new("gpt-5.6-sol", vec![ChatMessage::user("hello")]);
+        off.thinking_enabled = Some(false);
+        let body = openai.build_body(&off, false);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert!(body.get("thinking").is_none());
+
+        for (base_url, model) in [
+            ("https://api.openai.com/v1", "gpt-4o"),
+            ("https://proxy.example/v1", "gpt-5.6-sol"),
+            ("https://api.openai.com.evil.test/v1", "gpt-5.6-sol"),
+            ("https://api.openai.com/v1", "custom-reasoner"),
+            ("https://api.openai.com/v1", "gpt-5.6-sol-custom"),
+            ("https://api.openai.com/v1", "gpt-5.6-terra-unsupported"),
+            ("https://api.openai.com/v1", "gpt-5.6-luna-preview"),
+        ] {
+            let client = OpenAICompatClient::new(base_url, "secret", model).with_thinking_settings(
+                ThinkingSettings {
+                    enabled: true,
+                    effort: ThinkingEffort::High,
+                },
+            );
+            let body = client.build_body(
+                &ChatRequest::new(model, vec![ChatMessage::user("hello")]),
+                false,
+            );
+            assert!(body.get("reasoning_effort").is_none(), "{base_url} {model}");
+            assert!(body.get("thinking").is_none(), "{base_url} {model}");
+        }
     }
 
     #[test]

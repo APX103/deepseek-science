@@ -21,6 +21,14 @@ import * as api from './api/client'
 import { AsyncVersionGuard } from './api/asyncVersionGuard'
 import { sanitizeAssistantDisplayText } from './api/assistantProtocol'
 import { createRunId } from './api/sessionRun'
+import {
+  carryThinkingDisclosureMessageMetadata,
+  discardThinkingDisclosureBlock,
+  reconcileThinkingDisclosureHistory,
+  registerThinkingDisclosureBlock,
+  registerThinkingDisclosureMessage,
+  thinkingDisclosureId,
+} from './api/thinkingDisclosure'
 
 interface State {
   projects: Project[]
@@ -67,11 +75,12 @@ export async function loadFromBackend(): Promise<void> {
 }
 
 /** 拉取某会话的消息历史（从 GET /sessions/{sid} 恢复），回填 messages[sid]。 */
-export async function loadMessages(sid: string): Promise<void> {
+export async function loadMessages(sid: string): Promise<boolean> {
   const version = sessionLoadGuard.begin(sid)
   try {
     const s = await api.getSession(sid)
-    if (!sessionLoadGuard.isCurrent(sid, version)) return
+    if (!sessionLoadGuard.isCurrent(sid, version)) return false
+    reconcileThinkingDisclosureHistory(s.messages)
     setState({
       ...state,
       messages: { ...state.messages, [sid]: s.messages },
@@ -80,8 +89,10 @@ export async function loadMessages(sid: string): Promise<void> {
         summary.id === sid ? { ...summary, status: s.status } : summary,
       ),
     })
+    return true
   } catch {
     // 后端无此会话或离线：保留空。
+    return false
   }
 }
 
@@ -122,6 +133,11 @@ export function useSessionState(sid: string): SessionState | undefined {
   return useSyncExternalStore(subscribe, () => state.sessionStates[sid])
 }
 
+/** Imperative session snapshot for run coordinators that outlive a page render. */
+export function getSessionStateSnapshot(sid: string): SessionState | undefined {
+  return state.sessionStates[sid]
+}
+
 // ---------- projects ----------
 /** 新项目入列表（NewProjectModal 经 api/client 建好后回传）。 */
 export function addProject(p: Project) {
@@ -137,7 +153,7 @@ export function updateProject(pid: string, patch: Partial<Project>) {
   })
 }
 
-/** 归档/删除在第一版均为前端态移除（TODO: 接后端后区分软删/硬删）。 */
+/** 后端操作成功后，同步移除本地项目状态。 */
 export function removeProject(pid: string) {
   setState({ ...state, projects: state.projects.filter((p) => p.id !== pid) })
 }
@@ -219,6 +235,8 @@ export interface StreamBuffer {
   iterations: number
   /** 当前正在呈现的 LLM iteration；进入下一轮时会提交上一段。 */
   currentIteration: number
+  /** `draft_reset` 后递增，避免折叠选择泄漏到新的候选草稿。 */
+  draftRevision: number
   error: string | null
   /** 本轮 run 累积的工具调用（含结果，按到达顺序）。 */
   toolCalls: StreamToolCall[]
@@ -277,6 +295,7 @@ export function startStream(
       usage: null,
       iterations: 0,
       currentIteration: 0,
+      draftRevision: 0,
       error: null,
       toolCalls: [],
       pendingAsk: null,
@@ -301,7 +320,13 @@ export function startStream(
 export function appendStreamThinking(sid: string, t: string, expectedRunId?: string): boolean {
   const s = activeStream(sid, expectedRunId)
   if (!s) return false
-  streams = { ...streams, [sid]: { ...s, thinking: s.thinking + t } }
+  const thinking = s.thinking + t
+  registerThinkingDisclosureBlock(
+    s.runId,
+    thinkingDisclosureId(s.runId, s.currentIteration, s.draftRevision),
+    sanitizeAssistantDisplayText(thinking),
+  )
+  streams = { ...streams, [sid]: { ...s, thinking } }
   listeners.forEach((l) => l())
   return true
 }
@@ -319,7 +344,19 @@ export function appendStreamText(sid: string, t: string, expectedRunId?: string)
 export function resetStreamDraft(sid: string, expectedRunId?: string): boolean {
   const s = activeStream(sid, expectedRunId)
   if (!s) return false
-  streams = { ...streams, [sid]: { ...s, thinking: '', text: '' } }
+  discardThinkingDisclosureBlock(
+    s.runId,
+    thinkingDisclosureId(s.runId, s.currentIteration, s.draftRevision),
+  )
+  streams = {
+    ...streams,
+    [sid]: {
+      ...s,
+      thinking: '',
+      text: '',
+      draftRevision: s.draftRevision + 1,
+    },
+  }
   listeners.forEach((l) => l())
   return true
 }
@@ -363,6 +400,7 @@ export function advanceStreamIteration(
     [sid]: {
       ...current,
       currentIteration: iteration,
+      draftRevision: 0,
       iterations: Math.max(current.iterations, iteration),
       thinking: '',
       text: '',
@@ -451,8 +489,12 @@ export function appendStreamToolResult(
 function commitStreamMessage(sid: string, s: StreamBuffer): boolean {
   if (!s.thinking && !s.text && s.toolCalls.length === 0) return false
   const blocks: ContentBlock[] = []
+  const thinkingDisclosureIds: string[] = []
   if (s.thinking) {
     blocks.push({ type: 'thinking', thinking: sanitizeAssistantDisplayText(s.thinking) })
+    thinkingDisclosureIds.push(
+      thinkingDisclosureId(s.runId, s.currentIteration, s.draftRevision),
+    )
   }
   if (s.text) blocks.push({ type: 'text', text: sanitizeAssistantDisplayText(s.text) })
   // 工具调用按到达顺序输出 use + result 块（与历史消息渲染一致）。
@@ -467,13 +509,21 @@ function commitStreamMessage(sid: string, s: StreamBuffer): boolean {
       })
     }
   }
+  const message: Message = {
+    role: 'assistant',
+    content: blocks,
+    usage: s.usage,
+  }
+  if (thinkingDisclosureIds.length > 0) {
+    registerThinkingDisclosureMessage(message, s.runId, thinkingDisclosureIds)
+  }
   setState({
     ...state,
     messages: {
       ...state.messages,
       [sid]: [
         ...(state.messages[sid] ?? []),
-        { role: 'assistant', content: blocks, usage: s.usage },
+        message,
       ],
     },
   })
@@ -522,7 +572,10 @@ function attachRunToCurrentTurn(sid: string, startIndex: number, run: SessionRun
   const messages = [...(state.messages[sid] ?? [])]
   if (messages.length === 0) return
   const target = Math.max(0, Math.min(messages.length - 1, Math.max(startIndex, messages.length - 1)))
-  messages[target] = { ...messages[target], run }
+  const source = messages[target]!
+  const next = { ...source, run }
+  carryThinkingDisclosureMessageMetadata(source, next)
+  messages[target] = next
   setState({ ...state, messages: { ...state.messages, [sid]: messages } })
 }
 
@@ -689,9 +742,13 @@ export function setStreamAborter(
 }
 
 /** Enter stopping state without unlocking the composer or aborting SSE yet. */
-export function beginStreamStop(sid: string): string | null {
+export function beginStreamStop(sid: string, expectedRunId?: string): string | null {
   const s = streams[sid]
-  if (!s?.running || s.stopping) return null
+  if (
+    !s?.running ||
+    s.stopping ||
+    (expectedRunId !== undefined && s.runId !== expectedRunId)
+  ) return null
   streams = {
     ...streams,
     [sid]: { ...s, stopping: true, error: null },
@@ -765,6 +822,29 @@ export function resumeStreamAfterLateStop(sid: string, expectedRunId?: string): 
   }
   streams = { ...streams, [sid]: { ...s, stopping: false } }
   listeners.forEach((l) => l())
+  return true
+}
+
+/**
+ * The cancel endpoint reported that a normal terminal beat Stop and the caller
+ * has already restored the authoritative transcript after persistence. Drop
+ * the exact local shell without committing its partial draft: appending here
+ * would duplicate content that is already present in the restored history.
+ */
+export function retireStreamAfterBackendFinish(
+  sid: string,
+  expectedRunId: string,
+): boolean {
+  const s = streams[sid]
+  if (!s?.running || s.runId !== expectedRunId) return false
+
+  const aborter = aborters.get(sid)
+  if (aborter?.runId === s.runId) aborter.abort()
+  const nextStreams = { ...streams }
+  delete nextStreams[sid]
+  streams = nextStreams
+  deleteStreamAborter(sid, s.runId)
+  listeners.forEach((listener) => listener())
   return true
 }
 

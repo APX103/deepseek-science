@@ -10,9 +10,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::dsml::{
-    parse_assistant_text, DsmlError, ParsedAssistantText, MAX_ASSISTANT_TEXT_BYTES,
-    MAX_TOOL_ARGUMENT_BYTES_PER_CALL, MAX_TOOL_ARGUMENT_BYTES_TOTAL, MAX_TOOL_CALLS_PER_TURN,
-    MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_NAME_BYTES,
+    DsmlError, IncrementalAssistantTextGuard, IncrementalAssistantTextResult,
+    MAX_ASSISTANT_TEXT_BYTES, MAX_TOOL_ARGUMENT_BYTES_PER_CALL, MAX_TOOL_ARGUMENT_BYTES_TOTAL,
+    MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_NAME_BYTES,
 };
 use crate::events::{AgentEvent, CompleteKind, ToolCallView, ToolResultView};
 use crate::frame::FrameStatus;
@@ -39,7 +39,10 @@ fn to_llm_tool_defs(
 }
 
 /// Runner 主循环的迭代上限（modules.md 的 `max_iterations` 软上限）。
-pub const MAX_ITERATIONS: u32 = 25;
+///
+/// This remains the public compatibility name for the default. Production callers may pass a
+/// persisted value up to `dss_core::MAX_CONFIGURABLE_ITERATIONS` to `Runner::run`.
+pub const MAX_ITERATIONS: u32 = dss_core::DEFAULT_MAX_ITERATIONS;
 /// empty-retry 门：空响应重试上限（modules.md ≤3）。
 pub const EMPTY_RETRY_CAP: u32 = 3;
 /// 检索熔断：连续纯检索轮数阈值（modules.md ≥6）。
@@ -141,17 +144,16 @@ fn rejected_inactive_plan_update_results(calls: &[ToolCall]) -> Vec<ToolResult> 
         .collect()
 }
 
-/// Remote A2A delegation owns a durability boundary: once its complete transcript returns, it
-/// must be checkpointed before another tool can block this assistant turn. Reject the whole batch
-/// before Router execution, preserving one paired error for every model-declared call and giving
-/// the model deterministic next-turn recovery instructions.
-fn rejected_exclusive_a2a_batch_results(calls: &[ToolCall]) -> Vec<ToolResult> {
+/// Exclusive tools own a durability/side-effect boundary and must finish before another tool can
+/// block the same assistant turn. Reject the whole batch before Router execution, preserving one
+/// paired error for every model-declared call and deterministic next-turn recovery instructions.
+fn rejected_exclusive_tool_batch_results(calls: &[ToolCall]) -> Vec<ToolResult> {
     calls
         .iter()
         .map(|call| ToolResult {
             tool_use_id: call.id.clone(),
             content: format!(
-                "tool `{}` was not executed: a remote A2A delegation must be the only tool call in its model turn. On the next turn, call exactly one A2A tool by itself; retry any other tools in separate later turns",
+                "tool `{}` was not executed: an exclusive remote tool must be the only tool call in its model turn. On the next turn, call exactly one exclusive tool by itself; retry any other tools in separate later turns",
                 call.function.name
             ),
             is_error: true,
@@ -194,6 +196,8 @@ fn is_retrieval_tool(name: &str) -> bool {
             | "list_skills"
             | "list_files"
             | "read_file"
+            | "mcp_list_resources"
+            | "mcp_read_resource"
     )
 }
 
@@ -440,11 +444,8 @@ impl Runner {
             )
             .filter_map(parse_explicit_iteration_limit)
             .min();
-        let agent_iteration_limit = explicit_iteration_limit
-            .map(|limit| limit.min(max_iterations))
-            .unwrap_or(max_iterations);
-        let user_iteration_cap_active =
-            explicit_iteration_limit.is_some_and(|limit| limit <= max_iterations);
+        let (agent_iteration_limit, user_iteration_cap_active) =
+            effective_iteration_limit(explicit_iteration_limit, max_iterations);
         let mut tool_error_count = 0u32;
         let mut last_veto_findings = Vec::new();
         let mut artifact_repair_trace_start = None;
@@ -593,12 +594,11 @@ impl Runner {
             let mut tool_acc = ToolCallAccumulator::default();
             let mut finish_reason: Option<String> = None;
             let mut saw_finish = false;
-            // Text is an untrusted data/control multiplex until the complete
-            // turn proves whether it is ordinary Markdown or textual DSML.
-            // Holding the whole turn is the only way to guarantee that a late
-            // DSML opener cannot leave already-published parameter data.
-            let mut quarantined_text = String::new();
-            let mut quarantined_thinking = String::new();
+            // Each channel retains its complete bounded turn for the canonical
+            // DSML parse while releasing only irrevocably ordinary prefixes.
+            let mut text_guard = IncrementalAssistantTextGuard::new();
+            let mut thinking_guard = IncrementalAssistantTextGuard::new();
+            let mut thinking_len_at_text_first_lt: Option<usize> = None;
 
             futures::pin_mut!(stream);
             loop {
@@ -612,86 +612,268 @@ impl Runner {
                 match next_event {
                     Some(Ok(StreamEvent::Thinking(t))) => {
                         if saw_finish {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
                                 "provider emitted reasoning after the Finish event".to_string(),
-                                None,
                             )
                             .await;
                         }
-                        if quarantined_thinking
-                            .len()
-                            .saturating_add(quarantined_text.len())
+                        if thinking_guard
+                            .buffered_len()
+                            .saturating_add(text_guard.buffered_len())
                             .saturating_add(t.len())
                             > MAX_ASSISTANT_TEXT_BYTES
                         {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
                                 DsmlError::TooLarge.to_string(),
-                                None,
                             )
                             .await;
                         }
-                        quarantined_thinking.push_str(&t);
+                        let released = match thinking_guard.push(&t) {
+                            Ok(released) => released,
+                            Err(error) => {
+                                return fail_invalidated_candidate(
+                                    session,
+                                    tx,
+                                    &mut progress,
+                                    final_text,
+                                    "assistant_protocol_invalid",
+                                    error.to_string(),
+                                )
+                                .await;
+                            }
+                        };
+                        if thinking_guard.publication_is_frozen() {
+                            // Thinking and answer are one control-plane
+                            // boundary: a marker in either channel must stop
+                            // both before the next await can publish data.
+                            text_guard.freeze_publication();
+                        }
+                        if let Some(released) = released {
+                            if !send(
+                                tx,
+                                AgentEvent::Thinking {
+                                    text: released.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                return cancel(session, &mut progress);
+                            }
+                            progress.published.thinking.push_str(&released);
+                        }
                     }
                     Some(Ok(StreamEvent::Text(t))) => {
                         if saw_finish {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
                                 "provider emitted assistant text after the Finish event"
                                     .to_string(),
-                                None,
                             )
                             .await;
                         }
-                        if quarantined_thinking
-                            .len()
-                            .saturating_add(quarantined_text.len())
+                        if thinking_guard
+                            .buffered_len()
+                            .saturating_add(text_guard.buffered_len())
                             .saturating_add(t.len())
                             > MAX_ASSISTANT_TEXT_BYTES
                         {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
                                 DsmlError::TooLarge.to_string(),
-                                None,
                             )
                             .await;
                         }
-                        quarantined_text.push_str(&t);
+                        let text_had_observed_raw_lt = text_guard.has_observed_raw_lt();
+                        let released = match text_guard.push(&t) {
+                            Ok(released) => released,
+                            Err(error) => {
+                                return fail_invalidated_candidate(
+                                    session,
+                                    tx,
+                                    &mut progress,
+                                    final_text,
+                                    "assistant_protocol_invalid",
+                                    error.to_string(),
+                                )
+                                .await;
+                            }
+                        };
+                        if !text_had_observed_raw_lt && text_guard.has_observed_raw_lt() {
+                            // This byte offset is an event boundary: every
+                            // reasoning byte already buffered happened before
+                            // Text first entered the possible control plane.
+                            thinking_len_at_text_first_lt = Some(thinking_guard.buffered_len());
+                        }
+                        if text_guard.publication_is_frozen() {
+                            thinking_guard.freeze_publication();
+                        }
+                        if let Some(released) = released {
+                            if !send(
+                                tx,
+                                AgentEvent::Text {
+                                    text: released.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                return cancel(session, &mut progress);
+                            }
+                            progress.published.text.push_str(&released);
+                        }
                     }
-                    Some(Ok(StreamEvent::ToolCallDelta(d))) => {
+                    Some(Ok(StreamEvent::AssistantDelta { thinking, text })) => {
                         if saw_finish {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
+                                "provider emitted an assistant delta after the Finish event"
+                                    .to_string(),
+                            )
+                            .await;
+                        }
+                        if thinking_guard
+                            .buffered_len()
+                            .saturating_add(text_guard.buffered_len())
+                            .saturating_add(thinking.len())
+                            .saturating_add(text.len())
+                            > MAX_ASSISTANT_TEXT_BYTES
+                        {
+                            return fail_invalidated_candidate(
+                                session,
+                                tx,
+                                &mut progress,
+                                final_text,
+                                "assistant_protocol_invalid",
+                                DsmlError::TooLarge.to_string(),
+                            )
+                            .await;
+                        }
+
+                        // Preserve the provider's atomic delta boundary. If
+                        // either sibling contains a possible control opener,
+                        // freeze both before either guard can return publishable
+                        // bytes. No await is allowed until both guards have
+                        // consumed the complete delta and synchronized state.
+                        let thinking_len_at_event_start = thinking_guard.buffered_len();
+                        let text_len_at_event_start = text_guard.buffered_len();
+                        let text_had_observed_raw_lt = text_guard.has_observed_raw_lt();
+                        if thinking.as_bytes().contains(&b'<') || text.as_bytes().contains(&b'<') {
+                            thinking_guard.freeze_publication();
+                            text_guard.freeze_publication();
+                        }
+
+                        let released_thinking = match thinking_guard.push(&thinking) {
+                            Ok(released) => released,
+                            Err(error) => {
+                                return fail_invalidated_candidate(
+                                    session,
+                                    tx,
+                                    &mut progress,
+                                    final_text,
+                                    "assistant_protocol_invalid",
+                                    error.to_string(),
+                                )
+                                .await;
+                            }
+                        };
+                        let released_text = match text_guard.push(&text) {
+                            Ok(released) => released,
+                            Err(error) => {
+                                return fail_invalidated_candidate(
+                                    session,
+                                    tx,
+                                    &mut progress,
+                                    final_text,
+                                    "assistant_protocol_invalid",
+                                    error.to_string(),
+                                )
+                                .await;
+                            }
+                        };
+
+                        if !text_had_observed_raw_lt && text_guard.has_observed_raw_lt() {
+                            debug_assert!(text_guard.buffered_len() > text_len_at_event_start);
+                            // Exclude this same provider delta's reasoning from
+                            // the P2 pre-Text-latch allowance. It is a sibling
+                            // of the control opener, not earlier evidence.
+                            thinking_len_at_text_first_lt = Some(thinking_len_at_event_start);
+                        }
+                        if thinking_guard.publication_is_frozen()
+                            || text_guard.publication_is_frozen()
+                        {
+                            thinking_guard.freeze_publication();
+                            text_guard.freeze_publication();
+                        }
+
+                        if let Some(released) = released_thinking {
+                            if !send(
+                                tx,
+                                AgentEvent::Thinking {
+                                    text: released.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                return cancel(session, &mut progress);
+                            }
+                            progress.published.thinking.push_str(&released);
+                        }
+                        if let Some(released) = released_text {
+                            if !send(
+                                tx,
+                                AgentEvent::Text {
+                                    text: released.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                return cancel(session, &mut progress);
+                            }
+                            progress.published.text.push_str(&released);
+                        }
+                    }
+                    Some(Ok(StreamEvent::ToolCallDelta(d))) => {
+                        if saw_finish {
+                            return fail_invalidated_candidate(
+                                session,
+                                tx,
+                                &mut progress,
+                                final_text,
+                                "assistant_protocol_invalid",
                                 "provider emitted a tool-call delta after the Finish event"
                                     .to_string(),
-                                None,
                             )
                             .await;
                         }
                         if let Err(error) = tool_acc.push(d) {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
                                 format!("provider emitted invalid native tool protocol: {error}"),
-                                None,
                             )
                             .await;
                         }
@@ -699,13 +881,13 @@ impl Runner {
                     Some(Ok(StreamEvent::Usage(u))) => progress.record_usage(u),
                     Some(Ok(StreamEvent::Finish { reason })) => {
                         if saw_finish {
-                            return fail(
+                            return fail_invalidated_candidate(
                                 session,
                                 tx,
                                 &mut progress,
                                 final_text,
+                                "assistant_protocol_invalid",
                                 "provider emitted more than one Finish event".to_string(),
-                                None,
                             )
                             .await;
                         }
@@ -739,59 +921,71 @@ impl Runner {
             }
 
             // —— 决策门（顺序严格遵循 modules.md §4）——
-            let safe_thinking = match parse_assistant_text(&quarantined_thinking) {
-                Ok(ParsedAssistantText::Plain(thinking)) => thinking,
-                Ok(ParsedAssistantText::ToolCalls { .. }) => {
-                    return fail(
+            // Parse both complete bounded channels before any cross-channel
+            // frozen suffix can cross the event boundary.
+            let thinking_released_cursor = thinking_guard.released_cursor();
+            let thinking_before_text_lt_remainder_len = thinking_len_at_text_first_lt
+                .and_then(|cutoff| cutoff.checked_sub(thinking_released_cursor));
+            let parsed_thinking = thinking_guard.finish();
+            let parsed_text = text_guard.finish();
+            let mut thinking_remainder = match parsed_thinking {
+                Ok(IncrementalAssistantTextResult::Plain(remainder)) => remainder,
+                Ok(IncrementalAssistantTextResult::ToolCalls { .. }) => {
+                    return fail_invalidated_candidate(
                         session,
                         tx,
                         &mut progress,
                         final_text,
+                        "assistant_protocol_invalid",
                         "provider emitted textual DSML protocol in the reasoning channel"
                             .to_string(),
-                        None,
                     )
                     .await;
                 }
                 Err(error) => {
-                    return fail(
+                    return fail_invalidated_candidate(
                         session,
                         tx,
                         &mut progress,
                         final_text,
+                        "assistant_protocol_invalid",
                         format!("provider emitted invalid reasoning protocol: {error}"),
-                        None,
                     )
                     .await;
                 }
             };
 
             let had_native_tool_deltas = !tool_acc.is_empty();
-            let parsed_text = match parse_assistant_text(&quarantined_text) {
+            let parsed_text = match parsed_text {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    return fail(
+                    return fail_invalidated_candidate(
                         session,
                         tx,
                         &mut progress,
                         final_text,
+                        "assistant_protocol_invalid",
                         format!("provider emitted invalid textual DSML protocol: {error}"),
-                        None,
                     )
                     .await;
                 }
             };
+            let both_channels_plain =
+                matches!(&parsed_text, IncrementalAssistantTextResult::Plain(_));
             if had_native_tool_deltas
-                && matches!(&parsed_text, ParsedAssistantText::ToolCalls { .. })
+                && matches!(
+                    &parsed_text,
+                    IncrementalAssistantTextResult::ToolCalls { .. }
+                )
             {
-                return fail(
+                return fail_invalidated_candidate(
                     session,
                     tx,
                     &mut progress,
                     final_text,
+                    "assistant_protocol_invalid",
                     "provider emitted both native and textual DSML tool protocols in one turn"
                         .to_string(),
-                    None,
                 )
                 .await;
             }
@@ -799,21 +993,21 @@ impl Runner {
             let mut finalized = match tool_acc.finalize() {
                 Ok(calls) => calls,
                 Err(error) => {
-                    return fail(
+                    return fail_invalidated_candidate(
                         session,
                         tx,
                         &mut progress,
                         final_text,
+                        "assistant_protocol_invalid",
                         format!("provider emitted invalid native tool protocol: {error}"),
-                        None,
                     )
                     .await;
                 }
             };
 
-            let visible_text = match parsed_text {
-                ParsedAssistantText::Plain(text) => text,
-                ParsedAssistantText::ToolCalls {
+            let text_remainder = match parsed_text {
+                IncrementalAssistantTextResult::Plain(remainder) => remainder,
+                IncrementalAssistantTextResult::ToolCalls {
                     visible_text,
                     calls,
                 } => {
@@ -840,50 +1034,62 @@ impl Runner {
                     .map(|call| call.function.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                return fail(
+                return fail_invalidated_candidate(
                     session,
                     tx,
                     &mut progress,
                     final_text,
+                    "assistant_capability_violation",
                     format!(
                         "user-specified agent iteration budget exhausted ({agent_iteration_limit}): final iteration attempted tool call(s) after tools were disabled: {attempted}"
                     ),
-                    None,
                 )
                 .await;
             }
 
-            // Nothing derived from the quarantined response crosses the UI or
-            // history boundary before parsing, mixed-protocol detection and
-            // final-iteration capability checks have all succeeded.
+            // Flush cross-channel frozen suffixes only when both canonical
+            // channels are plain. For canonical Text tool calls, retain only
+            // reasoning bytes that predate Text's first raw `<`; any later
+            // sibling-latched suffix stays private. Every protocol/capability
+            // gate above must accept the turn first. Native tool deltas remain
+            // private until the complete batch below.
             if tx.is_closed() {
                 return cancel(session, &mut progress);
             }
-            if !safe_thinking.is_empty() {
+            if !both_channels_plain {
+                let safe_len = thinking_before_text_lt_remainder_len
+                    .filter(|length| {
+                        *length <= thinking_remainder.len()
+                            && thinking_remainder.is_char_boundary(*length)
+                    })
+                    .unwrap_or(0);
+                thinking_remainder.truncate(safe_len);
+            }
+            if !thinking_remainder.is_empty() {
                 if !send(
                     tx,
                     AgentEvent::Thinking {
-                        text: safe_thinking.clone(),
+                        text: thinking_remainder.clone(),
                     },
                 )
                 .await
                 {
                     return cancel(session, &mut progress);
                 }
-                progress.published.thinking = safe_thinking;
+                progress.published.thinking.push_str(&thinking_remainder);
             }
-            if !visible_text.is_empty() {
+            if both_channels_plain && !text_remainder.is_empty() {
                 if !send(
                     tx,
                     AgentEvent::Text {
-                        text: visible_text.clone(),
+                        text: text_remainder.clone(),
                     },
                 )
                 .await
                 {
                     return cancel(session, &mut progress);
                 }
-                progress.published.text = visible_text;
+                progress.published.text.push_str(&text_remainder);
             }
 
             // 门 1：max_tokens 续传（finish_reason == length）。
@@ -988,7 +1194,7 @@ impl Runner {
                             plan_step_updates_allowed,
                         )
                     });
-                let exclusive_a2a_batch_denied = finalized.len() > 1
+                let exclusive_tool_batch_denied = finalized.len() > 1
                     && finalized.iter().any(|call| {
                         tools.batch_policy(&call.function.name) == Some(ToolBatchPolicy::Exclusive)
                     });
@@ -996,8 +1202,8 @@ impl Runner {
                     rejected_preapproval_results(&finalized)
                 } else if inactive_plan_update_batch_denied {
                     rejected_inactive_plan_update_results(&finalized)
-                } else if exclusive_a2a_batch_denied {
-                    rejected_exclusive_a2a_batch_results(&finalized)
+                } else if exclusive_tool_batch_denied {
+                    rejected_exclusive_tool_batch_results(&finalized)
                 } else {
                     // —— 执行工具（并发 + 30s 超时）——
                     let pending: Vec<PendingToolCall> = finalized
@@ -1844,7 +2050,7 @@ fn parse_explicit_iteration_limit(prompt: &str) -> Option<u32> {
             let Ok(limit) = prefix[digit_start..digit_end].parse::<u32>() else {
                 continue;
             };
-            if limit == 0 || limit > MAX_ITERATIONS {
+            if limit == 0 || limit > dss_core::MAX_CONFIGURABLE_ITERATIONS {
                 continue;
             }
 
@@ -1868,6 +2074,16 @@ fn parse_explicit_iteration_limit(prompt: &str) -> Option<u32> {
     }
 
     limits.into_iter().min()
+}
+
+/// Apply a user-authored limit only as a further restriction; natural language can never expand
+/// the configured hard wall. The boolean preserves the existing dedicated final-iteration UX
+/// only when the user limit is the binding constraint.
+fn effective_iteration_limit(explicit: Option<u32>, configured: u32) -> (u32, bool) {
+    (
+        explicit.map_or(configured, |limit| limit.min(configured)),
+        explicit.is_some_and(|limit| limit <= configured),
+    )
 }
 
 fn is_iteration_count_joiner(joiner: &str) -> bool {
@@ -2040,6 +2256,36 @@ impl ToolCallAccumulator {
         }
         Ok(finalized)
     }
+}
+
+/// A protocol or capability decision can invalidate text that was safe to
+/// display provisionally but cannot enter canonical assistant history. Hide
+/// that candidate before resetting the live draft, matching reviewer-reset
+/// ordering, then report the terminal error through the ordinary failure path.
+async fn fail_invalidated_candidate(
+    session: &mut Session,
+    tx: &mpsc::Sender<AgentEvent>,
+    progress: &mut RunProgress,
+    previous_text: String,
+    reset_reason: &str,
+    message: String,
+) -> RunOutcome {
+    let has_published_draft =
+        !progress.published.thinking.is_empty() || !progress.published.text.is_empty();
+    if has_published_draft {
+        progress.hide_published(session);
+        if !send(
+            tx,
+            AgentEvent::DraftReset {
+                reason: reset_reason.to_string(),
+            },
+        )
+        .await
+        {
+            return cancel(session, progress);
+        }
+    }
+    fail(session, tx, progress, previous_text, message, None).await
 }
 
 /// LLM 失败路径：frame Failed + complete kind=error。
@@ -2416,6 +2662,7 @@ mod tests {
 
     #[test]
     fn explicit_iteration_limit_requires_nearby_limiting_language() {
+        assert_eq!(MAX_ITERATIONS, 100);
         assert_eq!(
             parse_explicit_iteration_limit("Finish in ≤6 iterations and verify the report."),
             Some(6)
@@ -2436,6 +2683,12 @@ mod tests {
             parse_explicit_iteration_limit("不超过10个 agent iterations 完成。"),
             Some(10)
         );
+        assert_eq!(
+            parse_explicit_iteration_limit("最多 200 轮完成，完成后立即停止。"),
+            Some(200)
+        );
+        assert_eq!(parse_explicit_iteration_limit("最多 0 轮完成。"), None);
+        assert_eq!(parse_explicit_iteration_limit("最多 1001 轮完成。"), None);
         assert_eq!(parse_explicit_iteration_limit("此轮限 3 轮完成。"), Some(3));
         assert_eq!(
             parse_explicit_iteration_limit("There are 4 iterations in the input dataset."),
@@ -2476,11 +2729,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_iteration_limit_can_only_narrow_the_configured_budget() {
+        assert_eq!(effective_iteration_limit(None, 160), (160, false));
+        assert_eq!(effective_iteration_limit(Some(40), 160), (40, true));
+        assert_eq!(effective_iteration_limit(Some(200), 160), (160, false));
+        assert_eq!(effective_iteration_limit(Some(200), 640), (200, true));
+    }
+
+    #[test]
     fn science_policy_covers_observed_cross_domain_failures() {
         assert!(SCIENCE_EXECUTION_POLICY.contains("smallest cheap validation"));
         assert!(SCIENCE_EXECUTION_POLICY.contains("post-hoc/exploratory"));
         assert!(SCIENCE_EXECUTION_POLICY.contains("zero exceedances"));
         assert!(SCIENCE_EXECUTION_POLICY.contains("actual tool trace"));
         assert!(SCIENCE_EXECUTION_POLICY.contains("Respect explicit user limits"));
+    }
+
+    #[test]
+    fn mcp_resource_reads_count_as_retrieval_but_agent_calls_do_not() {
+        assert!(is_retrieval_tool("mcp_list_resources"));
+        assert!(is_retrieval_tool("mcp_read_resource"));
+        assert!(!is_retrieval_tool("call_agent"));
+        assert!(!is_retrieval_tool("mcp__agent_registry__mutating_tool"));
     }
 }

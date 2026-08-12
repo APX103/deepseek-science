@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
 use dss_core::A2aAgentConfig;
 use reqwest::Url;
@@ -14,6 +15,95 @@ pub(crate) const MAX_ENDPOINT_BYTES: usize = 2_048;
 pub(crate) const MAX_TASK_BYTES: usize = 256 * 1024;
 pub(crate) const MIN_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const MAX_TIMEOUT_SECONDS: u64 = 300;
+
+/// Optional, runtime-only socket routing for A2A HTTP traffic.
+///
+/// Resolution overrides keep the original URL hostname intact, so TLS SNI and the HTTP Host
+/// header continue to identify the configured Agent. They are deliberately client construction
+/// data and are never persisted into an Agent configuration or Agent Card.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct A2aRouteOptions {
+    pub interface: Option<String>,
+    pub resolve: HashMap<String, SocketAddr>,
+}
+
+/// Explicit provenance assertion for an anonymous Agent endpoint read from a Registry.
+///
+/// Construct this only after the caller has bound an exact Registry Resource to a descriptor and
+/// validated that the descriptor declares anonymous authentication. The A2A client independently
+/// enforces HTTPS, exact endpoint identity, same-origin card discovery, and its narrow card repair
+/// rules; this policy never carries credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryInvocationPolicy {
+    descriptor_endpoint: Url,
+    allow_loopback_http: bool,
+}
+
+impl RegistryInvocationPolicy {
+    pub fn anonymous(descriptor_endpoint: impl AsRef<str>) -> Result<Self, A2aError> {
+        let descriptor_endpoint = validate_endpoint(descriptor_endpoint.as_ref())?;
+        if descriptor_endpoint.scheme() != "https" {
+            return Err(A2aError::InvalidEndpoint(
+                "Registry-derived A2A endpoints must use HTTPS".into(),
+            ));
+        }
+        validate_registry_production_host(&descriptor_endpoint)?;
+        Ok(Self {
+            descriptor_endpoint,
+            allow_loopback_http: false,
+        })
+    }
+
+    /// Construct an anonymous policy for a hermetic local integration fixture.
+    ///
+    /// This API is absent from production builds unless the explicit `test-support` feature is
+    /// enabled, and even then it accepts only an HTTP endpoint whose host is a literal loopback
+    /// address. It cannot authorize a hostname, wildcard bind address, or remote cleartext Agent.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn anonymous_loopback_for_testing(
+        descriptor_endpoint: impl AsRef<str>,
+    ) -> Result<Self, A2aError> {
+        let descriptor_endpoint = validate_endpoint(descriptor_endpoint.as_ref())?;
+        let literal_loopback = descriptor_endpoint
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+        if descriptor_endpoint.scheme() != "http" || !literal_loopback {
+            return Err(A2aError::InvalidEndpoint(
+                "test Registry endpoints must use HTTP with a literal loopback host".into(),
+            ));
+        }
+        Ok(Self {
+            descriptor_endpoint,
+            allow_loopback_http: true,
+        })
+    }
+
+    pub fn descriptor_endpoint(&self) -> &Url {
+        &self.descriptor_endpoint
+    }
+
+    pub(crate) fn allows_loopback_http(&self) -> bool {
+        self.allow_loopback_http
+    }
+
+    pub(crate) fn validate_config_binding(&self, config: &A2aAgentConfig) -> Result<(), A2aError> {
+        let configured_endpoint = validate_endpoint(&config.endpoint)?;
+        if configured_endpoint != self.descriptor_endpoint {
+            return Err(A2aError::InvalidConfig(
+                "Registry invocation endpoint differs from the validated descriptor endpoint"
+                    .into(),
+            ));
+        }
+        if config.bearer_token.is_some() {
+            return Err(A2aError::InvalidConfig(
+                "Registry-anonymous invocation must not carry A2A credentials".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,7 +206,7 @@ impl InvokeRequest {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<(), A2aError> {
+    pub fn validate(&self) -> Result<(), A2aError> {
         if matches!(self.action, InvokeAction::Send | InvokeAction::Submit)
             && self.task.trim().is_empty()
         {
@@ -155,6 +245,31 @@ impl InvokeRequest {
         }
         Ok(())
     }
+}
+
+fn validate_registry_production_host(endpoint: &Url) -> Result<(), A2aError> {
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| A2aError::InvalidEndpoint("endpoint has no host".into()))?;
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    if bare_host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(A2aError::InvalidEndpoint(
+            "Registry-derived production endpoints must use a DNS hostname, not an IP literal"
+                .into(),
+        ));
+    }
+    let canonical = bare_host.trim_end_matches('.').to_ascii_lowercase();
+    let local_name = ["localhost", "local", "internal"]
+        .iter()
+        .any(|suffix| canonical == *suffix || canonical.ends_with(&format!(".{suffix}")))
+        || canonical == "home.arpa"
+        || canonical.ends_with(".home.arpa");
+    if local_name {
+        return Err(A2aError::InvalidEndpoint(
+            "Registry-derived production endpoints must not use a local hostname".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_config(config: &A2aAgentConfig) -> Result<(), A2aError> {
@@ -329,6 +444,63 @@ mod tests {
 
         let duplicate = vec![config("a"), config("a")];
         assert!(validate_configs(&duplicate).is_err());
+    }
+
+    #[test]
+    fn registry_policy_requires_exact_credential_free_https_binding() {
+        assert!(RegistryInvocationPolicy::anonymous("http://agent.example.test/a2a").is_err());
+        let policy = RegistryInvocationPolicy::anonymous("https://agent.example.test/a2a").unwrap();
+        let mut bound = config("registry-agent");
+        bound.endpoint = "https://agent.example.test/a2a".into();
+        bound.bearer_token = None;
+        assert!(policy.validate_config_binding(&bound).is_ok());
+
+        bound.endpoint = "https://agent.example.test/other".into();
+        assert!(policy.validate_config_binding(&bound).is_err());
+        bound.endpoint = "https://agent.example.test/a2a".into();
+        bound.bearer_token = Some("must-not-forward".into());
+        assert!(policy.validate_config_binding(&bound).is_err());
+    }
+
+    #[test]
+    fn production_registry_policy_rejects_ip_literals_and_local_names() {
+        for endpoint in [
+            "https://127.0.0.1/a2a",
+            "https://[2606:4700:4700::1111]/a2a",
+            "https://localhost/a2a",
+            "https://agent.local/a2a",
+            "https://service.internal/a2a",
+            "https://printer.home.arpa/a2a",
+        ] {
+            assert!(
+                RegistryInvocationPolicy::anonymous(endpoint).is_err(),
+                "production policy unexpectedly accepted {endpoint}"
+            );
+        }
+        assert!(RegistryInvocationPolicy::anonymous("https://agent.example.test/a2a").is_ok());
+    }
+
+    #[test]
+    fn test_registry_policy_is_limited_to_literal_loopback_http() {
+        assert!(RegistryInvocationPolicy::anonymous_loopback_for_testing(
+            "http://127.0.0.1:9999/a2a"
+        )
+        .is_ok());
+        assert!(
+            RegistryInvocationPolicy::anonymous_loopback_for_testing("http://[::1]:9999/a2a")
+                .is_ok()
+        );
+        for endpoint in [
+            "http://localhost:9999/a2a",
+            "http://0.0.0.0:9999/a2a",
+            "http://192.0.2.1:9999/a2a",
+            "https://127.0.0.1:9999/a2a",
+        ] {
+            assert!(
+                RegistryInvocationPolicy::anonymous_loopback_for_testing(endpoint).is_err(),
+                "test policy unexpectedly accepted {endpoint}"
+            );
+        }
     }
 
     #[test]

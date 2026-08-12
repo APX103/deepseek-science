@@ -86,20 +86,28 @@ async fn main() -> Result<()> {
 async fn run_llm_once() -> Result<()> {
     let prompt = read_bounded_prompt(std::io::stdin().lock())?;
     let settings = dss_core::Settings::load().context("failed to load settings")?;
-    let api_key = settings
-        .llm
-        .api_key
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .context("LLM is not configured")?;
-    let model = settings.llm.model.clone();
-    let client = OpenAICompatClient::new(&settings.llm.base_url, api_key, &model);
+    let (client, model) = build_llm_once_client(&settings.llm, settings.thinking)?;
     let result = execute_llm_once(&client, &model, &prompt).await?;
     println!(
         "{}",
         serde_json::to_string(&llm_once_output_json(&model, result))?
     );
     Ok(())
+}
+
+fn build_llm_once_client(
+    llm: &dss_core::LlmSettings,
+    thinking: dss_core::ThinkingSettings,
+) -> Result<(OpenAICompatClient, String)> {
+    let api_key = llm
+        .api_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("LLM is not configured")?;
+    let model = llm.model.clone();
+    let client =
+        OpenAICompatClient::new(&llm.base_url, api_key, &model).with_thinking_settings(thinking);
+    Ok((client, model))
 }
 
 #[derive(Debug)]
@@ -296,7 +304,7 @@ fn init_tracing(config_level: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_llm_once, llm_once_output_json, read_bounded_prompt, Cli,
+        build_llm_once_client, execute_llm_once, llm_once_output_json, read_bounded_prompt, Cli,
         LLM_ONCE_FALLBACK_MAX_OUTPUT_TOKENS, LLM_ONCE_MAX_PROMPT_BYTES,
         LLM_ONCE_PRIMARY_MAX_OUTPUT_TOKENS,
     };
@@ -409,6 +417,26 @@ mod tests {
             LLM_ONCE_MAX_PROMPT_BYTES + 1
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn llm_once_client_captures_the_persisted_thinking_default() {
+        let thinking = dss_core::ThinkingSettings {
+            enabled: false,
+            effort: dss_core::ThinkingEffort::Max,
+        };
+        let (client, model) = build_llm_once_client(
+            &dss_core::LlmSettings {
+                base_url: "https://api.deepseek.com".into(),
+                model: "deepseek-v4-flash".into(),
+                api_key: Some("test-only-key".into()),
+            },
+            thinking,
+        )
+        .expect("construct configured llm-once client");
+
+        assert_eq!(model, "deepseek-v4-flash");
+        assert_eq!(client.thinking_settings(), thinking);
     }
 
     #[tokio::test]

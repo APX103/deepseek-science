@@ -140,6 +140,8 @@ mod tests {
         crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),
@@ -148,6 +150,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await

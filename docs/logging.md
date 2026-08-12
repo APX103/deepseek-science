@@ -69,6 +69,7 @@ logs
 | agent | `verify` | reviewer 裁决：warn | `{verdict, findings_count}` |
 | agent | `memory` | 抽取 3 条记忆 | `{appended, replaced, removed}` |
 | agent | `run_end` | 会话运行结束 | `{kind, iterations, usage}` |
+| system | `retention_sweep` | 保留策略清理完成（D-T07） | `{logs_by_age, logs_by_count, memory_expired, memory_demoted, memory_errors}` |
 
 ---
 
@@ -140,7 +141,7 @@ logs
 
 ## 待定（登记 [决策](decisions.md)）
 
-- 日志保留策略默认值（14 天？按量？）。
+- ~~日志保留策略默认值（14 天？按量？）。~~ ✅ 已定（D-T07）：按天 + 按量双限制，默认 14 天 / 10 万条；启动 + 每 6h sweep。
 - 是否要 `/api/logs/stream` 实时推送（增加复杂度，可后置）。
 - `kind` 枚举是否随增强方向扩展（如 P11 文献知识库加检索日志类型）。
 

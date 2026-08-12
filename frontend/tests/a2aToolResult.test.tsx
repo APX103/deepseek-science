@@ -189,6 +189,24 @@ describe('A2A result parsing', () => {
     expect(parseA2aToolResult('not-json')).toBeNull()
   })
 
+  test('validates and renders optional Registry Resource provenance', () => {
+    const envelope = JSON.parse(envelopeContent())
+    envelope.registry = {
+      server: 'agent-registry',
+      resource_uri: 'agent://a2a-test-agent',
+      resource_name: 'a2a-test-agent',
+    }
+    const parsed = parseA2aToolResult(JSON.stringify(envelope))!
+    expect(parsed.registry?.resource_uri).toBe('agent://a2a-test-agent')
+    const html = renderToStaticMarkup(<A2aToolResult result={parsed} />)
+    expect(html).toContain('Registry: agent-registry')
+    expect(html).toContain('Resource: a2a-test-agent')
+    expect(html).toContain('data-a2a-registry-resource="agent://a2a-test-agent"')
+
+    envelope.registry = { server: 'agent-registry' }
+    expect(parseA2aToolResult(JSON.stringify(envelope))).toBeNull()
+  })
+
   test('recognizes current and legacy resumable Task interruption envelopes', () => {
     const current = JSON.parse(envelopeContent())
     current.terminal = {

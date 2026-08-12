@@ -35,6 +35,190 @@ pub(crate) enum ParsedAssistantText {
     },
 }
 
+/// The terminal decision from [`IncrementalAssistantTextGuard`]. Plain text
+/// contains only the suffix that has not already crossed the live event
+/// boundary; tool calls are the canonical result of the whole-turn parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IncrementalAssistantTextResult {
+    Plain(String),
+    ToolCalls {
+        visible_text: String,
+        calls: Vec<ParsedDsmlCall>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalAssistantTextState {
+    LeadingWhitespace,
+    StreamingPlain,
+}
+
+/// Incrementally releases only text that cannot be part of a textual DSML
+/// envelope. Every DSML marker starts with a raw ASCII `<`, so retaining the
+/// first such byte and everything after it is deliberately conservative and
+/// chunk-boundary independent. The complete bounded turn is still retained
+/// for exactly one canonical parse in [`Self::finish`].
+#[derive(Debug)]
+pub(crate) struct IncrementalAssistantTextGuard {
+    text: String,
+    state: IncrementalAssistantTextState,
+    scan_cursor: usize,
+    released_cursor: usize,
+    publication_frozen: bool,
+    observed_raw_lt: bool,
+    #[cfg(test)]
+    scan_work_bytes: usize,
+}
+
+impl Default for IncrementalAssistantTextGuard {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            state: IncrementalAssistantTextState::LeadingWhitespace,
+            scan_cursor: 0,
+            released_cursor: 0,
+            publication_frozen: false,
+            observed_raw_lt: false,
+            #[cfg(test)]
+            scan_work_bytes: 0,
+        }
+    }
+}
+
+impl IncrementalAssistantTextGuard {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Buffer one provider delta and return the newly irrevocable plain-text
+    /// prefix, if any. A failed size check leaves the guard unchanged.
+    pub(crate) fn push(&mut self, chunk: &str) -> Result<Option<String>, DsmlError> {
+        let next_len = self
+            .text
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(DsmlError::TooLarge)?;
+        if next_len > MAX_ASSISTANT_TEXT_BYTES {
+            return Err(DsmlError::TooLarge);
+        }
+        self.text.push_str(chunk);
+
+        let publication_was_frozen = self.publication_frozen;
+        if self.observed_raw_lt {
+            return Ok(None);
+        }
+
+        if self.state == IncrementalAssistantTextState::LeadingWhitespace {
+            while self.scan_cursor < self.text.len() {
+                let character = self.text[self.scan_cursor..]
+                    .chars()
+                    .next()
+                    .expect("scan cursor is in bounds");
+                let width = character.len_utf8();
+                self.record_scan_work(width);
+                self.scan_cursor += width;
+
+                if character.is_whitespace() {
+                    continue;
+                }
+                if character == '<' {
+                    self.observed_raw_lt = true;
+                    self.freeze_publication();
+                    return Ok(None);
+                }
+                self.state = IncrementalAssistantTextState::StreamingPlain;
+                break;
+            }
+            if self.state == IncrementalAssistantTextState::LeadingWhitespace {
+                return Ok(None);
+            }
+        }
+
+        debug_assert_eq!(self.state, IncrementalAssistantTextState::StreamingPlain);
+        let mut safe_end = self.text.len();
+        while self.scan_cursor < self.text.len() {
+            let byte = self.text.as_bytes()[self.scan_cursor];
+            self.record_scan_work(1);
+            if byte == b'<' {
+                safe_end = self.scan_cursor;
+                self.scan_cursor += 1;
+                self.observed_raw_lt = true;
+                self.freeze_publication();
+                break;
+            }
+            self.scan_cursor += 1;
+        }
+
+        if publication_was_frozen || safe_end == self.released_cursor {
+            return Ok(None);
+        }
+        let released = self.text[self.released_cursor..safe_end].to_string();
+        self.released_cursor = safe_end;
+        Ok(Some(released))
+    }
+
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.text.len()
+    }
+
+    /// Stop incremental publication without discarding the canonical buffer.
+    /// Runner uses this to couple the reasoning and answer channels once
+    /// either one observes a raw `<` control-plane boundary.
+    pub(crate) fn freeze_publication(&mut self) {
+        self.publication_frozen = true;
+    }
+
+    pub(crate) fn publication_is_frozen(&self) -> bool {
+        self.publication_frozen
+    }
+
+    /// Whether this channel, rather than only its sibling, has observed its
+    /// first raw `<`. Scanning continues while externally frozen so Runner can
+    /// retain an exact cross-channel event boundary.
+    pub(crate) fn has_observed_raw_lt(&self) -> bool {
+        self.observed_raw_lt
+    }
+
+    /// Byte offset already delivered across the event boundary.
+    pub(crate) fn released_cursor(&self) -> usize {
+        self.released_cursor
+    }
+
+    /// Make the canonical whole-turn decision and return only terminal text
+    /// that was not emitted by [`Self::push`].
+    pub(crate) fn finish(self) -> Result<IncrementalAssistantTextResult, DsmlError> {
+        match parse_assistant_text(&self.text)? {
+            ParsedAssistantText::Plain(text) => {
+                debug_assert_eq!(text, self.text);
+                Ok(IncrementalAssistantTextResult::Plain(
+                    text[self.released_cursor..].to_string(),
+                ))
+            }
+            ParsedAssistantText::ToolCalls {
+                visible_text,
+                calls,
+            } => Ok(IncrementalAssistantTextResult::ToolCalls {
+                visible_text,
+                calls,
+            }),
+        }
+    }
+
+    fn record_scan_work(&mut self, bytes: usize) {
+        #[cfg(test)]
+        {
+            self.scan_work_bytes += bytes;
+        }
+        #[cfg(not(test))]
+        let _ = bytes;
+    }
+
+    #[cfg(test)]
+    fn scan_work_bytes(&self) -> usize {
+        self.scan_work_bytes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum DsmlError {
     #[error("assistant text exceeds the DSML quarantine limit")]
@@ -1155,6 +1339,268 @@ mod tests {
             }
             ParsedAssistantText::Plain(_) => panic!("expected tool calls"),
         }
+    }
+
+    fn run_incremental_guard<'a>(
+        source: &str,
+        chunks: impl IntoIterator<Item = &'a str>,
+    ) -> (
+        Vec<String>,
+        Result<IncrementalAssistantTextResult, DsmlError>,
+    ) {
+        let mut guard = IncrementalAssistantTextGuard::new();
+        let mut released = Vec::new();
+        for chunk in chunks {
+            if let Some(text) = guard.push(chunk).expect("chunk fits guard") {
+                assert!(!text.is_empty());
+                released.push(text);
+            }
+        }
+        assert_eq!(guard.buffered_len(), source.len());
+        (released, guard.finish())
+    }
+
+    fn assert_incremental_guard_matches_parser<'a>(
+        source: &str,
+        chunks: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<String> {
+        let canonical = parse_assistant_text(source);
+        let (released, terminal) = run_incremental_guard(source, chunks);
+        match (canonical, terminal) {
+            (
+                Ok(ParsedAssistantText::Plain(expected)),
+                Ok(IncrementalAssistantTextResult::Plain(remainder)),
+            ) => {
+                let mut reconstructed = released.concat();
+                reconstructed.push_str(&remainder);
+                assert_eq!(reconstructed, expected);
+            }
+            (
+                Ok(ParsedAssistantText::ToolCalls {
+                    visible_text: expected_visible,
+                    calls: expected_calls,
+                }),
+                Ok(IncrementalAssistantTextResult::ToolCalls {
+                    visible_text,
+                    calls,
+                }),
+            ) => {
+                assert!(released.is_empty(), "control envelope text was released");
+                assert_eq!(visible_text, expected_visible);
+                assert_eq!(calls, expected_calls);
+            }
+            (Err(expected), Err(actual)) => assert_eq!(actual, expected),
+            (canonical, terminal) => {
+                panic!("guard result {terminal:?} disagreed with canonical parse {canonical:?}")
+            }
+        }
+        released
+    }
+
+    fn char_chunks(source: &str) -> Vec<&str> {
+        let mut boundaries = source.char_indices().map(|(index, _)| index).skip(1);
+        let mut start = 0usize;
+        let mut chunks = Vec::new();
+        for end in boundaries.by_ref().chain(std::iter::once(source.len())) {
+            chunks.push(&source[start..end]);
+            start = end;
+        }
+        if source.is_empty() {
+            chunks.push("");
+        }
+        chunks
+    }
+
+    #[test]
+    fn incremental_guard_releases_ordinary_chunks_before_finish() {
+        let source = " \n\t研究正在进行 🚀";
+        let mut guard = IncrementalAssistantTextGuard::new();
+        assert_eq!(guard.push(" \n"), Ok(None));
+        assert_eq!(guard.push("\t"), Ok(None));
+        assert_eq!(guard.push("研究"), Ok(Some(" \n\t研究".into())));
+        assert_eq!(guard.push("正在"), Ok(Some("正在".into())));
+        assert_eq!(guard.push("进行 🚀"), Ok(Some("进行 🚀".into())));
+        assert_eq!(guard.buffered_len(), source.len());
+        assert_eq!(
+            guard.finish(),
+            Ok(IncrementalAssistantTextResult::Plain(String::new()))
+        );
+    }
+
+    #[test]
+    fn incremental_guard_external_freeze_retains_plain_remainder() {
+        let mut guard = IncrementalAssistantTextGuard::new();
+        assert!(!guard.publication_is_frozen());
+        assert_eq!(guard.push("safe prefix"), Ok(Some("safe prefix".into())));
+        assert_eq!(guard.released_cursor(), "safe prefix".len());
+
+        guard.freeze_publication();
+        assert!(guard.publication_is_frozen());
+        assert_eq!(guard.push(" and private suffix"), Ok(None));
+        assert!(!guard.has_observed_raw_lt());
+        assert_eq!(guard.buffered_len(), "safe prefix and private suffix".len());
+        assert_eq!(
+            guard.finish(),
+            Ok(IncrementalAssistantTextResult::Plain(
+                " and private suffix".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn incremental_guard_observes_own_lt_while_externally_frozen() {
+        let mut guard = IncrementalAssistantTextGuard::new();
+        guard.freeze_publication();
+        assert_eq!(guard.push("before"), Ok(None));
+        assert!(!guard.has_observed_raw_lt());
+        assert_eq!(guard.push(" <"), Ok(None));
+        assert!(guard.has_observed_raw_lt());
+        assert_eq!(guard.scan_work_bytes(), "before <".len());
+
+        assert_eq!(guard.push(" unscanned suffix"), Ok(None));
+        assert_eq!(guard.scan_work_bytes(), "before <".len());
+        assert_eq!(guard.released_cursor(), 0);
+        assert_eq!(
+            guard.finish(),
+            Ok(IncrementalAssistantTextResult::Plain(
+                "before < unscanned suffix".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn incremental_guard_never_releases_dsml_candidates_at_any_scalar_split() {
+        let candidates = [
+            concat!(
+                " \n<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"python\">",
+                "<｜｜DSML｜｜parameter name=\"code\" string=true>super-secret",
+                "</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>",
+                "</｜｜DSML｜｜tool_calls>\t"
+            ),
+            concat!(
+                "<||DSML||tool_calls><||DSML||invoke name='shell'>",
+                "<||DSML||parameter name='command' string=true>private-body",
+                "</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>"
+            ),
+            concat!(
+                "<||dsml||TOOL_CALLS><||DsMl||InVoKe name='x'>",
+                "</||dSmL||iNvOkE></||DSML||tool_calls>"
+            ),
+            "<|｜DSML｜|tool_calls><｜|DSML|｜invoke name='x'>secret",
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name='x'>secret",
+            "</｜DSML｜tool_calls>secret",
+        ];
+
+        for source in candidates {
+            let mut split_points = source
+                .char_indices()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            split_points.push(source.len());
+            for split in split_points {
+                let released = assert_incremental_guard_matches_parser(
+                    source,
+                    [&source[..split], &source[split..]],
+                );
+                assert!(
+                    released.is_empty(),
+                    "released candidate bytes at scalar split {split}: {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_guard_keeps_whitespace_around_valid_dsml_private() {
+        let source = concat!(
+            " \n   <｜DSML｜tool_calls><｜DSML｜invoke name=\"list_skills\">",
+            "</｜DSML｜invoke></｜DSML｜tool_calls>\r\n "
+        );
+        let (released, terminal) = run_incremental_guard(source, char_chunks(source));
+        assert!(released.is_empty());
+        let IncrementalAssistantTextResult::ToolCalls {
+            visible_text,
+            calls,
+        } = terminal.unwrap()
+        else {
+            panic!("expected canonical calls");
+        };
+        assert!(visible_text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_skills");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn incremental_guard_terminal_decision_matches_parser_context_rules() {
+        let block = concat!(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"x\">",
+            "<｜DSML｜parameter name=\"value\" string=true>secret",
+            "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
+        );
+        let cases = [
+            "<｜DS",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜unknown>",
+            &format!("prose before {block}"),
+            &format!("{block}\nprose after"),
+            &format!("{block}{block}"),
+            &format!("> {block}"),
+            &format!("- {block}"),
+            &format!("<div>\n{block}\n</div>"),
+            &format!("```text\n{block}\n```"),
+            &format!("`{block}`"),
+            &format!("    {block}"),
+            &format!("```text\ndocumentation\n{block}"),
+            &format!("> ```text\n> documentation\n{block}\n> ```"),
+            "<section>ordinary raw HTML</section>",
+        ];
+
+        for source in cases {
+            assert_incremental_guard_matches_parser(source, char_chunks(source));
+        }
+    }
+
+    #[test]
+    fn incremental_guard_reconstructs_multibyte_markdown_exactly() {
+        let cases = [
+            "  **研究🚀** [链接](https://例子.test/路径)\n数学 $α + β$",
+            "前缀🙂 [自动链接](<https://example.test/路径>) 后缀",
+            "```text\n<not-dsml>文档示例</not-dsml>\n```\n尾部",
+            "行内 `<not-dsml>🙂</not-dsml>` 与普通文本",
+            "~~~rust\nfn main() { println!(\"你好\"); }\n~~~",
+        ];
+
+        for source in cases {
+            assert_incremental_guard_matches_parser(source, char_chunks(source));
+        }
+    }
+
+    #[test]
+    fn incremental_guard_push_work_is_linear_and_size_bounded() {
+        const LARGE_RESPONSE_BYTES: usize = 128 * 1024;
+        let mut guard = IncrementalAssistantTextGuard::new();
+        for _ in 0..LARGE_RESPONSE_BYTES {
+            assert_eq!(guard.push("x"), Ok(Some("x".into())));
+        }
+        assert_eq!(guard.buffered_len(), LARGE_RESPONSE_BYTES);
+        assert_eq!(guard.scan_work_bytes(), LARGE_RESPONSE_BYTES);
+        assert_eq!(
+            guard.finish(),
+            Ok(IncrementalAssistantTextResult::Plain(String::new()))
+        );
+
+        let mut boundary = IncrementalAssistantTextGuard::new();
+        let maximum = "x".repeat(MAX_ASSISTANT_TEXT_BYTES);
+        assert_eq!(boundary.push(&maximum), Ok(Some(maximum.clone())));
+        assert_eq!(boundary.scan_work_bytes(), MAX_ASSISTANT_TEXT_BYTES);
+        assert_eq!(boundary.push("y"), Err(DsmlError::TooLarge));
+        assert_eq!(boundary.buffered_len(), MAX_ASSISTANT_TEXT_BYTES);
+        assert_eq!(boundary.scan_work_bytes(), MAX_ASSISTANT_TEXT_BYTES);
+        assert_eq!(
+            boundary.finish(),
+            Ok(IncrementalAssistantTextResult::Plain(String::new()))
+        );
     }
 
     #[test]

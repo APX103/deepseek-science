@@ -202,7 +202,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route(
             "/api/settings",
-            get(settings_endpoints::get_settings).post(settings_endpoints::save_settings),
+            get(settings_endpoints::get_settings).post(settings_endpoints::save_settings_http),
         )
         // sessions
         .route(

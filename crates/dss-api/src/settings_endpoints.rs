@@ -1,5 +1,7 @@
-//! Persisted application settings with one atomically replaced LLM+A2A runtime snapshot.
+//! Persisted application settings with one atomically replaced LLM+A2A/data-source runtime
+//! snapshot.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -19,6 +21,34 @@ use dss_core::A2aAgentConfig;
 
 fn json_error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": message })))
+}
+
+fn settings_json_error(rejection: JsonRejection) -> (StatusCode, Json<Value>) {
+    let invalid_json = matches!(
+        &rejection,
+        JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)
+    );
+    let status = if invalid_json {
+        StatusCode::BAD_REQUEST
+    } else {
+        rejection.status()
+    };
+    let message = if invalid_json {
+        "invalid settings JSON payload"
+    } else {
+        "invalid settings request body"
+    };
+    json_error(status, message)
+}
+
+/// A missing optional settings field means "preserve the current layered value". An explicit
+/// JSON `null` is not omission and must fail deserialization instead of silently taking that path.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 fn is_false(value: &bool) -> bool {
@@ -259,11 +289,47 @@ impl From<&dss_core::McpServerConfig> for McpServerSettings {
     }
 }
 
+/// Complete public/API form of the nested thinking policy. Both members are intentionally
+/// required whenever the object is present; only omission of the whole object is the legacy POST
+/// compatibility path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThinkingSettingsPayload {
+    enabled: bool,
+    effort: dss_core::ThinkingEffort,
+}
+
+impl From<dss_core::ThinkingSettings> for ThinkingSettingsPayload {
+    fn from(value: dss_core::ThinkingSettings) -> Self {
+        Self {
+            enabled: value.enabled,
+            effort: value.effort,
+        }
+    }
+}
+
+impl From<ThinkingSettingsPayload> for dss_core::ThinkingSettings {
+    fn from(value: ThinkingSettingsPayload) -> Self {
+        Self {
+            enabled: value.enabled,
+            effort: value.effort,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettingsPayload {
     providers: Vec<ProviderSettings>,
     model: String,
     default_workspace: String,
+    /// `None` is accepted only for backward-compatible POSTs from older clients. Public GET/POST
+    /// responses always contain `Some`, which serializes as a JSON number.
+    #[serde(default)]
+    max_iterations: Option<u32>,
+    /// `None` is accepted only for legacy POSTs. Public responses always contain the complete
+    /// effective policy captured by the live LLM runtime snapshot.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    thinking: Option<ThinkingSettingsPayload>,
     #[serde(default)]
     restart_required: bool,
     #[serde(default)]
@@ -274,14 +340,21 @@ pub struct AppSettingsPayload {
     a2a_agents: Vec<A2aAgentSettings>,
     #[serde(default)]
     skills: SkillSettingsPayload,
-    #[serde(default)]
-    mcp_servers: Vec<McpServerSettings>,
+    /// `None` is accepted only for legacy/partial POSTs and preserves the current layered list.
+    /// Public responses always contain `Some`; an explicit empty list is the opt-out operation.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    mcp_servers: Option<Vec<McpServerSettings>>,
     /// 数据源 API keys（GET 时脱敏；POST 时前端回传，None/空值保留后端旧值）。
     /// 和 providers.api_key 同样的 mask 机制。
     #[serde(default)]
     api_keys_masked: std::collections::HashMap<String, String>,
     #[serde(default)]
     api_keys: Option<std::collections::HashMap<String, String>>,
+    /// 日志保留策略（D-T07：按天 + 按量双限制）。
+    #[serde(default)]
+    log_retention_days: u32,
+    #[serde(default)]
+    log_max_rows: u32,
 }
 
 fn public_settings(
@@ -322,6 +395,8 @@ fn public_settings(
             .join("workspaces")
             .display()
             .to_string(),
+        max_iterations: Some(runtime.max_iterations()),
+        thinking: Some(llm.thinking().into()),
         restart_required: false,
         revision: runtime.revision(),
         overridden_fields: llm
@@ -331,10 +406,9 @@ fn public_settings(
             .collect(),
         a2a_agents: runtime.a2a().agents.iter().map(public_a2a_agent).collect(),
         skills: SkillSettingsPayload::from(persisted_skills),
-        mcp_servers: persisted_mcp.iter().map(McpServerSettings::from).collect(),
-        api_keys_masked: state
-            .settings
-            .api_keys
+        mcp_servers: Some(persisted_mcp.iter().map(McpServerSettings::from).collect()),
+        api_keys_masked: runtime
+            .api_keys()
             .iter()
             .map(|(k, v)| {
                 let masked = if v.is_empty() {
@@ -346,13 +420,18 @@ fn public_settings(
             })
             .collect(),
         api_keys: None,
+        log_retention_days: state.settings.log.retention_days,
+        log_max_rows: state.settings.log.max_rows,
     }
 }
 
 /// Overlay live MCP connection state (connected + tool count) onto the persisted server list.
 async fn enrich_mcp_status(state: &AppState, payload: &mut AppSettingsPayload) {
     let manager = state.mcp_runtime_snapshot().await.manager;
-    for server in &mut payload.mcp_servers {
+    let Some(servers) = payload.mcp_servers.as_mut() else {
+        return;
+    };
+    for server in servers {
         if let Some(info) = manager.server_info(&server.name).await {
             server.connected = info.connected;
             server.tool_count = Some(info.tools.len());
@@ -472,6 +551,10 @@ pub async fn save_settings(
     State(state): State<AppState>,
     Json(payload): Json<AppSettingsPayload>,
 ) -> Result<Json<AppSettingsPayload>, (StatusCode, Json<Value>)> {
+    if let Some(max_iterations) = payload.max_iterations {
+        dss_core::validate_max_iterations(max_iterations)
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+    }
     // 校验 provider 列表：必须有且仅有一个启用；名称非空且不重复；base_url/model 合法。
     let enabled_count = payload.providers.iter().filter(|p| p.enabled).count();
     if enabled_count != 1 {
@@ -597,36 +680,41 @@ pub async fn save_settings(
     dss_a2a::validate_configs(&a2a_configs)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error.to_string()))?;
 
-    let mut mcp_configs: Vec<dss_core::McpServerConfig> =
-        Vec::with_capacity(payload.mcp_servers.len());
-    let mut seen_mcp_names = std::collections::HashSet::new();
-    for submitted in &payload.mcp_servers {
-        let name = submitted.name.trim().to_owned();
-        if name.is_empty() {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "each MCP server needs a name",
-            ));
+    let mcp_configs = if let Some(submitted_servers) = payload.mcp_servers.as_ref() {
+        let mut configs: Vec<dss_core::McpServerConfig> =
+            Vec::with_capacity(submitted_servers.len());
+        let mut seen_mcp_names = std::collections::HashSet::new();
+        for submitted in submitted_servers {
+            let name = submitted.name.trim().to_owned();
+            if name.is_empty() {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "each MCP server needs a name",
+                ));
+            }
+            let url = submitted.url.trim().to_owned();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("MCP server \"{name}\" url must use http:// or https://"),
+                ));
+            }
+            if !seen_mcp_names.insert(name.to_lowercase()) {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("duplicate MCP server name: {name}"),
+                ));
+            }
+            configs.push(dss_core::McpServerConfig {
+                name,
+                url,
+                enabled: submitted.enabled,
+            });
         }
-        let url = submitted.url.trim().to_owned();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                &format!("MCP server \"{name}\" url must use http:// or https://"),
-            ));
-        }
-        if !seen_mcp_names.insert(name.to_lowercase()) {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                &format!("duplicate MCP server name: {name}"),
-            ));
-        }
-        mcp_configs.push(dss_core::McpServerConfig {
-            name,
-            url,
-            enabled: submitted.enabled,
-        });
-    }
+        Some(configs)
+    } else {
+        None
+    };
 
     let persisted_providers_before = state
         .settings
@@ -675,6 +763,21 @@ pub async fn save_settings(
     }
 
     let object = root.as_object_mut().expect("object assigned above");
+    // A missing field means an older client submitted the full form. Preserve the existing root
+    // (or its config.toml fallback) instead of materializing the default and overwriting it.
+    if let Some(max_iterations) = payload.max_iterations {
+        object.insert(
+            "max_iterations".into(),
+            Value::Number(max_iterations.into()),
+        );
+    }
+    if let Some(thinking) = payload.thinking {
+        object.insert(
+            "thinking".into(),
+            serde_json::to_value(thinking)
+                .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+        );
+    }
     let selected_provider = provider_configs
         .iter()
         .find(|p| p.enabled)
@@ -712,14 +815,16 @@ pub async fn save_settings(
         serde_json::to_value(&skills_config)
             .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
     );
-    object.insert(
-        "mcp_servers".into(),
-        serde_json::to_value(&mcp_configs)
-            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
-    );
+    if let Some(mcp_configs) = &mcp_configs {
+        object.insert(
+            "mcp_servers".into(),
+            serde_json::to_value(mcp_configs)
+                .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+        );
+    }
     // api_keys：前端回传的值里，mask 占位（••••••••）保留后端旧值，其余（含空=清空）写入。
     // 未出现在 payload.api_keys 里的旧 key 也保留（不丢用户已存的 key）。
-    let mut merged_api_keys = state.settings.api_keys.clone();
+    let mut merged_api_keys = current_runtime.api_keys().clone();
     if let Some(submitted) = &payload.api_keys {
         for (k, v) in submitted {
             if v == "••••••••" {
@@ -736,6 +841,30 @@ pub async fn save_settings(
     object.insert(
         "api_keys".into(),
         serde_json::to_value(&merged_api_keys)
+            .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    );
+
+    // log retention（D-T07）：按天 + 按量双限制，写入 settings.json 的 `log` 对象。
+    // 校验：retention_days >= 1（0 会清空所有日志）；max_rows >= 1000（防误填过小）。
+    if payload.log_retention_days == 0 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "log_retention_days must be >= 1",
+        ));
+    }
+    if payload.log_max_rows < 1000 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "log_max_rows must be >= 1000",
+        ));
+    }
+    let log_cfg = dss_core::settings::LogSettings {
+        retention_days: payload.log_retention_days,
+        max_rows: payload.log_max_rows,
+    };
+    object.insert(
+        "log".into(),
+        serde_json::to_value(&log_cfg)
             .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
     );
 
@@ -771,12 +900,21 @@ pub async fn save_settings(
         .settings
         .resolve_persisted_candidate_skills(root.clone())
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let thinking = state
+        .settings
+        .resolve_candidate_thinking(root.clone())
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let max_iterations = state
+        .settings
+        .resolve_candidate_max_iterations(root.clone())
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
     let persisted_mcp = state
         .settings
         .resolve_persisted_candidate_mcp_servers(root)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, &e.to_string()))?;
     let llm_replacement = Arc::new(LlmRuntimeSnapshot::new(
         resolved.llm,
+        thinking,
         next_revision,
         resolved.env_overrides,
     ));
@@ -788,20 +926,34 @@ pub async fn save_settings(
         next_revision,
         llm_replacement,
         a2a_replacement,
+        Arc::new(merged_api_keys),
+        max_iterations,
     ));
 
     // Linearize durable replacement and run snapshot capture. Existing runs already own their
     // old Arc; new runs wait until disk and runtime both represent this revision.
     let runtime_slot = state.runtime.clone();
     let replacement_for_commit = replacement.clone();
+    let persisted_skills_for_commit = persisted_skills.clone();
+    let persisted_mcp_for_commit = persisted_mcp.clone();
+    let state_for_commit = state.clone();
     tokio::spawn(async move {
         // The owned settings guard and independent task make the commit non-cancellable once it
-        // starts. Dropping the HTTP request can no longer leave a completed rename without the
-        // matching runtime pointer swap, nor let a second save overlap this commit.
+        // starts. Keep the guard through every derived runtime publication so a later settings
+        // save cannot publish its empty/revoked MCP runtime and then be overwritten by an older,
+        // slower reconnect. Dropping the HTTP request cannot leave only part of the revision live.
         let _save_guard = save_guard;
-        let mut runtime_slot = runtime_slot.write().await;
         write_private_settings(&path, &bytes).await?;
-        *runtime_slot = replacement_for_commit;
+        {
+            let mut runtime_slot = runtime_slot.write().await;
+            *runtime_slot = replacement_for_commit;
+        }
+        state_for_commit
+            .rebuild_catalog(&persisted_skills_for_commit)
+            .await;
+        state_for_commit
+            .rebuild_mcp(&persisted_mcp_for_commit)
+            .await;
         Ok::<(), io::Error>(())
     })
     .await
@@ -812,12 +964,6 @@ pub async fn save_settings(
         )
     })?
     .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
-
-    // Skill discovery and MCP are not part of the atomic LLM/A2A runtime snapshot; rebuild them
-    // after the durable write so built-in toggles, external/custom dirs, and MCP server changes
-    // apply without a restart.
-    state.rebuild_catalog(&persisted_skills).await;
-    state.rebuild_mcp(&persisted_mcp).await;
 
     let mut payload = public_settings(
         &state,
@@ -831,12 +977,27 @@ pub async fn save_settings(
     Ok(Json(payload))
 }
 
+/// HTTP adapter for settings-specific JSON semantics. Axum classifies serde data errors as 422,
+/// while this API treats malformed or wrongly typed settings JSON as a bad request. Other
+/// extractor failures retain their original status, and no deserializer detail (which could
+/// contain submitted credentials) is reflected to the client.
+pub async fn save_settings_http(
+    State(state): State<AppState>,
+    payload: Result<Json<AppSettingsPayload>, JsonRejection>,
+) -> Result<Json<AppSettingsPayload>, (StatusCode, Json<Value>)> {
+    let payload = payload.map_err(settings_json_error)?;
+    save_settings(State(state), payload).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Method, Request};
     use dss_core::settings::ServerSettings;
     use dss_core::{LlmEnvOverrides, LlmSettings, Settings};
     use std::path::PathBuf;
+    use tower::ServiceExt;
 
     struct TestDir(PathBuf);
 
@@ -858,6 +1019,12 @@ mod tests {
 
     const INITIAL_BASE_URL: &str = "https://initial.example.invalid";
     const INITIAL_MODEL: &str = "initial-model";
+    const OPENALEX_KEY: &str = "OPENALEX_API_KEY";
+    const SECONDARY_SOURCE_KEY: &str = "SECONDARY_SOURCE_API_KEY";
+
+    fn data_source_value(version: &str) -> String {
+        ["test", "only", "source", version].join("-")
+    }
 
     fn rerun_without_llm_env(test_name: &str) -> bool {
         const CHILD_ENV: &str = "DSS_SETTINGS_HOT_RELOAD_TEST_CHILD";
@@ -912,6 +1079,57 @@ mod tests {
     }
 
     async fn build_test_state(test_dir: &TestDir, configured: bool) -> AppState {
+        build_test_state_with_max_iterations(
+            test_dir,
+            configured,
+            dss_core::DEFAULT_MAX_ITERATIONS,
+            false,
+        )
+        .await
+    }
+
+    async fn build_test_state_with_max_iterations(
+        test_dir: &TestDir,
+        configured: bool,
+        max_iterations: u32,
+        persist_max_iterations: bool,
+    ) -> AppState {
+        build_test_state_with_runtime_settings(
+            test_dir,
+            configured,
+            max_iterations,
+            persist_max_iterations,
+            dss_core::ThinkingSettings::default(),
+            false,
+        )
+        .await
+    }
+
+    async fn build_test_state_with_thinking(
+        test_dir: &TestDir,
+        configured: bool,
+        thinking: dss_core::ThinkingSettings,
+        persist_thinking: bool,
+    ) -> AppState {
+        build_test_state_with_runtime_settings(
+            test_dir,
+            configured,
+            dss_core::DEFAULT_MAX_ITERATIONS,
+            false,
+            thinking,
+            persist_thinking,
+        )
+        .await
+    }
+
+    async fn build_test_state_with_runtime_settings(
+        test_dir: &TestDir,
+        configured: bool,
+        max_iterations: u32,
+        persist_max_iterations: bool,
+        thinking: dss_core::ThinkingSettings,
+        persist_thinking: bool,
+    ) -> AppState {
         let credential = configured.then(|| ["test", "credential"].join("-"));
         let mut llm_json = json!({
             "base_url": INITIAL_BASE_URL,
@@ -923,8 +1141,24 @@ mod tests {
                 .expect("LLM test settings are an object")
                 .insert("api_key".into(), Value::String(value.clone()));
         }
-        let bytes = serde_json::to_vec_pretty(&json!({ "llm": llm_json }))
-            .expect("serialize initial settings");
+        let mut root = json!({ "llm": llm_json });
+        if persist_max_iterations {
+            root.as_object_mut()
+                .expect("settings test root is an object")
+                .insert(
+                    "max_iterations".into(),
+                    Value::Number(max_iterations.into()),
+                );
+        }
+        if persist_thinking {
+            root.as_object_mut()
+                .expect("settings test root is an object")
+                .insert(
+                    "thinking".into(),
+                    serde_json::to_value(thinking).expect("serialize thinking fixture"),
+                );
+        }
+        let bytes = serde_json::to_vec_pretty(&root).expect("serialize initial settings");
         write_private_settings(&test_dir.path().join("settings.json"), &bytes)
             .await
             .expect("write initial settings");
@@ -932,6 +1166,8 @@ mod tests {
         crate::state::build_state(Settings {
             data_dir: test_dir.path().to_path_buf(),
             data_dir_is_default: false,
+            max_iterations,
+            thinking,
             server: ServerSettings::default(),
             llm: LlmSettings {
                 base_url: INITIAL_BASE_URL.into(),
@@ -951,6 +1187,7 @@ mod tests {
             mcp_servers: Vec::new(),
             a2a_agents: Vec::new(),
             memory: dss_core::settings::MemorySettings::default(),
+            log: dss_core::settings::LogSettings::default(),
             api_keys: std::collections::HashMap::new(),
         })
         .await
@@ -970,14 +1207,18 @@ mod tests {
             }],
             model: model.into(),
             default_workspace: String::new(),
+            max_iterations: Some(dss_core::DEFAULT_MAX_ITERATIONS),
+            thinking: Some(dss_core::ThinkingSettings::default().into()),
             restart_required: true,
             revision: 0,
             overridden_fields: Vec::new(),
             a2a_agents: Vec::new(),
             skills: SkillSettingsPayload::default(),
-            mcp_servers: Vec::new(),
+            mcp_servers: Some(Vec::new()),
             api_keys_masked: std::collections::HashMap::new(),
             api_keys: None,
+            log_retention_days: 14,
+            log_max_rows: 100_000,
         }
     }
 
@@ -996,6 +1237,645 @@ mod tests {
             last_refreshed_at: None,
             tool_name: String::new(),
             card_summary: None,
+        }
+    }
+
+    async fn request_settings_route(
+        state: &AppState,
+        method: Method,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/api/settings")
+            .header(header::HOST, "127.0.0.1:17896");
+        let body = if let Some(value) = body {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&value).expect("serialize settings request"))
+        } else {
+            Body::empty()
+        };
+        if let Some(token) = state.api_token.as_deref() {
+            request = request.header(crate::API_TOKEN_HEADER, token);
+        }
+        let response = crate::build_router(state.clone())
+            .oneshot(request.body(body).expect("build settings request"))
+            .await
+            .expect("route settings request");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("collect settings response");
+        let value = serde_json::from_slice(&bytes).expect("settings response must be JSON");
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn settings_router_get_exposes_the_enabled_agent_registry_default() {
+        let test_dir = TestDir::new("agent-registry-default-get");
+        let state = build_test_state(&test_dir, false).await;
+
+        let (status, response) = request_settings_route(&state, Method::GET, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response["mcp_servers"],
+            json!([{
+                "name": dss_core::DEFAULT_AGENT_REGISTRY_NAME,
+                "url": dss_core::DEFAULT_AGENT_REGISTRY_URL,
+                "enabled": true,
+                "connected": false
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_router_mcp_omission_preserves_layer_and_empty_list_opts_out() {
+        let test_dir = TestDir::new("agent-registry-legacy-post");
+        tokio::fs::create_dir_all(test_dir.path())
+            .await
+            .expect("create Registry settings fixture directory");
+        tokio::fs::write(
+            test_dir.path().join("config.toml"),
+            format!(
+                "[[mcp_servers]]\nname = {:?}\nurl = {:?}\nenabled = false\n",
+                dss_core::DEFAULT_AGENT_REGISTRY_NAME,
+                dss_core::DEFAULT_AGENT_REGISTRY_URL
+            ),
+        )
+        .await
+        .expect("write disabled lower-layer Registry fixture");
+        let state = build_test_state(&test_dir, false).await;
+
+        let mut legacy = serde_json::to_value(payload(INITIAL_BASE_URL, INITIAL_MODEL, None))
+            .expect("serialize legacy settings fixture");
+        legacy
+            .as_object_mut()
+            .expect("legacy settings fixture is an object")
+            .remove("mcp_servers");
+        let (status, preserved) = request_settings_route(&state, Method::POST, Some(legacy)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            preserved["mcp_servers"],
+            json!([{
+                "name": dss_core::DEFAULT_AGENT_REGISTRY_NAME,
+                "url": dss_core::DEFAULT_AGENT_REGISTRY_URL,
+                "enabled": false,
+                "connected": false
+            }])
+        );
+        let persisted_after_legacy: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after legacy POST"),
+        )
+        .expect("parse settings after legacy POST");
+        assert!(
+            persisted_after_legacy.get("mcp_servers").is_none(),
+            "omission must preserve the lower layer instead of materializing it"
+        );
+
+        let mut explicit_clear = preserved;
+        explicit_clear["mcp_servers"] = json!([]);
+        let (status, cleared) =
+            request_settings_route(&state, Method::POST, Some(explicit_clear)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cleared["mcp_servers"], json!([]));
+        let persisted_after_clear: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after explicit MCP clear"),
+        )
+        .expect("parse settings after explicit MCP clear");
+        assert_eq!(persisted_after_clear["mcp_servers"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn settings_router_rejects_null_mcp_servers_instead_of_treating_it_as_omitted() {
+        let test_dir = TestDir::new("agent-registry-null-post");
+        let state = build_test_state(&test_dir, false).await;
+        let settings_path = test_dir.path().join("settings.json");
+        let before = tokio::fs::read(&settings_path)
+            .await
+            .expect("read settings before invalid POST");
+        let mut invalid = serde_json::to_value(payload(INITIAL_BASE_URL, INITIAL_MODEL, None))
+            .expect("serialize settings fixture");
+        invalid["mcp_servers"] = Value::Null;
+
+        let (status, response) = request_settings_route(&state, Method::POST, Some(invalid)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response,
+            json!({ "error": "invalid settings JSON payload" })
+        );
+        assert_eq!(
+            tokio::fs::read(&settings_path)
+                .await
+                .expect("read settings after invalid POST"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_get_exposes_the_runtime_default_as_a_json_number() {
+        let test_dir = TestDir::new("max-iterations-default");
+        let state = build_test_state(&test_dir, false).await;
+
+        let Json(fetched) = get_settings(State(state.clone()))
+            .await
+            .expect("get default settings");
+        assert_eq!(state.runtime_snapshot().await.max_iterations(), 100);
+        assert_eq!(fetched.max_iterations, Some(100));
+        assert_eq!(
+            serde_json::to_value(&fetched).expect("serialize public settings")["max_iterations"],
+            json!(100),
+            "public settings must expose a number rather than null or an omitted field"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_iterations_save_is_durable_hot_and_snapshot_isolated() {
+        let test_dir = TestDir::new("max-iterations-hot-swap");
+        let state = build_test_state(&test_dir, false).await;
+        let started_run_snapshot = state.runtime_snapshot().await;
+        assert_eq!(started_run_snapshot.max_iterations(), 100);
+
+        let settings_path = test_dir.path().join("settings.json");
+        let mut root: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(&settings_path)
+                .await
+                .expect("read initial settings"),
+        )
+        .expect("parse initial settings");
+        root.as_object_mut()
+            .expect("settings root object")
+            .insert("future_setting".into(), json!({ "preserve": true }));
+        write_private_settings(
+            &settings_path,
+            &serde_json::to_vec_pretty(&root).expect("serialize unknown setting"),
+        )
+        .await
+        .expect("write unknown setting");
+
+        let mut update = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        update.max_iterations = Some(160);
+        // Exercise the A2A-refresh replacement path as well as the settings replacement path.
+        update.a2a_agents = vec![a2a_payload("max-iterations-refresh", None, true)];
+        let Json(saved) = save_settings(State(state.clone()), Json(update))
+            .await
+            .expect("save max_iterations");
+
+        assert_eq!(saved.max_iterations, Some(160));
+        assert_eq!(saved.revision, 1);
+        let current = state.runtime_snapshot().await;
+        assert!(!Arc::ptr_eq(&started_run_snapshot, &current));
+        assert_eq!(started_run_snapshot.max_iterations(), 100);
+        assert_eq!(current.max_iterations(), 160);
+        assert_eq!(
+            current.llm().thinking(),
+            dss_core::ThinkingSettings::default()
+        );
+
+        let persisted_text = tokio::fs::read_to_string(&settings_path)
+            .await
+            .expect("read saved settings");
+        let persisted: Value = serde_json::from_str(&persisted_text).expect("parse saved settings");
+        assert_eq!(persisted["max_iterations"], json!(160));
+        assert_eq!(persisted["future_setting"], json!({ "preserve": true }));
+        assert_eq!(
+            state
+                .settings
+                .resolve_candidate_max_iterations(persisted)
+                .expect("resolve restart-equivalent max_iterations"),
+            160
+        );
+
+        let Json(fetched) = get_settings(State(state.clone()))
+            .await
+            .expect("read back max_iterations");
+        assert_eq!(fetched.max_iterations, Some(160));
+        assert_eq!(fetched.revision, 1);
+
+        let refreshed = state.runtime_snapshot_with_refreshed_a2a().await;
+        assert_eq!(refreshed.max_iterations(), 160);
+        assert_eq!(refreshed.revision(), 1);
+        assert!(Arc::ptr_eq(current.llm(), refreshed.llm()));
+        assert_eq!(
+            refreshed.llm().thinking(),
+            dss_core::ThinkingSettings::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_post_without_max_iterations_preserves_settings_json_value() {
+        let test_dir = TestDir::new("max-iterations-legacy-post");
+        let state = build_test_state_with_max_iterations(&test_dir, false, 240, true).await;
+
+        let mut legacy_json = serde_json::to_value(payload(
+            "https://unrelated.example.invalid",
+            "unrelated-model",
+            None,
+        ))
+        .expect("serialize legacy payload fixture");
+        legacy_json
+            .as_object_mut()
+            .expect("legacy payload object")
+            .remove("max_iterations");
+        let legacy: AppSettingsPayload =
+            serde_json::from_value(legacy_json).expect("deserialize old POST shape");
+        assert_eq!(legacy.max_iterations, None);
+
+        let Json(saved) = save_settings(State(state.clone()), Json(legacy))
+            .await
+            .expect("save an unrelated legacy form");
+        assert_eq!(saved.max_iterations, Some(240));
+        assert_eq!(state.runtime_snapshot().await.max_iterations(), 240);
+
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after legacy save"),
+        )
+        .expect("parse settings after legacy save");
+        assert_eq!(persisted["max_iterations"], json!(240));
+    }
+
+    #[tokio::test]
+    async fn legacy_post_preserves_config_toml_fallback_without_materializing_root_field() {
+        let test_dir = TestDir::new("max-iterations-config-fallback");
+        tokio::fs::create_dir_all(test_dir.path())
+            .await
+            .expect("create test settings directory");
+        tokio::fs::write(
+            test_dir.path().join("config.toml"),
+            "max_iterations = 320\n",
+        )
+        .await
+        .expect("write config fallback");
+        let state = build_test_state_with_max_iterations(&test_dir, false, 320, false).await;
+        let mut legacy = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        legacy.max_iterations = None;
+
+        let Json(saved) = save_settings(State(state.clone()), Json(legacy))
+            .await
+            .expect("save old client form against config fallback");
+        assert_eq!(saved.max_iterations, Some(320));
+        assert_eq!(state.runtime_snapshot().await.max_iterations(), 320);
+
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after legacy save"),
+        )
+        .expect("parse settings after legacy save");
+        assert!(
+            persisted.get("max_iterations").is_none(),
+            "a missing old-client field must not shadow the config.toml fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_max_iterations_changes_neither_disk_nor_runtime() {
+        let test_dir = TestDir::new("max-iterations-invalid");
+        let state = build_test_state(&test_dir, false).await;
+        let settings_path = test_dir.path().join("settings.json");
+        let before_bytes = tokio::fs::read(&settings_path)
+            .await
+            .expect("read settings before invalid saves");
+        let before_runtime = state.runtime_snapshot().await;
+
+        for value in [0, dss_core::MAX_CONFIGURABLE_ITERATIONS + 1] {
+            let mut invalid = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+            invalid.max_iterations = Some(value);
+            let (status, Json(error)) = save_settings(State(state.clone()), Json(invalid))
+                .await
+                .expect_err("out-of-range max_iterations must fail");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error["error"],
+                json!("max_iterations must be between 1 and 1000")
+            );
+            let after_runtime = state.runtime_snapshot().await;
+            assert!(Arc::ptr_eq(&before_runtime, &after_runtime));
+            assert_eq!(after_runtime.revision(), 0);
+            assert_eq!(after_runtime.max_iterations(), 100);
+            assert_eq!(
+                tokio::fs::read(&settings_path)
+                    .await
+                    .expect("read settings after invalid save"),
+                before_bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_max_iterations_json_is_bad_request_and_atomic_at_the_real_route() {
+        let test_dir = TestDir::new("max-iterations-router-rejection");
+        let state = build_test_state(&test_dir, false).await;
+        let settings_path = test_dir.path().join("settings.json");
+        let before_bytes = tokio::fs::read(&settings_path)
+            .await
+            .expect("read settings before invalid routed saves");
+        let before_runtime = state.runtime_snapshot().await;
+        let valid = serde_json::to_value(payload(INITIAL_BASE_URL, INITIAL_MODEL, None))
+            .expect("serialize settings request");
+        let mut cases = Vec::new();
+        for (label, invalid_value) in [
+            ("negative", json!(-1)),
+            ("fractional", json!(1.5)),
+            ("string", json!("100")),
+            ("boolean", json!(true)),
+            ("u32 overflow", json!(4_294_967_296_u64)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["max_iterations"] = invalid_value;
+            cases.push((
+                label,
+                serde_json::to_vec(&invalid).expect("serialize invalid settings request"),
+            ));
+        }
+        let mut invalid_syntax = serde_json::to_vec(&valid).expect("serialize syntax fixture");
+        assert_eq!(invalid_syntax.pop(), Some(b'}'));
+        cases.push(("JSON syntax", invalid_syntax));
+
+        for (label, body) in cases {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/settings")
+                .header(header::HOST, "127.0.0.1:17896")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = state.api_token.as_deref() {
+                request = request.header(crate::API_TOKEN_HEADER, token);
+            }
+            let response = crate::build_router(state.clone())
+                .oneshot(
+                    request
+                        .body(Body::from(body))
+                        .expect("build settings request"),
+                )
+                .await
+                .expect("route settings request");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            let response_body = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("collect settings rejection");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response_body)
+                    .expect("settings rejection must be JSON"),
+                json!({ "error": "invalid settings JSON payload" }),
+                "{label}"
+            );
+
+            let after_runtime = state.runtime_snapshot().await;
+            assert!(
+                Arc::ptr_eq(&before_runtime, &after_runtime),
+                "{label} replaced runtime"
+            );
+            assert_eq!(after_runtime.revision(), 0, "{label}");
+            assert_eq!(
+                tokio::fs::read(&settings_path)
+                    .await
+                    .expect("read settings after invalid routed save"),
+                before_bytes,
+                "{label} changed disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_get_and_save_are_complete_durable_hot_and_snapshot_isolated() {
+        let test_dir = TestDir::new("thinking-hot-swap");
+        let state = build_test_state(&test_dir, true).await;
+        let started_run_snapshot = state.runtime_snapshot().await;
+        let initial = dss_core::ThinkingSettings::default();
+        assert_eq!(started_run_snapshot.llm().thinking(), initial);
+        assert_eq!(
+            started_run_snapshot
+                .llm()
+                .client()
+                .expect("configured initial client")
+                .thinking_settings(),
+            initial
+        );
+
+        let Json(initial_get) = get_settings(State(state.clone()))
+            .await
+            .expect("get initial thinking settings");
+        assert_eq!(initial_get.thinking, Some(initial.into()));
+        assert_eq!(
+            serde_json::to_value(&initial_get).expect("serialize initial public settings")
+                ["thinking"],
+            json!({ "enabled": true, "effort": "high" })
+        );
+
+        let target = dss_core::ThinkingSettings {
+            enabled: false,
+            effort: dss_core::ThinkingEffort::Max,
+        };
+        let mut update = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        update.thinking = Some(target.into());
+        let Json(saved) = save_settings(State(state.clone()), Json(update))
+            .await
+            .expect("save thinking policy");
+
+        assert_eq!(saved.thinking, Some(target.into()));
+        assert_eq!(saved.revision, 1);
+        let current = state.runtime_snapshot().await;
+        assert!(!Arc::ptr_eq(&started_run_snapshot, &current));
+        assert_eq!(started_run_snapshot.llm().thinking(), initial);
+        assert_eq!(current.llm().thinking(), target);
+        assert_eq!(
+            current
+                .llm()
+                .client()
+                .expect("configured replacement client")
+                .thinking_settings(),
+            target
+        );
+
+        let settings_path = test_dir.path().join("settings.json");
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(&settings_path)
+                .await
+                .expect("read saved thinking settings"),
+        )
+        .expect("parse saved thinking settings");
+        assert_eq!(
+            persisted["thinking"],
+            json!({ "enabled": false, "effort": "max" })
+        );
+        assert_eq!(
+            state
+                .settings
+                .resolve_candidate_thinking(persisted)
+                .expect("resolve restart-equivalent thinking policy"),
+            target
+        );
+
+        let Json(fetched) = get_settings(State(state))
+            .await
+            .expect("read back thinking policy");
+        assert_eq!(fetched.thinking, Some(target.into()));
+        assert_eq!(fetched.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_post_without_thinking_preserves_settings_json_value() {
+        let test_dir = TestDir::new("thinking-legacy-post");
+        let existing = dss_core::ThinkingSettings {
+            enabled: false,
+            effort: dss_core::ThinkingEffort::Low,
+        };
+        let state = build_test_state_with_thinking(&test_dir, false, existing, true).await;
+
+        let mut legacy_json = serde_json::to_value(payload(INITIAL_BASE_URL, INITIAL_MODEL, None))
+            .expect("serialize legacy payload fixture");
+        legacy_json
+            .as_object_mut()
+            .expect("legacy payload object")
+            .remove("thinking");
+        let legacy: AppSettingsPayload =
+            serde_json::from_value(legacy_json).expect("deserialize old POST shape");
+        assert_eq!(legacy.thinking, None);
+
+        let Json(saved) = save_settings(State(state.clone()), Json(legacy))
+            .await
+            .expect("save unrelated legacy form");
+        assert_eq!(saved.thinking, Some(existing.into()));
+        assert_eq!(state.runtime_snapshot().await.llm().thinking(), existing);
+
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after legacy save"),
+        )
+        .expect("parse settings after legacy save");
+        assert_eq!(
+            persisted["thinking"],
+            json!({ "enabled": false, "effort": "low" })
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_post_preserves_thinking_toml_fallback_without_materializing_json() {
+        let test_dir = TestDir::new("thinking-config-fallback");
+        tokio::fs::create_dir_all(test_dir.path())
+            .await
+            .expect("create test settings directory");
+        tokio::fs::write(
+            test_dir.path().join("config.toml"),
+            "[thinking]\nenabled = false\neffort = \"max\"\n",
+        )
+        .await
+        .expect("write thinking config fallback");
+        let fallback = dss_core::ThinkingSettings {
+            enabled: false,
+            effort: dss_core::ThinkingEffort::Max,
+        };
+        let state = build_test_state_with_thinking(&test_dir, false, fallback, false).await;
+        let mut legacy = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        legacy.thinking = None;
+
+        let Json(saved) = save_settings(State(state.clone()), Json(legacy))
+            .await
+            .expect("save old client form against thinking config fallback");
+        assert_eq!(saved.thinking, Some(fallback.into()));
+        assert_eq!(state.runtime_snapshot().await.llm().thinking(), fallback);
+
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after legacy save"),
+        )
+        .expect("parse settings after legacy save");
+        assert!(
+            persisted.get("thinking").is_none(),
+            "an omitted legacy field must not shadow the TOML fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_thinking_json_is_bad_request_and_atomic_at_the_real_route() {
+        let test_dir = TestDir::new("thinking-router-rejection");
+        let state = build_test_state(&test_dir, true).await;
+        let settings_path = test_dir.path().join("settings.json");
+        let before_bytes = tokio::fs::read(&settings_path)
+            .await
+            .expect("read settings before invalid routed saves");
+        let before_runtime = state.runtime_snapshot().await;
+        let valid = serde_json::to_value(payload(INITIAL_BASE_URL, INITIAL_MODEL, None))
+            .expect("serialize settings request");
+        let cases = [
+            ("outer null", Value::Null),
+            ("missing enabled", json!({ "effort": "high" })),
+            ("missing effort", json!({ "enabled": true })),
+            ("enabled null", json!({ "enabled": null, "effort": "high" })),
+            (
+                "enabled wrong type",
+                json!({ "enabled": "true", "effort": "high" }),
+            ),
+            ("effort null", json!({ "enabled": true, "effort": null })),
+            (
+                "unknown effort",
+                json!({ "enabled": true, "effort": "medium" }),
+            ),
+            (
+                "unknown member",
+                json!({ "enabled": true, "effort": "high", "mode": "extra" }),
+            ),
+        ];
+
+        for (label, invalid_thinking) in cases {
+            let mut invalid = valid.clone();
+            invalid["thinking"] = invalid_thinking;
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/settings")
+                .header(header::HOST, "127.0.0.1:17896")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = state.api_token.as_deref() {
+                request = request.header(crate::API_TOKEN_HEADER, token);
+            }
+            let response = crate::build_router(state.clone())
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            serde_json::to_vec(&invalid)
+                                .expect("serialize invalid thinking request"),
+                        ))
+                        .expect("build settings request"),
+                )
+                .await
+                .expect("route settings request");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            let response_body = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("collect settings rejection");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response_body)
+                    .expect("settings rejection must be JSON"),
+                json!({ "error": "invalid settings JSON payload" }),
+                "{label}"
+            );
+
+            let after_runtime = state.runtime_snapshot().await;
+            assert!(
+                Arc::ptr_eq(&before_runtime, &after_runtime),
+                "{label} replaced runtime"
+            );
+            assert_eq!(after_runtime.revision(), 0, "{label}");
+            assert_eq!(
+                after_runtime.llm().thinking(),
+                dss_core::ThinkingSettings::default()
+            );
+            assert_eq!(
+                tokio::fs::read(&settings_path)
+                    .await
+                    .expect("read settings after invalid routed save"),
+                before_bytes,
+                "{label} changed disk"
+            );
         }
     }
 
@@ -1127,6 +2007,198 @@ mod tests {
         assert_eq!(config.model, "configured-model");
         assert_eq!(config.revision, 1);
         assert!(config.overridden_fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_source_keys_hot_swap_mask_preserve_clear_and_restart() {
+        const RESTART_CHILD: &str = "DSS_API_KEYS_RESTART_TEST_CHILD";
+        const TEST_NAME: &str = "data_source_keys_hot_swap_mask_preserve_clear_and_restart";
+
+        if std::env::var_os(RESTART_CHILD).is_some() {
+            let restarted = Settings::load().expect("reload settings through the startup path");
+            let restarted_state = crate::state::build_state(restarted)
+                .await
+                .expect("rebuild application state from persisted settings");
+            let restarted_runtime = restarted_state.runtime_snapshot().await;
+            assert!(restarted_runtime
+                .api_keys()
+                .get(OPENALEX_KEY)
+                .is_some_and(|value| value == &data_source_value("v1")));
+            assert!(restarted_runtime
+                .api_keys()
+                .get(SECONDARY_SOURCE_KEY)
+                .is_some_and(|value| value == &data_source_value("secondary")));
+            let Json(restarted_public) = get_settings(State(restarted_state))
+                .await
+                .expect("read public settings after restart");
+            assert_eq!(
+                restarted_public
+                    .api_keys_masked
+                    .get(OPENALEX_KEY)
+                    .map(String::as_str),
+                Some("••••••••")
+            );
+            return;
+        }
+        if rerun_without_llm_env(TEST_NAME) {
+            return;
+        }
+
+        let test_dir = TestDir::new("data-source-keys");
+        let state = build_test_state(&test_dir, true).await;
+        let before_save = state.runtime_snapshot().await;
+        assert!(before_save.api_keys().is_empty());
+
+        let first_value = data_source_value("v1");
+        let secondary_value = data_source_value("secondary");
+        let mut first = payload(INITIAL_BASE_URL, INITIAL_MODEL, None);
+        first.api_keys = Some(std::collections::HashMap::from([
+            (OPENALEX_KEY.to_owned(), first_value.clone()),
+            (SECONDARY_SOURCE_KEY.to_owned(), secondary_value.clone()),
+        ]));
+        let Json(first_saved) = save_settings(State(state.clone()), Json(first))
+            .await
+            .expect("save data-source keys");
+
+        let after_first_save = state.runtime_snapshot().await;
+        assert!(!Arc::ptr_eq(&before_save, &after_first_save));
+        assert!(before_save.api_keys().is_empty());
+        assert!(after_first_save
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &first_value));
+        assert!(after_first_save
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+        assert_eq!(first_saved.revision, 1);
+        assert_eq!(
+            first_saved.api_keys_masked.get(OPENALEX_KEY),
+            Some(&"••••••••".to_owned())
+        );
+        assert_eq!(
+            first_saved.api_keys_masked.get(SECONDARY_SOURCE_KEY),
+            Some(&"••••••••".to_owned())
+        );
+        assert!(first_saved.api_keys.is_none());
+        let public_json = serde_json::to_string(&first_saved).expect("serialize public settings");
+        assert!(!public_json.contains(&first_value));
+        assert!(!public_json.contains(&secondary_value));
+
+        let Json(fetched) = get_settings(State(state.clone()))
+            .await
+            .expect("read freshly saved settings");
+        assert_eq!(fetched.revision, 1);
+        assert_eq!(
+            fetched.api_keys_masked.get(OPENALEX_KEY),
+            Some(&"••••••••".to_owned())
+        );
+        assert!(fetched.api_keys.is_none());
+
+        let restart = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .env(RESTART_CHILD, "1")
+        .env("DSS_DATA_DIR", test_dir.path())
+        .output()
+        .expect("rerun test through the startup settings loader");
+        assert!(
+            restart.status.success(),
+            "restart child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&restart.stdout),
+            String::from_utf8_lossy(&restart.stderr)
+        );
+
+        // A mask placeholder preserves the corresponding private value.
+        let mut mask_round_trip = first_saved;
+        mask_round_trip.api_keys = Some(std::collections::HashMap::from([(
+            OPENALEX_KEY.to_owned(),
+            "••••••••".to_owned(),
+        )]));
+        let Json(mask_saved) = save_settings(State(state.clone()), Json(mask_round_trip))
+            .await
+            .expect("round-trip a masked key");
+        assert_eq!(mask_saved.revision, 2);
+        assert!(state
+            .runtime_snapshot()
+            .await
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &first_value));
+
+        // Omitting api_keys on an unrelated settings save preserves all current sources.
+        let mut unrelated = mask_saved;
+        unrelated.model = "model-after-key-save".into();
+        unrelated.providers[0].model = Some(unrelated.model.clone());
+        let Json(unrelated_saved) = save_settings(State(state.clone()), Json(unrelated))
+            .await
+            .expect("save an unrelated setting");
+        let after_unrelated = state.runtime_snapshot().await;
+        assert_eq!(unrelated_saved.revision, 3);
+        assert!(after_unrelated
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &first_value));
+        assert!(after_unrelated
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+
+        // Replacing one source leaves unsubmitted sources untouched.
+        let replacement_value = data_source_value("v2");
+        let mut replace = unrelated_saved;
+        replace.api_keys = Some(std::collections::HashMap::from([(
+            OPENALEX_KEY.to_owned(),
+            replacement_value.clone(),
+        )]));
+        let Json(replaced) = save_settings(State(state.clone()), Json(replace))
+            .await
+            .expect("replace one data-source key");
+        let after_replace = state.runtime_snapshot().await;
+        assert_eq!(replaced.revision, 4);
+        assert!(after_replace
+            .api_keys()
+            .get(OPENALEX_KEY)
+            .is_some_and(|value| value == &replacement_value));
+        assert!(after_replace
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+
+        // An explicit empty string clears just that source in runtime and on disk.
+        let mut clear = replaced;
+        clear.api_keys = Some(std::collections::HashMap::from([(
+            OPENALEX_KEY.to_owned(),
+            String::new(),
+        )]));
+        let Json(cleared) = save_settings(State(state.clone()), Json(clear))
+            .await
+            .expect("clear one data-source key");
+        let after_clear = state.runtime_snapshot().await;
+        assert_eq!(cleared.revision, 5);
+        assert!(!after_clear.api_keys().contains_key(OPENALEX_KEY));
+        assert!(after_clear
+            .api_keys()
+            .get(SECONDARY_SOURCE_KEY)
+            .is_some_and(|value| value == &secondary_value));
+        assert!(cleared
+            .api_keys_masked
+            .get(OPENALEX_KEY)
+            .is_none_or(String::is_empty));
+
+        let persisted: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(test_dir.path().join("settings.json"))
+                .await
+                .expect("read settings after key clear"),
+        )
+        .expect("parse settings after key clear");
+        assert!(persisted["api_keys"].get(OPENALEX_KEY).is_none());
+        assert!(persisted["api_keys"]
+            .get(SECONDARY_SOURCE_KEY)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == secondary_value));
     }
 
     #[tokio::test]

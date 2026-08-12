@@ -22,6 +22,11 @@ const PARTIAL_USAGE: Usage = Usage {
     cache_hit_tokens: 0,
     cache_miss_tokens: 0,
 };
+const SAFE_PREFIX: &str = "safe prefix already shown; ";
+const FROZEN_PROTOCOL_TAIL: &str = concat!(
+    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"python\">",
+    "<｜DSML｜parameter name=\"code\" string=true>FROZEN_CONTEXT_SECRET"
+);
 
 struct PendingRequestLlm;
 
@@ -103,6 +108,62 @@ impl LlmClient for PartialThenErrorLlm {
 
     fn model(&self) -> &str {
         "partial-then-error"
+    }
+}
+
+struct SafePrefixThenStalledLlm {
+    frozen_tail_buffered: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for SafePrefixThenStalledLlm {
+    async fn chat(&self, _req: ChatRequest) -> Result<LlmResponse, LlmError> {
+        Err(LlmError::NotConfigured("not used".into()))
+    }
+
+    fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+        let published = stream::iter(vec![
+            Ok(StreamEvent::Usage(PARTIAL_USAGE)),
+            Ok(StreamEvent::Text(format!(
+                "{SAFE_PREFIX}{FROZEN_PROTOCOL_TAIL}"
+            ))),
+        ]);
+        let frozen_tail_buffered = self.frozen_tail_buffered.clone();
+        let consumed = stream::once(async move {
+            frozen_tail_buffered.notify_one();
+            Ok(StreamEvent::Usage(PARTIAL_USAGE))
+        });
+        let stalled = stream::pending::<Result<StreamEvent, LlmError>>();
+        let events = Box::pin(published.chain(consumed).chain(stalled)) as BoxedEventStream;
+        Box::pin(async move { Ok(events) })
+    }
+
+    fn model(&self) -> &str {
+        "safe-prefix-then-stalled"
+    }
+}
+
+struct SafePrefixThenErrorLlm;
+
+#[async_trait::async_trait]
+impl LlmClient for SafePrefixThenErrorLlm {
+    async fn chat(&self, _req: ChatRequest) -> Result<LlmResponse, LlmError> {
+        Err(LlmError::NotConfigured("not used".into()))
+    }
+
+    fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+        let events = Box::pin(stream::iter(vec![
+            Ok(StreamEvent::Usage(PARTIAL_USAGE)),
+            Ok(StreamEvent::Text(format!(
+                "{SAFE_PREFIX}{FROZEN_PROTOCOL_TAIL}"
+            ))),
+            Err(LlmError::Stream("failure after safe prefix".into())),
+        ])) as BoxedEventStream;
+        Box::pin(async move { Ok(events) })
+    }
+
+    fn model(&self) -> &str {
+        "safe-prefix-then-error"
     }
 }
 
@@ -453,6 +514,96 @@ async fn stream_error_discards_quarantined_text_and_thinking_but_preserves_usage
 }
 
 #[tokio::test]
+async fn receiver_disconnect_preserves_only_released_safe_prefix_and_drops_frozen_tail() {
+    let frozen_tail_buffered = Arc::new(Notify::new());
+    let (mut rx, task) = spawn_run(SafePrefixThenStalledLlm {
+        frozen_tail_buffered: frozen_tail_buffered.clone(),
+    })
+    .await;
+    recv_until(
+        &mut rx,
+        |event| matches!(event, AgentEvent::Text { text } if text == SAFE_PREFIX),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), frozen_tail_buffered.notified())
+        .await
+        .expect("runner did not buffer the frozen protocol tail");
+
+    drop(rx);
+    let (outcome, session) = await_run(task).await;
+    assert_cancelled_base(&outcome, &session);
+    assert_eq!(outcome.final_text, SAFE_PREFIX);
+    assert_eq!(outcome.iterations, 1);
+    assert_usage(outcome.usage, 7, 3);
+
+    let assistants: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1);
+    assert!(!assistants[0].harness_notice);
+    assert_eq!(assistants[0].content.as_deref(), Some(SAFE_PREFIX));
+    assert!(session.messages.iter().all(|message| {
+        message.content.as_deref().is_none_or(|content| {
+            !content.contains('<')
+                && !content.contains("DSML")
+                && !content.contains("FROZEN_CONTEXT_SECRET")
+        })
+    }));
+}
+
+#[tokio::test]
+async fn stream_error_preserves_only_released_safe_prefix_and_drops_frozen_tail() {
+    let (mut rx, task) = spawn_run(SafePrefixThenErrorLlm).await;
+    let (outcome, session) = await_run(task).await;
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(outcome.kind, CompleteKind::Error);
+    assert_eq!(outcome.final_text, SAFE_PREFIX);
+    assert_eq!(outcome.iterations, 1);
+    assert_usage(outcome.usage, 7, 3);
+    assert_eq!(session.frame.status, FrameStatus::Failed);
+
+    let streamed_text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_text, SAFE_PREFIX);
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, AgentEvent::DraftReset { .. })));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Complete { final_text, .. } if final_text == SAFE_PREFIX
+        )
+    }));
+
+    let assistants: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1);
+    assert!(!assistants[0].harness_notice);
+    assert_eq!(assistants[0].content.as_deref(), Some(SAFE_PREFIX));
+    assert!(session.messages.iter().all(|message| {
+        message.content.as_deref().is_none_or(|content| {
+            !content.contains('<')
+                && !content.contains("DSML")
+                && !content.contains("FROZEN_CONTEXT_SECRET")
+        })
+    }));
+}
+
+#[tokio::test]
 async fn second_iteration_cancel_keeps_real_tool_result_and_cumulative_usage() {
     let second_buffered = Arc::new(Notify::new());
     let llm = ToolThenPartialLlm {
@@ -493,12 +644,18 @@ async fn second_iteration_cancel_keeps_real_tool_result_and_cumulative_usage() {
     );
     assert_eq!(tool_results[0].is_error, Some(false));
 
+    let released_reasoning = session
+        .messages
+        .iter()
+        .find(|message| message.reasoning_content.as_deref() == Some("second analysis"))
+        .expect("safe second-iteration reasoning crossed the UI boundary");
+    assert!(!released_reasoning.harness_notice);
     assert!(session.messages.iter().all(|message| {
-        message.reasoning_content.as_deref() != Some("second analysis")
-            && message
-                .content
-                .as_deref()
-                .is_none_or(|content| !content.contains("post-tool secret"))
+        message.content.as_deref().is_none_or(|content| {
+            !content.contains('<')
+                && !content.contains("DSML")
+                && !content.contains("post-tool secret")
+        })
     }));
 }
 
@@ -528,16 +685,17 @@ async fn second_iteration_error_keeps_real_tool_result_and_cumulative_usage() {
             .count(),
         1
     );
-    assert!(session.messages.iter().all(|message| {
-        message.reasoning_content.as_deref() != Some("second analysis")
-            && message
-                .content
-                .as_deref()
-                .is_none_or(|content| !content.contains("post-tool secret"))
-    }));
+    let released_reasoning = session
+        .messages
+        .iter()
+        .find(|message| message.reasoning_content.as_deref() == Some("second analysis"))
+        .expect("safe second-iteration reasoning crossed the UI boundary");
+    assert!(!released_reasoning.harness_notice);
     assert!(session.messages.iter().all(|message| {
         message.content.as_deref().is_none_or(|content| {
-            !content.contains("DSML") && !content.contains("post-tool secret")
+            !content.contains('<')
+                && !content.contains("DSML")
+                && !content.contains("post-tool secret")
         })
     }));
 }

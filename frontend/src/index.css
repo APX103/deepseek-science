@@ -5,19 +5,20 @@
 /*
  * DeepSeek 设计 token（docs/design-system.md）
  * 亮色为默认；[data-theme="dark"] 覆盖为深色。
- * 核心：品牌蓝 #4D6BFE、1px 细边框、几乎无阴影、圆角克制。
+ * 核心：品牌蓝、1px 细边框、几乎无阴影、圆角克制。
+ * 色值来源：2026-08-11 浏览器实测 chat.deepseek.com（深色）+ deepseek.com（亮色）。
  */
 :root {
-  --brand: #4d6bfe;
-  --brand-hover: #3d5ae0;
-  --brand-soft: rgba(77, 107, 254, 0.1);
+  --brand: #3b82f6;
+  --brand-hover: #2563eb;
+  --brand-soft: rgba(59, 130, 246, 0.1);
   --bg: #ffffff;
   --surface: #f9fafb;
   --surface-2: #f3f4f6;
   --border: #e5e7eb;
   --border-strong: #d1d5db;
-  --text: #111827;
-  --text-secondary: #6b7280;
+  --text: #0f1115;
+  --text-secondary: #64748b;
   --text-tertiary: #9ca3af;
   --danger: #ef4444;
   --danger-soft: rgba(239, 68, 68, 0.1);
@@ -25,14 +26,14 @@
 }
 
 [data-theme='dark'] {
-  --brand: #5b7cff;
+  --brand: #5686fe;
   --brand-hover: #4d6bfe;
-  --brand-soft: rgba(91, 124, 255, 0.14);
+  --brand-soft: rgba(86, 134, 254, 0.14);
   --bg: #151517;
-  --surface: #1f1f23;
+  --surface: #1b1b1c;
   --surface-2: #2a2a2e;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
+  --border: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.2);
   --text: #f9fafb;
   --text-secondary: #9ca3af;
   --text-tertiary: #6b7280;

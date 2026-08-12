@@ -7,6 +7,9 @@ pub mod time;
 
 pub use error::Error;
 pub use settings::{
-    A2aAgentConfig, LlmEnvOverrides, LlmProvider, LlmSettings, McpServerConfig,
-    ResolvedLlmSettings, Settings, SkillSettings, DEFAULT_A2A_TIMEOUT_SECONDS,
+    default_mcp_servers, validate_max_iterations, A2aAgentConfig, LlmEnvOverrides, LlmProvider,
+    LlmSettings, McpServerConfig, ResolvedLlmSettings, Settings, SkillSettings, ThinkingEffort,
+    ThinkingSettings, DEFAULT_A2A_TIMEOUT_SECONDS, DEFAULT_AGENT_REGISTRY_NAME,
+    DEFAULT_AGENT_REGISTRY_URL, DEFAULT_MAX_ITERATIONS, MAX_CONFIGURABLE_ITERATIONS,
+    MIN_MAX_ITERATIONS,
 };

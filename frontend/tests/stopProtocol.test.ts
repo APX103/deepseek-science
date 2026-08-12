@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
+  appendStreamText,
   beginStreamStop,
   completeStream,
   failStream,
   failStreamStop,
   finishStreamStop,
+  getMessagesSnapshot,
   getStreamSnapshot,
+  retireStreamAfterBackendFinish,
   resumeStreamAfterLateStop,
+  sendUserMessage,
   setStreamAborter,
   startStream,
 } from "../src/store";
@@ -91,5 +95,21 @@ describe("explicit Stop protocol", () => {
       stopping: false,
       error: null,
     });
+  });
+
+  test("authoritative restore retirement drops the exact draft shell without duplicating it", () => {
+    const sid = "stop-authoritative-retire";
+    sendUserMessage(sid, "canonical user turn");
+    const runId = startStream(sid);
+    appendStreamText(sid, "partial draft that canonical GET already replaced", runId);
+    let abortCount = 0;
+    setStreamAborter(sid, () => { abortCount += 1; }, runId);
+    const restoredMessages = getMessagesSnapshot(sid);
+
+    expect(retireStreamAfterBackendFinish(sid, runId)).toBe(true);
+    expect(abortCount).toBe(1);
+    expect(getStreamSnapshot(sid)).toBeUndefined();
+    expect(getMessagesSnapshot(sid)).toEqual(restoredMessages);
+    expect(JSON.stringify(getMessagesSnapshot(sid))).not.toContain("partial draft");
   });
 });

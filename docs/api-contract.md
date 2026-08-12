@@ -34,6 +34,29 @@
 绝不返回明文 API Key。运行时**只能启用一个 provider**；POST 时 `enabled=true` 的项必须且只能有一个。
 `AppSettings.model` 保留作为兼容字段，其值等于当前启用 provider 的 model。
 
+`AppSettings.max_iterations` 是每次用户请求内 Runner 的模型/工具迭代总上限，必须是
+`1..=1000` 的整数，未配置时默认 `100`。GET 与成功 POST 的响应始终返回当前运行时值；新版前端
+在完整表单 POST 中必须原样携带该字段。为兼容旧客户端，POST 缺少该字段表示保留候选配置中的
+现值，不得重置为默认值。显式保存继续使用同一 `revision` CAS、根对象合并和私密原子写事务。
+
+该值属于热更新运行快照：保存提交后接受的新 run 立即使用新上限，已经开始的 run 保持接收时
+捕获的旧上限。用户在 prompt/run context 中明确给出的更小轮次限制仍可收窄本次预算，实际值为
+`min(用户显式限制, max_iterations)`；自然完成、取消和其他提前终止条件不要求运行满该轮数。
+
+`AppSettings.thinking` 是单次模型请求的推理策略，完整形态为
+`{enabled:boolean, effort:"low"|"high"|"max"}`，未配置时默认 `{enabled:true, effort:"high"}`。
+它与 `max_iterations` 正交：前者控制一次受支持模型调用的推理强度，后者限制整个 Agent/工具循环。
+GET 与成功 POST 始终从当前 LLM 运行快照返回两个成员；新版前端完整表单必须原样携带该对象。
+旧客户端省略整个 `thinking` 对象时保留 `settings.json` 或 `config.toml` 的当前分层值；显式 `null`、
+缺少成员、未知成员或不在枚举中的 effort 均返回 400，且不得修改磁盘、revision 或运行快照。
+
+当前请求映射保持 fail-closed：DeepSeek V4 Chat Completions 开启时发送
+`thinking:{type:"enabled"}` 与顶层 `reasoning_effort`，关闭时只发送
+`thinking:{type:"disabled"}`；官方 `api.openai.com` 的已识别 GPT-5.6 alias 与 Sol/Terra/Luna model ID 只发送
+顶层 `reasoning_effort`（关闭为 `none`），绝不发送 DeepSeek 的 `thinking` 对象。非推理模型、代理和
+未知 OpenAI-compatible 目标不注入推测性的扩展字段。该策略随不可变 LLM 运行快照捕获：保存后新
+run 立即生效，已经开始的 run 继续使用旧策略。
+
 `AppSettings.a2a_agents` 是最多 16 项的数组。每项可编辑字段为
 `id/name/endpoint/enabled/timeout_seconds/bearer_token?/clear_bearer_token?`；GET 只返回
 `bearer_token_masked`，绝不返回明文凭据。诊断字段为
@@ -88,6 +111,16 @@ endpoint 时旧凭据绝不自动转发。GET 返回的 `revision` 必须原样�
 ### MCP
 | GET | `/api/mcp/{server_name}/tools` | `{name, url, enabled, connected, tools:[{name,description}], error?}` |
 
+默认设置包含 `agent-registry`（`https://a2a-dev.intern-ai.org.cn/mcp`）；显式
+`mcp_servers: []` 可关闭。Agent 运行时可通过 `mcp_list_resources`、
+`mcp_read_resource` 发现/读取 Resource；这两个工具仅在 captured runtime 至少有一个
+已连接且声明 Resources 的 server 时出现，`server` schema 只枚举该次运行捕获的 manager
+key。只有 captured runtime 中的 `agent-registry` 已连接并声明 Resources 时，才提供独占工具 `call_agent`；其输入绑定
+list/read 返回的精确 `resource_uri`，只允许一次 fresh Send，不接受 endpoint、credential 或
+任意 task/context handle。默认 Registry 强制按 Resources-only 连接，不调用或挂载它声明的
+MCP Tools。返回仍使用 `dss.a2a.tool-result.v1`，其 typed optional `registry` 字段保留
+server/resource URI/name provenance；所有远端描述、Card 和输出均按不可信外部数据处理。
+
 ### Projects
 | GET | `/api/projects?archived=false` | 项目列表（默认项目置顶） |
 | POST | `/api/projects` | 建项目 `proj_<8hex>` |
@@ -141,6 +174,10 @@ endpoint 时旧凭据绝不自动转发。GET 返回的 `revision` 必须原样�
 **`complete.kind` 取值**：`natural | awaiting | max_iters | error | cancelled`。
 **`complete.awaiting`**：`"user_response" | "plan_approval" | null`。
 **`complete.usage`**：`{input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens, …}`。`cache_hit_tokens`/`cache_miss_tokens` 来自 DeepSeek `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`（前缀缓存，命中输入约 1/120 价）；OpenAI 兼容端点回退 `prompt_tokens_details.cached_tokens`，缺失时为 0。
+
+前端把当前流式 iteration 的 Thinking disclosure 默认展开，把刷新恢复的历史 Thinking 默认收起；
+两者都可通过原生按钮点击或键盘切换，并用 `aria-expanded`/`aria-controls` 关联内容区域。折叠只改变
+显示状态，不删除或改写已经通过协议清洗的 canonical reasoning 内容。
 
 ### 实现注意（易错点）
 

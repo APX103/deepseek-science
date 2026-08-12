@@ -1,18 +1,9 @@
-// 文本文件预览弹层：支持 Markdown 渲染/源码切换。
-// 设计为可扩展：后续接入 LaTeX 编译器后可把 .tex 加入 filePreviewMode。
-import { memo } from 'react'
+// 文本文件预览弹层：可渲染格式默认预览，并可切换到可复制源码。
 import { useEffect, useMemo, useState } from 'react'
-import Markdown from 'react-markdown'
-import rehypeKatex from 'rehype-katex'
-import remarkBreaks from 'remark-breaks'
-import remarkGemoji from 'remark-gemoji'
-import remarkGfm from 'remark-gfm'
-import remarkMath from 'remark-math'
 import { readFile } from '../api/client'
 import type { WorkspaceFile } from '../types'
+import MarkdownContent from './MarkdownContent'
 import Modal from './Modal'
-import Toggle from './Toggle'
-import 'katex/dist/katex.min.css'
 
 interface Props {
   sid: string
@@ -20,117 +11,90 @@ interface Props {
   onClose: () => void
 }
 
-type PreviewMode = 'source' | 'markdown'
+type PreviewRenderer = 'markdown'
+type DisplayMode = 'rendered' | 'source'
 
-function filePreviewMode(path: string): PreviewMode | null {
+export function filePreviewMode(path: string): PreviewRenderer | null {
   const ext = path.split('.').pop()?.toLowerCase()
   if (ext === 'md' || ext === 'markdown' || ext === 'mdx') return 'markdown'
   return null
 }
 
-const SAFE_FRAGMENT = /^#[A-Za-z0-9][A-Za-z0-9_.:%-]*$/
+export function initialDisplayMode(path: string): DisplayMode {
+  return filePreviewMode(path) ? 'rendered' : 'source'
+}
 
-function safeMarkdownUrl(value: string): string {
-  const trimmed = value.trim()
-  if (SAFE_FRAGMENT.test(trimmed)) return trimmed
-  if (!/^https?:\/\//i.test(trimmed)) return ''
-  try {
-    const parsed = new URL(trimmed)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : ''
-  } catch {
-    return ''
+interface ClipboardWriter {
+  writeText(text: string): Promise<void>
+}
+
+export async function copyPreviewSource(content: string, clipboard?: ClipboardWriter): Promise<void> {
+  const writer = clipboard ?? (typeof navigator !== 'undefined' ? navigator.clipboard : undefined)
+  if (!writer?.writeText) throw new Error('clipboard unavailable')
+  await writer.writeText(content)
+}
+
+export function SourcePreview({ content }: { content: string }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copying' | 'copied' | 'error'>('idle')
+
+  useEffect(() => {
+    if (copyState !== 'copied') return
+    const timer = window.setTimeout(() => setCopyState('idle'), 1800)
+    return () => window.clearTimeout(timer)
+  }, [copyState])
+
+  const copySource = async () => {
+    setCopyState('copying')
+    try {
+      await copyPreviewSource(content)
+      setCopyState('copied')
+    } catch {
+      setCopyState('error')
+    }
   }
-}
 
-const markdownComponents = {
-  a({ href, children, ...props }: { href?: string; children?: React.ReactNode; className?: string }) {
-    if (!href) {
-      return <span className="agent-markdown-blocked-link">{children}</span>
-    }
-    if (href.startsWith('#')) {
-      return (
-        <a href={href} {...props}>
-          {children}
-        </a>
-      )
-    }
-    return (
-      <button
-        type="button"
-        role="link"
-        className={`agent-markdown-external-link ${props.className ?? ''}`.trim()}
-        title="在系统浏览器中打开"
-        onClick={() => {
-          if (typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window)) {
-            window.open(href, '_blank', 'noopener,noreferrer')
-          }
-        }}
-      >
-        {children}
-      </button>
-    )
-  },
-  img({ alt }: { alt?: string }) {
-    return (
-      <span className="agent-markdown-image-placeholder" role="note">
-        🖼 {alt?.trim() || '远程图片未自动加载'}
-      </span>
-    )
-  },
-  table({ children, ...props }: { children?: React.ReactNode; className?: string }) {
-    return (
-      <div className="agent-markdown-table-wrap" role="region" aria-label="可横向滚动的表格" tabIndex={0}>
-        <table {...props}>{children}</table>
-      </div>
-    )
-  },
-}
-
-const RenderedMarkdown = memo(function RenderedMarkdown({ content }: { content: string }) {
   return (
-    <div className="agent-markdown" data-agent-markdown="true">
-      <Markdown
-        components={markdownComponents as any}
-        remarkPlugins={[
-          [remarkGfm, { singleTilde: false }],
-          remarkBreaks,
-          remarkGemoji,
-          remarkMath,
-        ]}
-        rehypePlugins={[
-          [
-            rehypeKatex,
-            {
-              trust: false,
-              strict: 'warn',
-              throwOnError: false,
-              maxExpand: 1000,
-              maxSize: 20,
-            },
-          ],
-        ]}
-        skipHtml
-        urlTransform={safeMarkdownUrl}
-      >
-        {content}
-      </Markdown>
+    <div className="overflow-hidden rounded-md border border-border bg-surface" data-file-source="true">
+      <div className="flex min-h-9 items-center justify-between gap-3 border-b border-border px-3 py-1.5">
+        <span className="text-[10px] font-medium uppercase tracking-wide text-ink3">源码</span>
+        <div className="flex items-center gap-2">
+          {copyState === 'error' && (
+            <span className="text-[11px] text-red-600" role="status">
+              复制失败，请检查剪贴板权限
+            </span>
+          )}
+          <button
+            type="button"
+            className="btn-ghost rounded px-2 py-1 text-[11px]"
+            onClick={() => void copySource()}
+            disabled={copyState === 'copying'}
+            aria-label="复制源码"
+          >
+            {copyState === 'copied' ? '已复制' : copyState === 'copying' ? '正在复制…' : '复制源码'}
+          </button>
+        </div>
+      </div>
+      <pre className="overflow-auto p-3 font-mono text-[12px] leading-[1.7] text-ink2">
+        <code>{content}</code>
+      </pre>
     </div>
   )
-})
+}
 
 export default function FilePreviewModal({ sid, file, onClose }: Props) {
   const [content, setContent] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const defaultMode = useMemo(() => filePreviewMode(file.path), [file.path])
-  const [rendered, setRendered] = useState(defaultMode !== null)
+  const renderer = useMemo(() => filePreviewMode(file.path), [file.path])
+  const [displayMode, setDisplayMode] = useState<DisplayMode>(() => initialDisplayMode(file.path))
 
   useEffect(() => {
     let cancelled = false
     setContent(null)
     setLoading(true)
     setError(null)
+    setDisplayMode(initialDisplayMode(file.path))
 
     void readFile(sid, file.path)
       .then((text) => {
@@ -148,19 +112,42 @@ export default function FilePreviewModal({ sid, file, onClose }: Props) {
     }
   }, [sid, file.path])
 
-  const showRendered = rendered && defaultMode === 'markdown'
+  const showRendered = displayMode === 'rendered' && renderer === 'markdown'
 
   return (
     <Modal title={file.path} onClose={onClose} width="max-w-3xl">
       <div className="flex max-h-[70vh] min-h-40 flex-col">
-        {defaultMode && (
-          <div className="flex items-center justify-end gap-2 border-b border-border px-4 py-2">
-            <span className={`text-[12px] ${showRendered ? 'text-ink' : 'text-ink3'}`}>渲染</span>
-            <Toggle checked={rendered} onChange={setRendered} />
-            <span className={`text-[12px] ${!showRendered ? 'text-ink' : 'text-ink3'}`}>源码</span>
+        {renderer && (
+          <div className="flex items-center justify-end border-b border-border px-4 py-2">
+            <div
+              className="inline-flex rounded-md border border-border bg-surface p-0.5"
+              role="group"
+              aria-label="文件显示模式"
+            >
+              <button
+                type="button"
+                className={`rounded px-2.5 py-1 text-[12px] transition-colors ${
+                  showRendered ? 'bg-bg font-medium text-ink shadow-subtle' : 'text-ink3 hover:text-ink2'
+                }`}
+                aria-pressed={showRendered}
+                onClick={() => setDisplayMode('rendered')}
+              >
+                预览
+              </button>
+              <button
+                type="button"
+                className={`rounded px-2.5 py-1 text-[12px] transition-colors ${
+                  !showRendered ? 'bg-bg font-medium text-ink shadow-subtle' : 'text-ink3 hover:text-ink2'
+                }`}
+                aria-pressed={!showRendered}
+                onClick={() => setDisplayMode('source')}
+              >
+                源码
+              </button>
+            </div>
           </div>
         )}
-        <div className="flex-1 overflow-auto p-4">
+        <div className="flex-1 overflow-auto p-4" data-preview-mode={showRendered ? 'rendered' : 'source'}>
           {loading ? (
             <p className="text-[13px] text-ink3">正在加载文件内容…</p>
           ) : error ? (
@@ -170,11 +157,9 @@ export default function FilePreviewModal({ sid, file, onClose }: Props) {
           ) : content === '' ? (
             <p className="text-[13px] text-ink3">该文件为空。</p>
           ) : showRendered ? (
-            <RenderedMarkdown content={content ?? ''} />
+            <MarkdownContent content={content ?? ''} />
           ) : (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[12px] leading-[1.7] text-ink2">
-              {content ?? ''}
-            </pre>
+            <SourcePreview content={content ?? ''} />
           )}
         </div>
       </div>

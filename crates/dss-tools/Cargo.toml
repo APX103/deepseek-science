@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Deepseek Science tool system (Tool trait, registry, router, built-in tools)"
 
+[features]
+test-support = ["dss-a2a/test-support"]
+
 [dependencies]
 dss-core = { path = "../dss-core" }
 dss-a2a = { path = "../dss-a2a" }
@@ -20,3 +23,15 @@ async-trait.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+
+[[test]]
+name = "agent_registry_a2a_e2e"
+path = "tests/agent_registry_a2a_e2e.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "agent_registry_a2a_live_e2e"
+path = "tests/agent_registry_a2a_live_e2e.rs"

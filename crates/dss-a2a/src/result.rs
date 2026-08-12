@@ -4,6 +4,7 @@ use serde_json::Value;
 use crate::{CardSnapshot, InvokeAction, ProtocolBinding, ProtocolVersion};
 
 pub const A2A_RESULT_SCHEMA: &str = "dss.a2a.tool-result.v1";
+pub const REGISTRY_DIRECT_TASK_WARNING: &str = "registry_direct_task_send_response";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A2aAgentRef {
@@ -27,6 +28,21 @@ pub struct A2aRequestRecord {
     pub context_id: Option<String>,
     pub task: String,
     pub timeout_seconds: u64,
+}
+
+/// Optional cross-protocol provenance for an A2A Agent resolved through a trusted
+/// Registry Resource. Keeping this in the canonical typed envelope prevents
+/// serializers and compact projections from silently discarding the authority
+/// that selected the remote endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2aRegistryProvenance {
+    pub server: String,
+    pub resource_uri: String,
+    pub resource_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,6 +127,8 @@ pub struct A2aToolResult {
     pub schema: String,
     pub agent: A2aAgentRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<A2aRegistryProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<CardSnapshot>,
     pub request: A2aRequestRecord,
     pub responses: Vec<ResponseFrame>,
@@ -174,5 +192,22 @@ mod tests {
             false,
         );
         assert!(!protocol_error.is_resumable_interruption());
+    }
+
+    #[test]
+    fn legacy_results_without_registry_provenance_remain_compatible() {
+        let raw = serde_json::json!({
+            "schema": A2A_RESULT_SCHEMA,
+            "agent": {"config_id":"a", "display_name":"A", "configured_endpoint":"https://example.test/a2a"},
+            "request": {"invocation_id":"i", "action":"send", "message_id":"m", "task":"x", "timeout_seconds":5},
+            "responses": [],
+            "terminal": {"kind":"protocol_error", "success":false, "error":"x"}
+        });
+        let restored: A2aToolResult = serde_json::from_value(raw).unwrap();
+        assert!(restored.registry.is_none());
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("registry")
+            .is_none());
     }
 }

@@ -82,6 +82,9 @@ export interface A2aAgentSettingsUpdate {
 
 export type LlmOverriddenField = 'api_key' | 'base_url' | 'model'
 
+/** Public settings expose only an empty value or the backend's fixed credential mask. */
+export type MaskedApiKey = '' | '••••••••'
+
 /** Skill 发现配置：内置开关 + 外部目录纳入 + 自定义目录。 */
 export interface SkillSettingsValue {
   /** 被禁用的 skill 名称。 */
@@ -90,6 +93,14 @@ export interface SkillSettingsValue {
   include_codex: boolean
   include_cursor: boolean
   custom_dirs: string[]
+}
+
+/** Persisted reasoning budget for compatible LLM providers. */
+export type ThinkingEffort = 'low' | 'high' | 'max'
+
+export interface ThinkingSettingsValue {
+  enabled: boolean
+  effort: ThinkingEffort
 }
 
 export interface AppSettings {
@@ -108,8 +119,16 @@ export interface AppSettings {
   skills?: SkillSettingsValue
   /** MCP server 列表（含连接状态）；旧后端可能不返回。 */
   mcp_servers?: McpServer[]
-  /** 数据源 API keys（GET 时脱敏为 ••••••••）；旧后端可能不返回。 */
-  api_keys_masked?: Record<string, string>
+  /** 数据源 API keys（GET 时只能为空值或固定 mask）；旧后端可能不返回。 */
+  api_keys_masked?: Record<string, MaskedApiKey>
+  /** 日志保留天数（D-T07）；旧后端可能不返回。 */
+  log_retention_days?: number
+  /** 日志最大条数（D-T07）；旧后端可能不返回。 */
+  log_max_rows?: number
+  /** 每次 Agent 运行的模型/工具最大迭代次数；旧后端可能不返回。 */
+  max_iterations?: number
+  /** Think 开关与单次模型调用的推理强度；旧后端可能不返回。 */
+  thinking?: ThinkingSettingsValue
 }
 
 /** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */
@@ -124,6 +143,14 @@ export interface AppSettingsUpdate {
   mcp_servers?: McpServerUpdate[]
   /** 数据源 API keys。mask 占位（••••••••）后端保留旧值；空串清除该 key。 */
   api_keys?: Record<string, string>
+  /** 日志保留天数（D-T07）。 */
+  log_retention_days: number
+  /** 日志最大条数（D-T07）。 */
+  log_max_rows: number
+  /** 每次 Agent 运行的模型/工具最大迭代次数。 */
+  max_iterations: number
+  /** Think 开关与单次模型调用的推理强度。 */
+  thinking: ThinkingSettingsValue
 }
 
 // ---------- MCP ----------

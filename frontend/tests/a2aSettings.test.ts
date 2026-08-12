@@ -10,6 +10,7 @@ function settings(): AppSettings {
   return {
     providers: [
       {
+        id: 'DeepSeek',
         name: 'DeepSeek',
         base_url: 'https://api.example.invalid',
         api_key_masked: '••••••••',

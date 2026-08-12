@@ -31,7 +31,7 @@ pub struct A2aRemoteTool {
 }
 
 #[derive(Debug, Default)]
-struct InvocationGuard {
+pub(super) struct InvocationGuard {
     mutating_attempted: bool,
     observed_existing_task: bool,
     cancelled_task_ids: std::collections::HashSet<String>,
@@ -39,7 +39,7 @@ struct InvocationGuard {
 }
 
 impl InvocationGuard {
-    fn reserve(&mut self, request: &InvokeRequest) -> Result<(), ToolError> {
+    pub(super) fn reserve(&mut self, request: &InvokeRequest) -> Result<(), ToolError> {
         match request.action {
             dss_a2a::InvokeAction::Send | dss_a2a::InvokeAction::Submit => {
                 if self.mutating_attempted {
@@ -81,7 +81,7 @@ impl InvocationGuard {
         Ok(())
     }
 
-    fn observe(&mut self, result: &dss_a2a::A2aToolResult) {
+    pub(super) fn observe(&mut self, result: &dss_a2a::A2aToolResult) {
         if result.terminal.is_resumable_interruption() {
             if let Some(task_id) = result.terminal.task_id.as_ref() {
                 self.resumable_task_ids.insert(task_id.clone());
@@ -218,6 +218,9 @@ impl Tool for A2aRemoteTool {
     async fn call(&self, _ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError> {
         let mut request: InvokeRequest = parse_arguments_to(&args)?;
         request.timeout_seconds = Some(self.effective_timeout(&args));
+        // JSON Schema is not enforced by ToolRouter. Keep local argument errors
+        // from reserving the one remote Message side effect for this run.
+        request.validate().map_err(ToolError::other)?;
         let mut invocation_guard = self.invocation_guard.lock().await;
         invocation_guard.reserve(&request)?;
         let mut card_cache = self.card_cache.lock().await;
@@ -447,5 +450,18 @@ mod tests {
             .reserve(&InvokeRequest::cancel_task("task-1"))
             .unwrap_err();
         assert!(error.to_string().contains("already attempted"));
+    }
+
+    #[test]
+    fn invalid_request_is_rejected_before_the_side_effect_guard_is_reserved() {
+        let mut guard = InvocationGuard::default();
+        let invalid = InvokeRequest::new("");
+        assert!(invalid.validate().is_err());
+        assert!(!guard.mutating_attempted);
+
+        let valid = InvokeRequest::new("now valid");
+        valid.validate().unwrap();
+        guard.reserve(&valid).unwrap();
+        assert!(guard.mutating_attempted);
     }
 }

@@ -58,11 +58,11 @@
 
 ---
 
-## 当前决策日志（初始）
+## 当前决策日志
 
-> 实现期持续追加。编号不重排。
+> 实现期持续追加，编号不重排。状态统一使用：**已完成**（历史保留但不再是债务）、**部分完成**（已有可用基线，剩余范围明确）、**有效 TODO/DEFER**（仍未完成）。
 
-### 待用户确认（QUESTION，高优先）
+### QUESTION 记录
 
 #### D-Q01 后端二进制名与 CLI（已定）
 - **已定**：二进制名 `dss-backend`（`dss-bin` crate 的 `[[bin]]`），CLI 子命令 `dss-backend serve --port N`（默认 17896）。
@@ -74,9 +74,10 @@
 - **已定**：`~/.deepseek-science`，环境变量 `DSS_DATA_DIR`。见 D-001/D-006。
 - 相关：architecture、data-model。
 
-#### D-Q04 代码沙箱方案
-- 方案 A（Python 子进程+JSON-RPC，倾向）/ B（PyO3）/ C（WASM）/ D（容器）/ E（可插拔）。
-- 阻塞 P9 与方向 2.1。需调研。
+#### D-Q04 代码沙箱方案（部分完成）
+- **已完成基线**：bash/python 已采用受工作区约束的子进程执行；`python` 仍是每次调用新建进程的最小实现。
+- **尚待定案**：方案 A（Python 长进程+JSON-RPC，倾向）/ B（PyO3）/ C（WASM）/ D（容器）/ E（可插拔），以及状态、venv/包管理和 host 注入边界。
+- 状态：**部分完成，仍为 P9 有效决策项**。
 - 相关：tech-stack.md、enhancements.md。
 
 ### 已记录的设计决策（DECISION，散见各文档）
@@ -136,29 +137,38 @@
 
 ### 待办（TODO）
 
-#### D-T01 调研：代码沙箱方案定案
-- 归属：P9 / 方向 2.1。产出 `research/sandbox.md`。
+#### D-T01 调研：代码沙箱方案定案（部分完成）
+- 已有最小子进程隔离基线；生产级方案仍未定案，尚需产出 `research/sandbox.md`。
+- 状态：**部分完成，仍为有效 TODO**。归属：P9 / 方向 2.1；与 D-Q04、D-F07 联动。
 
 #### D-T02 调研：向量索引选型（文献知识库）
 - 候选：hnsw / usearch / sqlite-vss。归属：P11 / 方向 3。
+- 状态：**有效 TODO（未完成）**。
 
 #### D-T03 调研：学科插件分发形态
 - 编译期 feature / 动态加载 / Python 包。归属：P13+ / [07](domain-plugins.md)。
+- 状态：**有效 TODO（未完成）**。
 
-#### D-T04 调研：Deepseek 能力边界
-- 并行 sampling、context caching、function calling 特化。归属：P10 / 方向 1。
+#### D-T04 调研：DeepSeek 能力边界（部分完成）
+- **已完成基线**：`reasoning_content` 流式展示、function calling、多轮 usage 与 prefix-cache 命中计量/请求前缀优化均已接入。
+- **剩余范围**：并行 sampling、模型能力矩阵及更细的 function-calling 特化验证。
+- 状态：**部分完成，仍为有效 TODO**。归属：P10 / 方向 1。
 
 #### D-T05 R 语言支持评估
 - 生信（DESeq2/Seurat）依赖 R。归属：沙箱（D-T01）的子项。
+- 状态：**有效 TODO（未完成）**。
 
-#### D-T06 校准：DeepSeek 设计 token 精确值
-- 用浏览器 devtools 实测 chat.deepseek.com 的精确 hex（品牌蓝、各中性色、圆角、间距）。
-- 实现 P1 之后、主题重写前完成。校准后回填 [design-system.md](design-system.md) 中标 ⚠️ 的值。
-- 归属：前端主题阶段（08 路线图新增任务）。
+#### D-T06 校准：DeepSeek 设计 token 精确值 ✅ 已完成
+- **产出**：2026-08-11 浏览器实测 chat.deepseek.com（深色登录页 `:root`/`.ds-input--border` computed style）+ deepseek.com（亮色首页 CTA 卡片）。回填 [design-system.md](design-system.md) 色彩 token，去掉全部 ⚠️ 标记。
+- **关键校准**：亮色品牌蓝 `#4D6BFE` → `#3B82F6`；深色品牌蓝 `#5b7cff` → `#5686FE`；深色 surface `#1f1f23` → `#1B1B1C`；深色 border `rgba(255,255,255,0.08)` → `0.12`；亮色主文本 `#111827` → `#0F1115`、次文本 `#6B7280` → `#64748B`。
+- **偏离说明**：实测发现 DeepSeek 官网实际用大圆角（按钮 pill/`4096px`、输入框 `28px`、卡片 `16px`），与本文档当初「不用大圆角胶囊」矛盾。本工作台**有意保留克制圆角**（更适合高密度工作台界面），在 design-system.md「线条与圆角」段注明偏离理由。仅改色彩 token，不动组件。
+- 归属：前端主题阶段（已完成）。
 
-#### D-T07 定：日志保留策略默认值
-- 候选：按天（14 天）/按量（10 万条）。是否需要 `/api/logs/stream` 实时推送。
-- 归属：日志系统阶段。来源：logging.md。
+#### D-T07 定：日志保留策略默认值 ✅ 已完成
+- **已定**：按天 + 按量双限制。默认 14 天、10 万条，先到先清。
+- **实现**（2026-08-11）：`dss-core::LogSettings`（retention_days/max_rows，默认 14/100_000）；`dss-db::prune_logs`（先按天 `DELETE ts < before`，再按量删最旧的到 max_rows）；`dss-observability::LogStore::prune`；`dss-api::state::spawn_retention_loop`（启动跑一次 + 每 6h 循环，顺带激活 memory retention sweep）；settings 端点 GET/POST 暴露 `log_retention_days`/`log_max_rows`；前端 SettingsModal General 加「日志保留」卡片。每次 sweep 写一条 `source=system, kind=retention_sweep` 日志。
+- **未做（DEFER）**：`/api/logs/stream` 实时推送（复杂度，后置）；settings 热更新 retention loop 沿用启动快照（修改需重启后端生效，与 `log_level` 行为一致）。
+- 归属：日志系统阶段（已完成）。来源：logging.md。
 
 #### D-T08 调研：Orca（onorca.dev）竞品 ✅ 已完成
 - 产出：[research/orca.md](research/orca.md)（2026-08-05 快照，17 节功能层面全梳理 + 借鉴分析）。
@@ -170,58 +180,74 @@
 
 > 实现核心基线时冒出的「可以更好」想法，先攒这儿，不立即改。
 
-#### D-F01 统一两套 BM25 实现
+#### D-F01 统一两套 BM25 实现（有效 DEFER）
 - 当前 skills（k1=1.2 + RRF）与 memory（k1=1.5 + CJK）各有一套实现。初期保持两套；统一为 DEFER。
+- 状态：**有效债务（未完成）**。
 - 来源：modules.md。
 
-#### D-F02 agent 回调契约的类型化
-- SSE 事件目前是序列化 JSON；Rust 内部可用强类型 enum。但为契约兼容，序列化仍走 JSON。DEFER：内部用 enum，边界序列化。
+#### D-F02 agent 回调契约的类型化 ✅ 已完成
+- **原始遗留**：Rust 内部回调使用松散 JSON，期望改为强类型、仅在边界序列化。
+- **完成证据**：`dss-agent::AgentEvent` 已是带 serde tag 的强类型 enum，覆盖 start/iteration/thinking/text/tool/plan/complete/error；HTTP/SSE 边界继续序列化为既有 JSON 契约。
+- 状态：**已完成，不再是 DEFER**。
 
-#### D-F03 config 双表示统一
+#### D-F03 config 双表示统一（有效 DEFER）
 - 当前有 Settings（toml/env）与 AppSettings（settings.json，前端设置面板的持久化格式）两套 + 转换胶水。Rust 可统一，但前端依赖 AppSettings 形态。DEFER：边界保持 AppSettings 形态，内部统一。
+- 状态：**有效债务（未完成）**。
 
-#### D-F04 P2b 范围（P2 拆分的延后项）
-- P2（工具与多轮）已拆为 P2a（已完成）与 P2b。P2b 待做：web_search/fetch_url、python 子进程（最小方案，沙箱留 P9）、max_tokens 续传门、empty-retry 门、检索熔断、plan 工具、delegate/submit_output、compile_pdf、记忆工具、artifacts ledger。
-- 门控阈值与顺序严格遵循 modules.md（不随意改动）。
+#### D-F04 artifacts provenance / ledger（原 P2b 延后范围，已收窄）
+- **历史范围**：P2 拆分时曾包含 web/fetch、python、max_tokens/empty-retry/检索门、plan、delegate、compile、记忆和 artifacts ledger。
+- **已完成**：除 artifacts provenance/ledger 外，上述工具与门控均已有实现；python 的生产级沙箱另由 D-F07 跟踪。
+- **剩余范围**：定义并实现 artifacts 的来源、依赖与可追溯 ledger；完成前不对外宣称“版本化 artifacts”。
+- 状态：**部分完成，债务仅保留 artifacts provenance/ledger**。门控阈值与顺序继续遵循 modules.md。
 - 来源：roadmap.md P2 / plans/P2a-tools-multiturn.md 回顾。
 
-#### D-F05 ToolDef 双定义
+#### D-F05 ToolDef 双定义（有效 DEFER）
 - `dss-tools::ToolDef` 与 `dss-llm::ToolDef` 各有一份同构定义（两 crate 不互依）。Runner 里 `to_llm_tool_defs` 做值转换。
 - DEFER：若后续 dss-tools 需要直接产出 LLM 请求，可让 dss-llm 依赖 dss-tools 或提取共享 crate。当前转换开销可忽略。
+- 状态：**有效债务（未完成）**。
 
-#### D-F06 前端 ask_user 回复闭环
-- P2a 前端只做了 ask_user 的展示（`AskUserPanel`）与会话 awaiting 态；「用户回复后继续 run」的完整闭环（需 /approve 或 stream-sse 带 reply 参数）待 P3（session 恢复 + 多轮 awaiting 恢复）一起做。
+#### D-F06 前端 ask_user 回复闭环 ✅ 已完成
+- **原始遗留**：P2a 只有 `AskUserPanel` 展示与 awaiting 态，缺少回答后继续 run。
+- **完成证据**：前端按持久化 run 的 `awaiting=user_response` 识别等待原因，composer 将回答作为下一次 run 继续；若同时存在已批准未完成 plan，则保留并继续执行该 plan。`pending_ask` 与 plan 均可随 run checkpoint 恢复。
+- 状态：**已完成，不再是 DEFER**。
 - 来源：plans/P2a-tools-multiturn.md 回顾。
 
-#### D-F07 python 沙箱化（P9 / 方向 2.1）
-- P2b-tools 的 `python` 工具用最小子进程方案（`python3 -c`，每调用一个新进程，无 state 持久、无 venv）。
-- DEFER 到 P9/方向 2.1：JSON-RPC 长进程沙箱 + host 注入、变量跨调用持久、venv/uv pip 管理、`install_packages` 工具。沙箱方案选型见 tech-stack.md（倾向方案 A）。
+#### D-F07 python 沙箱化（部分完成；P9 / 方向 2.1）
+- **已完成基线**：`python` 使用每次调用新建的子进程执行，具备最小进程隔离；无跨调用 state、无 venv。
+- **剩余范围**：JSON-RPC 长进程沙箱、host 注入、变量持久、venv/uv 包管理。当前没有 `install_packages` 工具。
+- 状态：**部分完成，仍为有效 DEFER**。沙箱方案见 D-Q04/D-T01。
 - 来源：plans/P2b-tools.md 回顾。
 
-#### D-F08 web_search 搜索源
-- P2b-tools 的 `web_search` 依赖 DuckDuckGo HTML 端点抓取。**本机出口 IP 被 DDG 反爬拦截**（返回 anomaly 页），实际不可用。
-- DEFER：换可配 API 的搜索源（Brave Search API / SerpAPI / 自建 SearXNG），或经代理换出口。`parse_ddg` 的朴素解析逻辑届时按新源的 HTML/API 形态重写。
+#### D-F08 web_search 搜索源（部分完成）
+- **原始问题**：DuckDuckGo HTML 会对本机出口返回 challenge/anomaly，单一搜索源不可用。
+- **已完成基线**：DDG challenge、异常响应或请求失败时会回退到 Bing RSS，并对 feed 完整性和响应大小做校验。
+- **剩余范围**：可配置的正式 API/自建搜索源与持续 live 可靠性验证；Bing RSS 只是降级路径。
+- 状态：**部分完成，仍为有效 DEFER**。
 - 来源：plans/P2b-tools.md 回顾。
 
-#### D-F09 frames 不落库（P3）
+#### D-F09 frames 不落库（有效 DEFER）
 - P3 选 data-model 选项 A（frames 纯内存，session 恢复靠 `session_messages` + 重置 root frame 为 Completed）。理由：P3 无 verification/compaction，frames 表的 FK 依赖方都不存在；恢复靠消息历史即可重建可继续 run 的 Session。
-- DEFER 到 P6（verification）/ P4（compaction）：那时 `verification_checks`/`compaction_archives` 引用 `frames.id`，需落 frames 表（选项 B），让 FK 有效 + 崩溃恢复 frame status。
+- 当前虽已有 run/frame 元数据与历史 checkpoint，但仍没有完整 frames 树、verification/compaction archives 的持久化；需落实选项 B 才能崩溃恢复 frame status。
+- 状态：**有效债务（未完成）**。
 - 来源：plans/P3-persistence.md 回顾、data-model.md「frames 是否落库」。
 
-#### D-F10 run 中途取消丢未持久化消息
-- P3 持久化在 run **结束**批量写 `session.messages[persisted_count..]`。客户端中途断开（cancel 语义）→ run 未到结束 → 本轮已 push 的部分消息不入库（下次恢复看不到这一轮）。
-- 与 P1 cancel 语义一致（断开即中止）。DEFER：如需中途增量持久化，改成每轮末写库（与门控/P2b-gates 一起做时评估）。
+#### D-F10 run 中途取消丢未持久化消息 ✅ 已完成
+- **原始遗留**：P3 只在 run 结束批量写入，客户端中断可能丢失本轮已完成的消息。
+- **完成证据**：Runner 在工具批次等安全边界发送 history checkpoint；API 通过 `append_history_checkpoint` 原子写消息、run/plan/pending_ask 状态，取消和终态再提交一致快照。已完成的工具证据可在取消/重载后恢复。
+- 状态：**已完成，不再是 DEFER**。
 - 来源：plans/P3-persistence.md 回顾。
 
-#### D-F11 LRU 排序简化
+#### D-F11 LRU 排序简化（有效 DEFER）
 - SessionManager 的 LRU 驱逐（MAX_ACTIVE_SESSIONS=10）用 `HashMap.keys().next()` 取一个非当前 session 驱逐，非真正「最久未用」。
 - DEFER：改 `LinkedHashMap` 或维护 last_used 时间戳做真 LRU。本地桌面 10 上限很少触发，当前简化可接受。
+- 状态：**有效债务（未完成）**。
 - 来源：plans/P3-persistence.md 回顾。
 
-#### D-F12 Rolling Compact 索引版 projection（P4a）
+#### D-F12 Rolling Compact 索引版 projection（有效 DEFER）
 - modules.md 的 RC 用 `applied_summary_uuids` + 带 uuid/compact_boundary 的 Message。当前 `ChatMessage`（dss-llm）是 OpenAI 协议精简态、无 uuid。
 - P4a 用**索引范围 fold**（`CompactionState.folds: Vec<Fold{start_idx,end_idx,summary}>`）实现 projection：把 fold 区间替换成 assistant summary。语义等价（append-only + projection，日志不 mutate）。
-- DEFER 到 P4b：完整 uuid/compact_boundary Message 模型迁移 + L2 fold 实现（跨多个已 fold 区间的 head 段压缩）+ boundary 工具对齐 + compaction state 持久化。
+- schema 已有 `sessions.compaction_state` 列，但当前没有读写路径。仍需完整 uuid/compact_boundary Message 模型、L2 fold、boundary 工具对齐及 compaction state 持久化/恢复。
+- 状态：**有效债务（未完成）**。
 - 来源：plans/P4a-compact.md 回顾、modules.md §8。
 
 ---
@@ -242,4 +268,4 @@
 
 ---
 
-至此，规划文档集完成。下一步是等你确认上面 **QUESTION（D-Q01、D-Q04）** 与 [06](enhancements.md#优先级建议) 的优先级，然后即可进入 P0 实施（写第一份 `plans/P0-*.md`）。
+当前实施已越过 P0；后续工作以各条目的最新状态和 `HANDOFF.md` 的优先级为准，不按历史章节位置推断完成度。

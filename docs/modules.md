@@ -175,14 +175,14 @@ impl ToolRouter {
 | `ask_user` | question, options, header | 触发 AWAITING_USER_RESPONSE | 设 `pending_ask` |
 | `delegate` ★ | task, context_summary, output_schema, … | 子 agent | 深度上限 2，子工具集裁剪 |
 | `submit_output` | output, completion_bullets | 子 agent 结构化返回 | 设 frame context 标志 |
-| `call_agent` ★ | name, task, context_id, task_id | A2A | 经 agent-registry MCP |
+| `call_agent` ★ | resource_uri, task, skill_id?, timeout_seconds? | A2A | 仅经已配置的 `agent-registry` Resource；只允许一次 fresh Send，不接受 endpoint/credential/任意 task handle |
 | `save_artifacts`/`get_artifact`/`list_artifacts` | files/version_id/— | 版本化产物 | 见 dss-artifacts |
 | `search_skills`/`list_skills`/`skill` | query/source/name | skill 发现/加载 | 见 dss-skills |
 | `install_packages` ★ | packages | venv + uv pip | workspace/.venv |
 | `boundary` | label | 注入 task_boundary harness-notice | chunk 边界对齐 |
 | `summary_query` | summary, question | 查折叠摘要原始消息 | 单次 LLM Q&A |
-| `mcp_read_resource` | server, uri | MCP 资源读取 | — |
-| `registry_connect_mcp_server` | name | 连接 registry MCP | — |
+| `mcp_list_resources` | server | MCP 资源发现 | 仅在 captured runtime 有已连接且声明 Resources 的 server 时提供；server 枚举只含这些 manager key，不接受 URL |
+| `mcp_read_resource` | server, uri | MCP 资源读取 | 与 list 共用 captured server 枚举，精确读取 list 返回的 URI |
 | `mcp__{server}__{tool}` 或 `mcp_search`/`mcp_call` | — | 动态挂载 | 阈值 30 切换 |
 
 ### ToolContext（运行时共享态）
@@ -291,13 +291,13 @@ frame.status = Completed; return MaxIters
 
 ## 6. dss-mcp（MCP 客户端 + 动态挂载）
 
-**职责**：streamable HTTP JSON-RPC 客户端、服务器管理、工具动态注册。
+**职责**：streamable HTTP JSON-RPC 客户端、服务器管理、Resources 发现/读取、工具动态注册。
 
 - **协议**：**仅 streamable HTTP + SSE**（无 stdio）。`initialize`（protocolVersion `2024-11-05`）→ 捕获 `Mcp-Session-Id` → `notifications/initialized` → `tools/list`。
 - **`MCPClient`**：`connect`/`call_tool`/`list_resources`/`read_resource`。响应解析兼容 `text/event-stream`（聚合 `data:` 取最后 result/error）与纯 JSON。
-- **`MCPServerManager`**：`add_server`（idempotent，失败不抛返回 false）/ `list_all_tools` / `call_tool` / `close_all`。
-- **动态挂载**：`total_mcp ≤ 30` → 全量注册 `mcp__{server}__{tool}`；否则注册 `mcp_search`/`mcp_call` meta 工具。同时 `generate_mcp_skills` 为每 server 生成 `mcp-{slug}` skill。
-- **agent-registry 注入**：把 registry 当作名为 `agent-registry` 的 MCP server 自动注入（用户配置同名时不覆盖）。
+- **`MCPServerManager`**：`add_server`（idempotent，失败不抛返回 false）/ `try_add_server`（保留详细错误）/ `list_all_tools` / `call_tool` / `list_resources` / `read_resource` / `close_all`。
+- **动态挂载**：普通显式 MCP server 最多挂载 30 个经过名称/schema/总量校验的工具；名称按 authority tuple 稳定化，碰撞不会覆盖既有工具。未知或可能有副作用的远端工具按独占、单次尝试处理。
+- **agent-registry 注入**：未配置 `mcp_servers` 时默认注入名为 `agent-registry`、地址为 `https://a2a-dev.intern-ai.org.cn/mcp` 的 server；显式列表整体覆盖，`[]` 可关闭。该 canonical server 强制为 Resources-only，连接时不请求/挂载其 MCP Tools。运行时只有它已连接且声明 Resources 时才注册 run-local `call_agent`。工具会重新 list/read 精确 `resource_uri`，严格解析匿名 A2A descriptor，再经 `A2aClient` 与 Agent Card 交互；只允许一次 fresh Send，不接受任意 task handle，也不会调用或转发 credential endpoint。
 
 **实现注意**：Rust 的 SSE 解析用 `reqwest::streaming` + `eventsource-stream` 或手写行解析。
 

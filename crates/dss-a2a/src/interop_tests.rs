@@ -12,8 +12,10 @@ use dss_core::A2aAgentConfig;
 use serde_json::{json, Value};
 
 use crate::{
-    A2aClient, A2aClientOptions, CardRefreshKind, CardSnapshot, InvokeAction, InvokeRequest,
-    ProtocolBinding, ProtocolVersion, TerminalKind, A2A_RESULT_SCHEMA,
+    A2aClient, A2aClientOptions, A2aRouteOptions, CardRefreshKind, CardSnapshot, InvokeAction,
+    InvokeRequest, ProtocolBinding, ProtocolVersion, RegistryInvocationPolicy, TerminalKind,
+    A2A_RESULT_SCHEMA, REGISTRY_API_KEY_WARNING, REGISTRY_DIRECT_TASK_WARNING,
+    REGISTRY_ENDPOINT_OVERRIDE_WARNING,
 };
 
 const TOKEN: &str = "fixture-bearer-secret";
@@ -28,6 +30,7 @@ struct Variant {
 enum FixtureMode {
     Normal,
     NotModified,
+    ReflectBearerValidators,
     BrokenSend,
     ResumeWorkingOnce,
     Interrupted,
@@ -83,19 +86,45 @@ async fn card(State(state): State<FixtureState>, headers: HeaderMap) -> Response
             .unwrap()
             .push("Agent Card: Bearer header missing".into());
     }
-    if get_number > 1 && !headers.contains_key("if-none-match") {
-        state
-            .failures
-            .lock()
-            .unwrap()
-            .push("second Agent Card GET was not conditional".into());
+    if get_number > 1 {
+        if state.mode == FixtureMode::ReflectBearerValidators {
+            if headers.contains_key("if-none-match") || headers.contains_key("if-modified-since") {
+                state
+                    .failures
+                    .lock()
+                    .unwrap()
+                    .push("Bearer-reflecting validators were sent conditionally".into());
+            }
+        } else if !headers.contains_key("if-none-match") {
+            state
+                .failures
+                .lock()
+                .unwrap()
+                .push("second Agent Card GET was not conditional".into());
+        }
     }
     let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        "etag",
-        HeaderValue::from_str(&format!("\"card-{get_number}\"")).unwrap(),
-    );
-    if get_number > 1 && state.mode == FixtureMode::NotModified {
+    if state.mode == FixtureMode::ReflectBearerValidators {
+        response_headers.insert(
+            "etag",
+            HeaderValue::from_str(&format!("\"server-reflected-{TOKEN}\"")).unwrap(),
+        );
+        response_headers.insert(
+            "last-modified",
+            HeaderValue::from_str(&format!("Wed, 21 Oct 2015 07:28:00 GMT; {TOKEN}")).unwrap(),
+        );
+    } else {
+        response_headers.insert(
+            "etag",
+            HeaderValue::from_str(&format!("\"card-{get_number}\"")).unwrap(),
+        );
+    }
+    if get_number > 1
+        && matches!(
+            state.mode,
+            FixtureMode::NotModified | FixtureMode::ReflectBearerValidators
+        )
+    {
         return (StatusCode::NOT_MODIFIED, response_headers).into_response();
     }
     let interface = match state.variant.binding {
@@ -629,6 +658,45 @@ async fn conditional_304_reuses_only_the_validated_cached_card() {
 }
 
 #[tokio::test]
+async fn bearer_reflecting_card_validators_are_neither_cached_nor_replayed() {
+    let (state, server) = spawn_fixture(
+        Variant {
+            version: ProtocolVersion::V1,
+            binding: ProtocolBinding::JsonRpc,
+        },
+        FixtureMode::ReflectBearerValidators,
+    )
+    .await;
+    let client = A2aClient::new().unwrap();
+    let config = config(&state);
+
+    let first = client.refresh_card(&config, None).await.unwrap();
+    assert_eq!(first.etag, None);
+    assert_eq!(first.last_modified, None);
+
+    // Persisted snapshots from an older client may already contain a reflected credential.
+    // They must be scrubbed before both request construction and 304 cache reuse.
+    let mut legacy_cache = first;
+    legacy_cache.etag = Some(format!("\"server-reflected-{TOKEN}\""));
+    legacy_cache.last_modified = Some(format!("Wed, 21 Oct 2015 07:28:00 GMT; {TOKEN}"));
+    let refreshed = client
+        .refresh_card(&config, Some(&legacy_cache))
+        .await
+        .unwrap();
+
+    assert_eq!(refreshed.refresh_kind, CardRefreshKind::NotModified);
+    assert_eq!(refreshed.etag, None);
+    assert_eq!(refreshed.last_modified, None);
+    assert_eq!(state.card_gets.load(Ordering::SeqCst), 2);
+    assert!(
+        state.failures.lock().unwrap().is_empty(),
+        "fixture failures: {:?}",
+        state.failures.lock().unwrap()
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn ambiguous_send_body_failure_is_never_replayed() {
     let (state, server) = spawn_fixture(
         Variant {
@@ -960,4 +1028,217 @@ async fn both_rest_versions_cancel_with_an_empty_body_and_their_own_enum_spellin
         );
         server.abort();
     }
+}
+
+#[derive(Clone)]
+struct RegistryCompatState {
+    sends: Arc<AtomicUsize>,
+    failures: Arc<Mutex<Vec<String>>>,
+}
+
+async fn registry_compat_card() -> Json<Value> {
+    Json(json!({
+        "name": "Registry fixture",
+        "description": "Exercises the narrow Registry compatibility path",
+        "version": "1",
+        "supportedInterfaces": [{
+            "url": "http://0.0.0.0:8888/a2a",
+            "protocolBinding": "JSONRPC",
+            "protocolVersion": "1.0"
+        }],
+        "capabilities": {"streaming": false},
+        "securitySchemes": {
+            "apiKey": {"apiKeySecurityScheme":{"in":"header", "name":"X-API-Key"}}
+        },
+        "securityRequirements": [{"schemes":{"apiKey":{}}}],
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": [{
+            "id":"marker", "name":"Marker", "description":"Return a marker", "tags":["test"]
+        }]
+    }))
+}
+
+async fn registry_compat_rpc(
+    State(state): State<RegistryCompatState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.sends.fetch_add(1, Ordering::SeqCst);
+    if headers.contains_key("authorization") || headers.contains_key("x-api-key") {
+        state
+            .failures
+            .lock()
+            .unwrap()
+            .push("Registry-anonymous invocation sent credentials".into());
+    }
+    if body.get("method").and_then(Value::as_str) != Some("SendMessage") {
+        state
+            .failures
+            .lock()
+            .unwrap()
+            .push("Registry invocation did not use canonical SendMessage".into());
+    }
+    Json(json!({
+        "jsonrpc":"2.0",
+        "id":body.get("id").cloned().unwrap_or(Value::Null),
+        "result": {
+            "id":"registry-task", "contextId":"registry-context",
+            "status":{"state":"TASK_STATE_INPUT_REQUIRED"},
+            "artifacts":[{"artifactId":"marker", "parts":[{"text":"DSS_A2A_E2E_OK"}]}]
+        }
+    }))
+}
+
+#[tokio::test]
+async fn registry_entry_point_is_explicit_anonymous_and_preserves_warnings() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = RegistryCompatState {
+        sends: Arc::new(AtomicUsize::new(0)),
+        failures: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/.well-known/agent-card.json", get(registry_compat_card))
+        .route("/a2a", post(registry_compat_rpc))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{address}/a2a");
+    let config = A2aAgentConfig {
+        id: "registry-fixture".into(),
+        name: "Registry fixture".into(),
+        endpoint: endpoint.clone(),
+        enabled: true,
+        bearer_token: None,
+        timeout_seconds: 5,
+    };
+    let client = A2aClient::new().unwrap();
+
+    let strict = client
+        .invoke(&config, None, InvokeRequest::new("return marker"))
+        .await;
+    assert_eq!(strict.terminal.kind, TerminalKind::CardRefreshError);
+    assert!(strict.warnings.is_empty());
+    assert_eq!(state.sends.load(Ordering::SeqCst), 0);
+
+    let policy = RegistryInvocationPolicy::anonymous_loopback_for_testing(&endpoint).unwrap();
+    let registry = client
+        .invoke_registry_anonymous(&config, None, &policy, InvokeRequest::new("return marker"))
+        .await;
+    assert_eq!(registry.terminal.kind, TerminalKind::TaskInterrupted);
+    assert!(!registry.is_error(), "result was {registry:#?}");
+    assert_eq!(registry.terminal.task_id.as_deref(), Some("registry-task"));
+    assert_eq!(
+        registry.card.as_ref().unwrap().selected_interface.url,
+        endpoint
+    );
+    assert_eq!(
+        registry.warnings,
+        vec![
+            REGISTRY_ENDPOINT_OVERRIDE_WARNING,
+            REGISTRY_API_KEY_WARNING,
+            REGISTRY_DIRECT_TASK_WARNING,
+        ]
+    );
+    assert_eq!(state.sends.load(Ordering::SeqCst), 1);
+    assert!(state.failures.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[derive(Clone)]
+struct RoutedHostState {
+    interface_url: String,
+    expected_host: String,
+    failures: Arc<Mutex<Vec<String>>>,
+}
+
+impl RoutedHostState {
+    fn check_host(&self, headers: &HeaderMap) {
+        if headers.get("host").and_then(|value| value.to_str().ok())
+            != Some(self.expected_host.as_str())
+        {
+            self.failures
+                .lock()
+                .unwrap()
+                .push("route override rewrote the HTTP Host header".into());
+        }
+    }
+}
+
+async fn routed_card(State(state): State<RoutedHostState>, headers: HeaderMap) -> Json<Value> {
+    state.check_host(&headers);
+    Json(json!({
+        "name":"Routed fixture", "description":"Checks hostname preservation", "version":"1",
+        "supportedInterfaces":[{
+            "url":state.interface_url, "protocolBinding":"JSONRPC", "protocolVersion":"1.0"
+        }],
+        "capabilities":{"streaming":false},
+        "securityRequirements":[],
+        "defaultInputModes":["text/plain"], "defaultOutputModes":["text/plain"],
+        "skills":[{"id":"route", "name":"Route", "description":"Check route", "tags":["test"]}]
+    }))
+}
+
+async fn routed_rpc(
+    State(state): State<RoutedHostState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.check_host(&headers);
+    Json(json!({
+        "jsonrpc":"2.0", "id":body.get("id").cloned().unwrap_or(Value::Null),
+        "result":{"task":{
+            "id":"route-task", "status":{"state":"TASK_STATE_INPUT_REQUIRED"}
+        }}
+    }))
+}
+
+#[tokio::test]
+async fn route_resolution_keeps_the_url_hostname_for_host_and_tls_identity() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let expected_host = format!("route.test:{}", address.port());
+    let interface_url = format!("http://{expected_host}/a2a");
+    let state = RoutedHostState {
+        interface_url: interface_url.clone(),
+        expected_host,
+        failures: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/.well-known/agent-card.json", get(routed_card))
+        .route("/a2a", post(routed_rpc))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut route = A2aRouteOptions::default();
+    route.resolve.insert("route.test".into(), address);
+    let client = A2aClient::with_options_and_route_options(
+        A2aClientOptions {
+            connect_timeout: Duration::from_secs(1),
+            card_timeout: Duration::from_secs(1),
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 1,
+        },
+        route,
+    )
+    .unwrap();
+    let config = A2aAgentConfig {
+        id: "route-fixture".into(),
+        name: "Route fixture".into(),
+        endpoint: interface_url,
+        enabled: true,
+        bearer_token: None,
+        timeout_seconds: 5,
+    };
+    let result = client
+        .invoke(&config, None, InvokeRequest::new("check route"))
+        .await;
+    assert_eq!(result.terminal.kind, TerminalKind::TaskInterrupted);
+    assert!(result.warnings.is_empty());
+    assert!(
+        state.failures.lock().unwrap().is_empty(),
+        "fixture failures: {:?}",
+        state.failures.lock().unwrap()
+    );
+    server.abort();
 }
