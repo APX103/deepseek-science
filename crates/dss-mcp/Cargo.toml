@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Deepseek Science MCP streamable-HTTP client + server manager + dynamic mounting"
 
 [dependencies]
+base64 = "0.22"
 dss-core = { path = "../dss-core" }
 serde.workspace = true
 serde_json.workspace = true

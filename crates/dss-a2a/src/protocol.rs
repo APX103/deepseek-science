@@ -235,6 +235,54 @@ pub(crate) fn parse_send_response(
     }
 }
 
+/// Parse a SendMessage response under the explicit Registry compatibility policy.
+///
+/// The canonical v1 union is always attempted first. Only a v1 result with neither union member
+/// may fall back to a direct Task, and `parse_task` still requires a non-empty id plus a supported
+/// `status.state` value. All transport correlation checks remain identical to the strict path.
+pub(crate) fn parse_registry_send_response(
+    interface: &SelectedInterface,
+    payload: &Value,
+    expected_request_id: Option<&str>,
+) -> Result<(ResponseMeaning, bool), A2aError> {
+    match parse_send_response(interface, payload, expected_request_id) {
+        Ok(meaning) => Ok((meaning, false)),
+        Err(strict_error) if interface.protocol_version != ProtocolVersion::V1 => Err(strict_error),
+        Err(strict_error) => {
+            if validate_transport(
+                interface.binding,
+                payload,
+                expected_request_id,
+                "SendMessage",
+            )?
+            .is_some()
+            {
+                return Err(strict_error);
+            }
+            let value = success_value(interface.binding, payload);
+            let Some(object) = value.as_object() else {
+                return Err(strict_error);
+            };
+            if object.contains_key("message") || object.contains_key("task") {
+                return Err(strict_error);
+            }
+            let valid_id = object.get("id").and_then(Value::as_str).is_some_and(|id| {
+                !id.trim().is_empty() && id.len() <= 512 && !id.chars().any(char::is_control)
+            });
+            let valid_status = object
+                .get("status")
+                .and_then(Value::as_object)
+                .and_then(|status| status.get("state"))
+                .and_then(Value::as_str)
+                .is_some_and(|state| !state.trim().is_empty());
+            if !valid_id || !valid_status {
+                return Err(strict_error);
+            }
+            parse_task(value, ProtocolVersion::V1, interface.binding).map(|meaning| (meaning, true))
+        }
+    }
+}
+
 pub(crate) fn parse_get_task_response(
     interface: &SelectedInterface,
     payload: &Value,
@@ -776,6 +824,57 @@ mod tests {
             parse_send_response(&v1_interface, &response, Some("r1")).unwrap(),
             ResponseMeaning::Message { .. }
         ));
+        let (canonical, used_fallback) =
+            parse_registry_send_response(&v1_interface, &response, Some("r1")).unwrap();
+        assert!(matches!(canonical, ResponseMeaning::Message { .. }));
+        assert!(!used_fallback);
+
+        let direct_v1_task = json!({
+            "jsonrpc":"2.0", "id":"r-direct",
+            "result": {
+                "id":"task-direct", "contextId":"context-direct",
+                "status":{"state":"TASK_STATE_INPUT_REQUIRED"}
+            }
+        });
+        assert!(parse_send_response(&v1_interface, &direct_v1_task, Some("r-direct")).is_err());
+        let (direct, used_fallback) =
+            parse_registry_send_response(&v1_interface, &direct_v1_task, Some("r-direct")).unwrap();
+        assert!(matches!(
+            direct,
+            ResponseMeaning::Task {
+                task_id,
+                disposition: TaskDisposition::Interrupted,
+                ..
+            } if task_id == "task-direct"
+        ));
+        assert!(used_fallback);
+
+        for malformed in [
+            json!({"jsonrpc":"2.0", "id":"bad", "result":{"status":{"state":"TASK_STATE_COMPLETED"}}}),
+            json!({"jsonrpc":"2.0", "id":"bad", "result":{"id":"task-only"}}),
+            json!({"jsonrpc":"2.0", "id":"bad", "result":{"id":"task", "status":{}}}),
+            json!({"jsonrpc":"2.0", "id":"bad", "result":{"id":"   ", "status":{"state":"TASK_STATE_COMPLETED"}}}),
+            json!({"jsonrpc":"2.0", "id":"bad", "result":{"id":"task", "status":{"state":"UNKNOWN"}}}),
+        ] {
+            assert!(
+                parse_registry_send_response(&v1_interface, &malformed, Some("bad")).is_err(),
+                "malformed direct Task should fail closed: {malformed}"
+            );
+        }
+
+        let invalid_union_with_direct_fields = json!({
+            "jsonrpc":"2.0", "id":"bad-union",
+            "result": {
+                "id":"task", "status":{"state":"TASK_STATE_COMPLETED"},
+                "message":{}, "task":{}
+            }
+        });
+        assert!(parse_registry_send_response(
+            &v1_interface,
+            &invalid_union_with_direct_fields,
+            Some("bad-union")
+        )
+        .is_err());
 
         let direct_v03 = json!({
             "kind":"message", "messageId":"m", "role":"agent",

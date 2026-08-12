@@ -392,6 +392,9 @@ function FrameAccordion({
 export default function A2aToolResult({ result }: Props) {
   const agentName = textField(result.agent, 'display_name', 'name', 'id', 'config_id') || '远程 Agent'
   const endpoint = textField(result.agent, 'configured_endpoint', 'endpoint')
+  const registryServer = textField(result.registry, 'server')
+  const registryResourceUri = textField(result.registry, 'resource_uri')
+  const registryResourceName = textField(result.registry, 'resource_name')
   const cardSummary = recordField(result.card, 'summary') ?? result.card ?? {}
   const cardName = textField(cardSummary, 'name')
   const cardDescription = textField(cardSummary, 'description')
@@ -438,6 +441,8 @@ export default function A2aToolResult({ result }: Props) {
           </div>
         </div>
         <div className="mt-2 flex flex-wrap gap-1.5">
+          {registryServer && <MetaLine>Registry: {registryServer}</MetaLine>}
+          {registryResourceName && <MetaLine>Resource: {registryResourceName}</MetaLine>}
           {cardName && <MetaLine>Card: {cardName}</MetaLine>}
           {cardVersion && <MetaLine>Agent {cardVersion}</MetaLine>}
           {protocolVersion && <MetaLine>A2A {protocolVersion}</MetaLine>}
@@ -447,6 +452,14 @@ export default function A2aToolResult({ result }: Props) {
           {taskId && <MetaLine>task {taskId}</MetaLine>}
           {contextId && <MetaLine>context {contextId}</MetaLine>}
         </div>
+        {registryResourceUri && (
+          <div
+            className="mt-2 break-all rounded border border-border bg-bg/70 px-2 py-1.5 font-mono text-[10px] text-ink2"
+            data-a2a-registry-resource={registryResourceUri}
+          >
+            {registryResourceUri}
+          </div>
+        )}
         {selectedInterface && (
           <div className="mt-2 rounded border border-border bg-bg/70 px-2 py-1.5 font-mono text-[10px] text-ink2" data-a2a-interface>
             {textField(selectedInterface, 'protocol_binding', 'protocolBinding', 'binding') || 'A2A'}

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { readFileBlob } from '../api/client'
 import type { Artifact } from '../types'
 import { IconDownload, IconExpand, IconX } from './icons'
+import PreviewTitleBar from './PreviewTitleBar'
 
 interface Props {
   sid: string
@@ -38,44 +39,42 @@ export default function PdfPreviewModal({ sid, artifact, onClose }: Props) {
   }, [artifact.path, sid])
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-bg" onMouseDown={onClose}>
-      <div
-        className="flex h-11 shrink-0 items-center gap-3 border-b border-border px-4"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <span className="min-w-0 truncate font-mono text-[13px] text-ink2">{artifact.path}</span>
-        <span className="shrink-0 text-[12px] text-ink3">{formatSize(artifact.size)}</span>
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          {src ? (
-            <>
-              <a
-                href={src}
-                target="_blank"
-                rel="noreferrer"
-                className="btn-ghost rounded p-1.5"
-                title="在新窗口打开"
-                aria-label="在新窗口打开 PDF"
-              >
-                <IconExpand width={14} height={14} />
-              </a>
-              <a
-                href={src}
-                download={name}
-                className="btn-ghost rounded p-1.5"
-                title="下载 PDF"
-                aria-label="下载 PDF"
-              >
-                <IconDownload width={14} height={14} />
-              </a>
-            </>
-          ) : null}
-          <button className="btn-ghost rounded p-1.5" onClick={onClose} aria-label="关闭">
-            <IconX width={14} height={14} />
-          </button>
-        </div>
-      </div>
+    <div
+      className="fixed inset-0 z-50 flex flex-col bg-bg"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose()
+      }}
+    >
+      <PreviewTitleBar path={artifact.path} size={artifact.size}>
+        {src ? (
+          <>
+            <a
+              href={src}
+              target="_blank"
+              rel="noreferrer"
+              className="btn-ghost rounded p-1.5"
+              title="在新窗口打开"
+              aria-label="在新窗口打开 PDF"
+            >
+              <IconExpand width={14} height={14} />
+            </a>
+            <a
+              href={src}
+              download={name}
+              className="btn-ghost rounded p-1.5"
+              title="下载 PDF"
+              aria-label="下载 PDF"
+            >
+              <IconDownload width={14} height={14} />
+            </a>
+          </>
+        ) : null}
+        <button className="btn-ghost rounded p-1.5" onClick={onClose} aria-label="关闭">
+          <IconX width={14} height={14} />
+        </button>
+      </PreviewTitleBar>
 
-      <div className="min-h-0 flex-1 bg-surface p-3" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="min-h-0 flex-1 bg-surface p-3">
         {src ? (
           <iframe
             key={src}
@@ -91,10 +90,4 @@ export default function PdfPreviewModal({ sid, artifact, onClose }: Props) {
       </div>
     </div>
   )
-}
-
-function formatSize(size: number): string {
-  if (size < 1024) return `${size} B`
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }

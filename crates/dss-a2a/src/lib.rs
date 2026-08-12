@@ -18,17 +18,18 @@ mod interop_tests;
 
 pub use card::{
     parse_agent_card, resolve_agent_card_url, same_origin, CardRefreshKind, CardSkillSummary,
-    CardSnapshot, CardSummary, ParsedAgentCard, SelectedInterface,
+    CardSnapshot, CardSummary, ParsedAgentCard, SelectedInterface, REGISTRY_API_KEY_WARNING,
+    REGISTRY_ENDPOINT_OVERRIDE_WARNING,
 };
 pub use client::{A2aClient, A2aClientOptions};
 pub use error::A2aError;
 pub use result::{
-    A2aAgentRef, A2aRequestRecord, A2aTerminal, A2aToolResult, ResponseFrame, TerminalKind,
-    A2A_RESULT_SCHEMA,
+    A2aAgentRef, A2aRegistryProvenance, A2aRequestRecord, A2aTerminal, A2aToolResult,
+    ResponseFrame, TerminalKind, A2A_RESULT_SCHEMA, REGISTRY_DIRECT_TASK_WARNING,
 };
 pub use runtime::{A2aRuntimeSnapshot, AgentRuntime, AgentRuntimeStatus};
 pub use types::{
-    stable_tool_name, validate_config, validate_configs, InvokeAction, InvokeRequest,
-    ProtocolBinding, ProtocolVersion, MAX_AGENT_COUNT, MAX_CARD_BYTES, MAX_RESPONSE_BYTES,
-    MAX_TOTAL_RESPONSE_BYTES,
+    stable_tool_name, validate_config, validate_configs, A2aRouteOptions, InvokeAction,
+    InvokeRequest, ProtocolBinding, ProtocolVersion, RegistryInvocationPolicy, MAX_AGENT_COUNT,
+    MAX_CARD_BYTES, MAX_RESPONSE_BYTES, MAX_TOTAL_RESPONSE_BYTES,
 };

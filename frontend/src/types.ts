@@ -95,6 +95,14 @@ export interface SkillSettingsValue {
   custom_dirs: string[]
 }
 
+/** Persisted reasoning budget for compatible LLM providers. */
+export type ThinkingEffort = 'low' | 'high' | 'max'
+
+export interface ThinkingSettingsValue {
+  enabled: boolean
+  effort: ThinkingEffort
+}
+
 export interface AppSettings {
   providers: AppSettingsProvider[]
   /** GET /settings always returns this list; optional keeps older saved mocks loadable. */
@@ -117,6 +125,10 @@ export interface AppSettings {
   log_retention_days?: number
   /** 日志最大条数（D-T07）；旧后端可能不返回。 */
   log_max_rows?: number
+  /** 每次 Agent 运行的模型/工具最大迭代次数；旧后端可能不返回。 */
+  max_iterations?: number
+  /** Think 开关与单次模型调用的推理强度；旧后端可能不返回。 */
+  thinking?: ThinkingSettingsValue
 }
 
 /** 可提交字段；运行时 revision/覆盖来源只由后端产生。 */
@@ -135,6 +147,10 @@ export interface AppSettingsUpdate {
   log_retention_days: number
   /** 日志最大条数（D-T07）。 */
   log_max_rows: number
+  /** 每次 Agent 运行的模型/工具最大迭代次数。 */
+  max_iterations: number
+  /** Think 开关与单次模型调用的推理强度。 */
+  thinking: ThinkingSettingsValue
 }
 
 // ---------- MCP ----------

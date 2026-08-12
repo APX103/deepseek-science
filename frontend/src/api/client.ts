@@ -26,10 +26,6 @@ import {
 } from "./sessionMessages";
 import { buildRunPayload, type StreamRunOptions } from "./sessionRun";
 import { withApiToken } from "./auth";
-import {
-  mockLogs,
-  mockTemplates,
-} from "../mock/data";
 
 const DEFAULT_BACKEND_PORT = "17896";
 
@@ -187,23 +183,15 @@ export async function listSkills(): Promise<Skill[]> {
 }
 
 export async function listTemplates(): Promise<TemplateInfo[]> {
-  try {
-    return await request<TemplateInfo[]>("/templates");
-  } catch {
-    return mockTemplates;
-  }
+  return request<TemplateInfo[]>("/templates");
 }
 
 export async function getTemplate(templateId: string): Promise<string> {
-  try {
-    const r = await apiFetch(
-      `${apiBase()}/templates/${encodeURIComponent(templateId)}`,
-    );
-    if (!r.ok) throw new Error(`${r.status}`);
-    return await r.text();
-  } catch {
-    return "\\documentclass{ctexart}\n\\begin{document}\n\\end{document}\n";
-  }
+  const r = await apiFetch(
+    `${apiBase()}/templates/${encodeURIComponent(templateId)}`,
+  );
+  if (!r.ok) throw new Error(`${r.status}`);
+  return r.text();
 }
 
 // ---------- 后端行 → 前端类型映射 ----------
@@ -607,7 +595,6 @@ export async function deleteFile(sid: string, path: string): Promise<void> {
   if (!r.ok) throw new Error(`删除文件失败：HTTP ${r.status}`);
 }
 
-export { mockLogs };
 export type { LogEntry };
 
 // ---------- 流式 SSE ----------

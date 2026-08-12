@@ -7,6 +7,7 @@ import FilePreviewModal, {
   initialDisplayMode,
 } from '../src/components/FilePreviewModal'
 import { filePreviewKind } from '../src/api/filePreview'
+import PreviewTitleBar from '../src/components/PreviewTitleBar'
 
 function buttonMarkup(html: string, label: string): string {
   const button = (html.match(/<button\b[\s\S]*?<\/button>/g) ?? []).find((candidate) =>
@@ -57,6 +58,25 @@ describe('file preview modes', () => {
 
     expect(buttonMarkup(html, '预览')).toContain('aria-pressed="true"')
     expect(buttonMarkup(html, '源码')).toContain('aria-pressed="false"')
+    expect(html).not.toContain('data-preview-title-bar')
+  })
+
+  test('renders the shared full-window title bar with a fixed inset and two bare drag surfaces', () => {
+    const path = 'results/a-very-long-preview-name.pdf'
+    const html = renderToStaticMarkup(
+      <PreviewTitleBar path={path} size={1536}>
+        <button type="button" aria-label="测试关闭">
+          close
+        </button>
+      </PreviewTitleBar>,
+    )
+
+    expect(html).toContain('data-preview-title-bar="true"')
+    expect(html).toContain('style="padding-left:76px"')
+    expect(html.match(/data-tauri-drag-region="true"/g)).toHaveLength(2)
+    expect(html).toContain(path)
+    expect(html).toContain('1.5 KB')
+    expect(buttonMarkup(html, '测试关闭')).not.toContain('data-tauri-drag-region')
   })
 })
 

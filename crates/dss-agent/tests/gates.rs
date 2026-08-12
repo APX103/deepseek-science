@@ -11,11 +11,11 @@ use dss_tools::{
     builtin, Tool, ToolBatchPolicy, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec,
 };
 use futures::future::BoxFuture;
-use futures::stream;
+use futures::{stream, StreamExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// 一次脚本化的流式响应：若干 text 增量 + 可选 finish_reason + 可选 tool_calls。
 #[derive(Clone)]
@@ -156,6 +156,19 @@ struct MixedPartialNativeLlm;
 
 struct ProtocolEventsLlm {
     events: Mutex<Option<Vec<Result<StreamEvent, LlmError>>>>,
+}
+
+struct GatedFinishLlm {
+    release_finish: Arc<Notify>,
+}
+
+struct CombinedGatedFinishLlm {
+    release_finish: Arc<Notify>,
+}
+
+struct CrossChannelPlainGatedLlm {
+    reached_finish_gate: Arc<Notify>,
+    release_finish: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -322,6 +335,95 @@ impl LlmClient for ProtocolEventsLlm {
 
     fn model(&self) -> &str {
         "protocol-events"
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for GatedFinishLlm {
+    async fn chat(&self, _req: ChatRequest) -> Result<dss_llm::LlmResponse, LlmError> {
+        Err(LlmError::NotConfigured("use chat_stream".into()))
+    }
+
+    fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+        let deltas = stream::iter(vec![
+            Ok(StreamEvent::Text("First streamed chunk; ".into())),
+            Ok(StreamEvent::Text("second chunk ✅".into())),
+        ]);
+        let release_finish = self.release_finish.clone();
+        let finish = stream::once(async move {
+            release_finish.notified().await;
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            })
+        });
+        let events = Box::pin(deltas.chain(finish)) as BoxedEventStream;
+        Box::pin(async move { Ok(events) })
+    }
+
+    fn model(&self) -> &str {
+        "gated-finish"
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for CombinedGatedFinishLlm {
+    async fn chat(&self, _req: ChatRequest) -> Result<dss_llm::LlmResponse, LlmError> {
+        Err(LlmError::NotConfigured("use chat_stream".into()))
+    }
+
+    fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+        let delta = stream::once(async {
+            Ok(StreamEvent::AssistantDelta {
+                thinking: "same-delta thought 🧠".into(),
+                text: "same-delta answer ✅".into(),
+            })
+        });
+        let release_finish = self.release_finish.clone();
+        let finish = stream::once(async move {
+            release_finish.notified().await;
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            })
+        });
+        let events = Box::pin(delta.chain(finish)) as BoxedEventStream;
+        Box::pin(async move { Ok(events) })
+    }
+
+    fn model(&self) -> &str {
+        "combined-gated-finish"
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for CrossChannelPlainGatedLlm {
+    async fn chat(&self, _req: ChatRequest) -> Result<dss_llm::LlmResponse, LlmError> {
+        Err(LlmError::NotConfigured("use chat_stream".into()))
+    }
+
+    fn chat_stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<BoxedEventStream, LlmError>> {
+        let deltas = stream::iter(vec![
+            Ok(StreamEvent::Thinking(
+                "analysis <comparison> remains ordinary".into(),
+            )),
+            Ok(StreamEvent::Text("answer after sibling freeze".into())),
+        ]);
+        let reached_finish_gate = self.reached_finish_gate.clone();
+        let release_finish = self.release_finish.clone();
+        let finish = stream::once(async move {
+            // This future is first polled only after Runner has handled both
+            // preceding deltas and asks the provider for its next event.
+            reached_finish_gate.notify_one();
+            release_finish.notified().await;
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            })
+        });
+        let events = Box::pin(deltas.chain(finish)) as BoxedEventStream;
+        Box::pin(async move { Ok(events) })
+    }
+
+    fn model(&self) -> &str {
+        "cross-channel-plain-gated"
     }
 }
 
@@ -669,7 +771,768 @@ async fn natural_completion_with_content() {
 }
 
 #[tokio::test]
-async fn reasoning_channel_dsml_and_partial_prefixes_fail_without_publication() {
+async fn ordinary_text_is_emitted_before_finish_and_reconstructs_exactly_once() {
+    const EXPECTED: &str = "First streamed chunk; second chunk ✅";
+
+    let release_finish = Arc::new(Notify::new());
+    let llm = GatedFinishLlm {
+        release_finish: release_finish.clone(),
+    };
+    let (tx, mut rx) = mpsc::channel::<dss_agent::AgentEvent>(32);
+    let task = tokio::spawn(async move {
+        let mut session = Session::new("gated-stream-test", tmp_workspace());
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext::new(session.workspace.clone());
+        let outcome = Runner::run(
+            &mut session,
+            &llm,
+            llm.model(),
+            "stream before finish",
+            &registry,
+            &ctx,
+            MAX_ITERATIONS,
+            500_000,
+            None,
+            None,
+            &[],
+            false,
+            &tx,
+        )
+        .await;
+        (outcome, session)
+    });
+
+    let mut events = Vec::new();
+    let first_text = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let event = rx.recv().await.expect("event channel closed before text");
+            if let dss_agent::AgentEvent::Text { text } = &event {
+                let text = text.clone();
+                events.push(event);
+                break text;
+            }
+            events.push(event);
+        }
+    })
+    .await
+    .expect("ordinary text was not emitted while Finish was gated");
+
+    assert_eq!(first_text, "First streamed chunk; ");
+    assert!(
+        !task.is_finished(),
+        "runner completed even though the fake provider still withheld Finish"
+    );
+
+    release_finish.notify_one();
+    let (outcome, session) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("runner did not finish after the gate opened")
+        .expect("runner task panicked");
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let streamed_text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_text, EXPECTED);
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Natural);
+    assert_eq!(outcome.final_text, EXPECTED);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            dss_agent::AgentEvent::Complete { final_text, .. } if final_text == EXPECTED
+        )
+    }));
+    assert!(session.messages.iter().any(|message| {
+        message.role == "assistant" && message.content.as_deref() == Some(EXPECTED)
+    }));
+}
+
+#[tokio::test]
+async fn ordinary_combined_delta_emits_both_channels_before_finish_exactly_once() {
+    const THINKING: &str = "same-delta thought 🧠";
+    const TEXT: &str = "same-delta answer ✅";
+
+    let release_finish = Arc::new(Notify::new());
+    let llm = CombinedGatedFinishLlm {
+        release_finish: release_finish.clone(),
+    };
+    let (tx, mut rx) = mpsc::channel::<dss_agent::AgentEvent>(32);
+    let task = tokio::spawn(async move {
+        let mut session = Session::new("combined-gated-stream-test", tmp_workspace());
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext::new(session.workspace.clone());
+        let outcome = Runner::run(
+            &mut session,
+            &llm,
+            llm.model(),
+            "stream one atomic provider delta",
+            &registry,
+            &ctx,
+            MAX_ITERATIONS,
+            500_000,
+            None,
+            None,
+            &[],
+            false,
+            &tx,
+        )
+        .await;
+        (outcome, session)
+    });
+
+    let mut events = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut saw_thinking = false;
+        let mut saw_text = false;
+        while !saw_thinking || !saw_text {
+            let event = rx
+                .recv()
+                .await
+                .expect("event channel closed before both combined fields");
+            saw_thinking |=
+                matches!(&event, dss_agent::AgentEvent::Thinking { text } if text == THINKING);
+            saw_text |= matches!(&event, dss_agent::AgentEvent::Text { text } if text == TEXT);
+            events.push(event);
+        }
+    })
+    .await
+    .expect("combined fields were not emitted while Finish was gated");
+
+    let thinking_index = events
+        .iter()
+        .position(|event| matches!(event, dss_agent::AgentEvent::Thinking { .. }))
+        .expect("thinking event");
+    let text_index = events
+        .iter()
+        .position(|event| matches!(event, dss_agent::AgentEvent::Text { .. }))
+        .expect("text event");
+    assert!(thinking_index < text_index);
+    assert!(!task.is_finished());
+
+    release_finish.notify_one();
+    let (outcome, session) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("runner did not finish after releasing Finish")
+        .expect("runner task panicked");
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        THINKING
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        TEXT
+    );
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Natural);
+    assert_eq!(outcome.final_text, TEXT);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            dss_agent::AgentEvent::Complete { final_text, .. } if final_text == TEXT
+        )
+    }));
+    let assistant = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("canonical assistant message");
+    assert_eq!(assistant.reasoning_content.as_deref(), Some(THINKING));
+    assert_eq!(assistant.content.as_deref(), Some(TEXT));
+}
+
+fn assert_cross_channel_private(
+    events: &[dss_agent::AgentEvent],
+    session: &Session,
+    forbidden: &[&str],
+) {
+    assert!(events.iter().all(|event| match event {
+        dss_agent::AgentEvent::Thinking { text } | dss_agent::AgentEvent::Text { text } => {
+            forbidden.iter().all(|needle| !text.contains(needle))
+        }
+        _ => true,
+    }));
+    assert!(session.messages.iter().all(|message| {
+        [
+            message.content.as_deref(),
+            message.reasoning_content.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|text| forbidden.iter().all(|needle| !text.contains(needle)))
+    }));
+    let serialized_history =
+        serde_json::to_string(&session.messages).expect("session history is serializable");
+    assert!(forbidden
+        .iter()
+        .all(|needle| !serialized_history.contains(needle)));
+}
+
+#[tokio::test]
+async fn combined_text_tool_opener_excludes_same_delta_reasoning_secret() {
+    const PRE_EVENT_THINKING: &str = "prior < ordinary tail 🧪";
+    const SECRET: &str = "SAME_DELTA_SECRET";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CountingTool {
+        name: "count_probe",
+        calls: calls.clone(),
+    }));
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Thinking(PRE_EVENT_THINKING.into())),
+            Ok(StreamEvent::AssistantDelta {
+                thinking: SECRET.into(),
+                text: concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "<｜DSML｜parameter name=\"code\" string=true>safe</｜DSML｜parameter>",
+                    "</｜DSML｜invoke></｜DSML｜tool_calls>"
+                )
+                .into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: Some("tool_calls".into()),
+            }),
+        ],
+        registry,
+    )
+    .await;
+
+    // ProtocolEventsLlm has no second turn, so the registered tool succeeds
+    // before the fixture terminates with its expected follow-up error.
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, dss_agent::AgentEvent::ToolCalls { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, dss_agent::AgentEvent::ToolResults { .. })));
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        PRE_EVENT_THINKING
+    );
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, dss_agent::AgentEvent::Text { .. })));
+    assert_cross_channel_private(&events, &session, &[SECRET]);
+    assert!(!serde_json::to_string(&events)
+        .expect("live events are serializable")
+        .contains(SECRET));
+    let tool_assistant = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant" && message.tool_calls.is_some())
+        .expect("successful textual tool call is canonicalized in history");
+    assert_eq!(
+        tool_assistant.reasoning_content.as_deref(),
+        Some(PRE_EVENT_THINKING)
+    );
+}
+
+#[tokio::test]
+async fn combined_reasoning_tool_opener_excludes_same_delta_text_secret() {
+    const SECRET: &str = "SAME_DELTA_TEXT_SECRET";
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::AssistantDelta {
+                thinking: concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "</｜DSML｜invoke></｜DSML｜tool_calls>"
+                )
+                .into(),
+                text: SECRET.into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ],
+        ToolRegistry::new(),
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(outcome.final_text, "");
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event,
+            dss_agent::AgentEvent::Thinking { .. }
+                | dss_agent::AgentEvent::Text { .. }
+                | dss_agent::AgentEvent::DraftReset { .. }
+                | dss_agent::AgentEvent::ToolCalls { .. }
+                | dss_agent::AgentEvent::ToolResults { .. }
+        )
+    }));
+    assert_cross_channel_private(&events, &session, &[SECRET]);
+    assert!(!serde_json::to_string(&events)
+        .expect("live events are serializable")
+        .contains(SECRET));
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| message.role != "assistant"));
+}
+
+#[tokio::test]
+async fn combined_plain_raw_lt_channels_reconstruct_exactly_after_finish() {
+    const THINKING: &str = "analysis α < β 🧠";
+    const TEXT: &str = "answer γ < δ ✅";
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::AssistantDelta {
+                thinking: THINKING.into(),
+                text: TEXT.into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ],
+        ToolRegistry::new(),
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Natural);
+    assert_eq!(outcome.final_text, TEXT);
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        THINKING
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        TEXT
+    );
+    let assistant = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("canonical assistant message");
+    assert_eq!(assistant.reasoning_content.as_deref(), Some(THINKING));
+    assert_eq!(assistant.content.as_deref(), Some(TEXT));
+}
+
+#[tokio::test]
+async fn reasoning_dsml_opener_freezes_text_secret_across_channels() {
+    const SECRET: &str = "CROSS_CHANNEL_SECRET";
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Thinking(
+                concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "<｜DSML｜parameter name=\"code\" string=true>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Text(SECRET.into())),
+            Ok(StreamEvent::Thinking(
+                concat!(
+                    "</｜DSML｜parameter></｜DSML｜invoke>",
+                    "</｜DSML｜tool_calls>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ],
+        ToolRegistry::new(),
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(outcome.final_text, "");
+    assert_cross_channel_private(&events, &session, &[SECRET, "DSML"]);
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, dss_agent::AgentEvent::DraftReset { .. })));
+}
+
+#[tokio::test]
+async fn text_dsml_opener_freezes_reasoning_secret_across_channels() {
+    const SECRET: &str = "CROSS_CHANNEL_SECRET";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CountingTool {
+        name: "count_probe",
+        calls: calls.clone(),
+    }));
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Text(
+                concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "<｜DSML｜parameter name=\"code\" string=true>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Thinking(SECRET.into())),
+            Ok(StreamEvent::Text(
+                concat!(
+                    "</｜DSML｜parameter></｜DSML｜invoke>",
+                    "</｜DSML｜tool_calls>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ],
+        registry,
+    )
+    .await;
+
+    // The textual protocol reaches a real successful execution path. Its
+    // sibling's latch-frozen reasoning suffix must still be discarded.
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(outcome.final_text, "");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, dss_agent::AgentEvent::ToolCalls { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, dss_agent::AgentEvent::ToolResults { .. })));
+    assert_cross_channel_private(&events, &session, &[SECRET, "DSML"]);
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event,
+            dss_agent::AgentEvent::Thinking { .. } | dss_agent::AgentEvent::Text { .. }
+        )
+    }));
+}
+
+#[tokio::test]
+async fn reasoning_with_ordinary_lt_before_text_tool_opener_is_preserved_exactly() {
+    const THINKING: &str = "a < b";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CountingTool {
+        name: "count_probe",
+        calls: calls.clone(),
+    }));
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Thinking(THINKING.into())),
+            Ok(StreamEvent::Text(
+                concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "</｜DSML｜invoke></｜DSML｜tool_calls>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Finish {
+                reason: Some("tool_calls".into()),
+            }),
+        ],
+        registry,
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let streamed_thinking: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_thinking, THINKING);
+    let tool_assistant = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant" && message.tool_calls.is_some())
+        .expect("successful textual tool call is canonicalized in history");
+    assert_eq!(tool_assistant.reasoning_content.as_deref(), Some(THINKING));
+}
+
+#[tokio::test]
+async fn text_tool_opener_preserves_pre_latch_reasoning_and_drops_later_secret() {
+    const THINKING_BEFORE_LATCH: &str = "before < ordinary";
+    const SECRET: &str = "AFTER_LATCH_SECRET";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CountingTool {
+        name: "count_probe",
+        calls: calls.clone(),
+    }));
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Thinking(THINKING_BEFORE_LATCH.into())),
+            Ok(StreamEvent::Text(
+                concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "<｜DSML｜parameter name=\"code\" string=true>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Thinking(SECRET.into())),
+            Ok(StreamEvent::Text(
+                concat!(
+                    "</｜DSML｜parameter></｜DSML｜invoke>",
+                    "</｜DSML｜tool_calls>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Finish {
+                reason: Some("tool_calls".into()),
+            }),
+        ],
+        registry,
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let streamed_thinking: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_thinking, THINKING_BEFORE_LATCH);
+    assert_cross_channel_private(&events, &session, &[SECRET]);
+    let tool_assistant = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant" && message.tool_calls.is_some())
+        .expect("successful textual tool call is canonicalized in history");
+    assert_eq!(
+        tool_assistant.reasoning_content.as_deref(),
+        Some(THINKING_BEFORE_LATCH)
+    );
+}
+
+#[tokio::test]
+async fn split_dsml_marker_across_channels_freezes_both_publications() {
+    const SECRET: &str = "CROSS_CHANNEL_SECRET";
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Thinking("<｜DS".into())),
+            Ok(StreamEvent::Text(format!(
+                "ML｜parameter name=\"code\" string=true>{SECRET}"
+            ))),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ],
+        ToolRegistry::new(),
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    assert_eq!(outcome.final_text, "");
+    assert_cross_channel_private(&events, &session, &[SECRET, "DSML", "ML｜parameter"]);
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event,
+            dss_agent::AgentEvent::Thinking { .. } | dss_agent::AgentEvent::Text { .. }
+        )
+    }));
+}
+
+#[tokio::test]
+async fn cross_channel_freeze_keeps_only_prior_safe_prefixes_then_resets_them() {
+    const SAFE_THINKING: &str = "safe thought. ";
+    const SAFE_TEXT: &str = "safe answer. ";
+    const SECRET: &str = "CROSS_CHANNEL_SECRET";
+    let (outcome, session, events) = run_protocol_events(
+        vec![
+            Ok(StreamEvent::Thinking(SAFE_THINKING.into())),
+            Ok(StreamEvent::Text(SAFE_TEXT.into())),
+            Ok(StreamEvent::Thinking(
+                concat!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+                    "</｜DSML｜invoke></｜DSML｜tool_calls>"
+                )
+                .into(),
+            )),
+            Ok(StreamEvent::Text(SECRET.into())),
+            Ok(StreamEvent::Finish {
+                reason: Some("stop".into()),
+            }),
+        ],
+        ToolRegistry::new(),
+    )
+    .await;
+
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
+    let streamed_thinking: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let streamed_text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_thinking, SAFE_THINKING);
+    assert_eq!(streamed_text, SAFE_TEXT);
+    assert_cross_channel_private(&events, &session, &[SECRET, "DSML"]);
+
+    let reset_index = events
+        .iter()
+        .position(|event| matches!(event, dss_agent::AgentEvent::DraftReset { .. }))
+        .expect("invalid cross-channel candidate must retract safe prefixes");
+    let complete_index = events
+        .iter()
+        .position(|event| matches!(event, dss_agent::AgentEvent::Complete { .. }))
+        .expect("terminal error event");
+    assert!(reset_index < complete_index);
+
+    let hidden = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("prior safe prefixes remain hidden audit evidence");
+    assert!(hidden.harness_notice);
+    assert_eq!(hidden.reasoning_content.as_deref(), Some(SAFE_THINKING));
+    assert_eq!(hidden.content.as_deref(), Some(SAFE_TEXT));
+}
+
+#[tokio::test]
+async fn ordinary_lt_freezes_sibling_until_finish_then_flushes_both_plain_channels_once() {
+    const THINKING: &str = "analysis <comparison> remains ordinary";
+    const TEXT: &str = "answer after sibling freeze";
+
+    let reached_finish_gate = Arc::new(Notify::new());
+    let release_finish = Arc::new(Notify::new());
+    let llm = CrossChannelPlainGatedLlm {
+        reached_finish_gate: reached_finish_gate.clone(),
+        release_finish: release_finish.clone(),
+    };
+    let (tx, mut rx) = mpsc::channel::<dss_agent::AgentEvent>(32);
+    let task = tokio::spawn(async move {
+        let mut session = Session::new("cross-channel-plain", tmp_workspace());
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext::new(session.workspace.clone());
+        let outcome = Runner::run(
+            &mut session,
+            &llm,
+            llm.model(),
+            "freeze sibling until finish",
+            &registry,
+            &ctx,
+            MAX_ITERATIONS,
+            500_000,
+            None,
+            None,
+            &[],
+            false,
+            &tx,
+        )
+        .await;
+        (outcome, session)
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reached_finish_gate.notified(),
+    )
+    .await
+    .expect("provider never reached its Finish gate");
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        "analysis "
+    );
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, dss_agent::AgentEvent::Text { .. })));
+    assert!(!task.is_finished());
+
+    release_finish.notify_one();
+    let (outcome, session) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("runner did not finish after releasing Finish")
+        .expect("runner task panicked");
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let streamed_thinking: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let streamed_text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_thinking, THINKING);
+    assert_eq!(streamed_text, TEXT);
+    assert_eq!(outcome.kind, dss_agent::CompleteKind::Natural);
+    assert_eq!(outcome.final_text, TEXT);
+    let assistant = session
+        .messages
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("canonical assistant message");
+    assert_eq!(assistant.reasoning_content.as_deref(), Some(THINKING));
+    assert_eq!(assistant.content.as_deref(), Some(TEXT));
+}
+
+#[tokio::test]
+async fn reasoning_channel_dsml_freezes_sibling_text_without_protocol_publication() {
+    const SAFE_TEXT: &str = "safe provisional text";
+
     for reasoning in [
         concat!(
             "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
@@ -680,9 +1543,7 @@ async fn reasoning_channel_dsml_and_partial_prefixes_fail_without_publication() 
         let (outcome, session, events) = run_protocol_events(
             vec![
                 Ok(StreamEvent::Thinking(reasoning.into())),
-                Ok(StreamEvent::Text(
-                    "safe text must remain quarantined".into(),
-                )),
+                Ok(StreamEvent::Text(SAFE_TEXT.into())),
                 Ok(StreamEvent::Finish {
                     reason: Some("stop".into()),
                 }),
@@ -698,15 +1559,20 @@ async fn reasoning_channel_dsml_and_partial_prefixes_fail_without_publication() 
                 event,
                 dss_agent::AgentEvent::Thinking { .. }
                     | dss_agent::AgentEvent::Text { .. }
+                    | dss_agent::AgentEvent::DraftReset { .. }
                     | dss_agent::AgentEvent::ToolCalls { .. }
                     | dss_agent::AgentEvent::ToolResults { .. }
             )
         }));
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| message.role != "assistant"));
         assert!(session.messages.iter().all(|message| {
             message.content.as_deref().is_none_or(|content| {
                 !content.contains("DSML")
                     && !content.contains("DSM")
-                    && !content.contains("safe text must remain quarantined")
+                    && !content.contains(SAFE_TEXT)
             })
         }));
     }
@@ -730,16 +1596,36 @@ async fn reasoning_and_text_share_one_bounded_quarantine() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("quarantine limit")));
-    assert!(events.iter().all(|event| {
-        !matches!(
-            event,
-            dss_agent::AgentEvent::Thinking { .. } | dss_agent::AgentEvent::Text { .. }
-        )
-    }));
-    assert!(session
+    let streamed_thinking: String = events
+        .iter()
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_thinking.len(), 1536 * 1024);
+    assert!(events
+        .iter()
+        .all(|event| { !matches!(event, dss_agent::AgentEvent::Text { .. }) }));
+    let reset_index = events
+        .iter()
+        .position(|event| matches!(event, dss_agent::AgentEvent::DraftReset { .. }))
+        .expect("combined bound violation must retract streamed thinking");
+    let complete_index = events
+        .iter()
+        .position(|event| matches!(event, dss_agent::AgentEvent::Complete { .. }))
+        .expect("terminal error event");
+    assert!(reset_index < complete_index);
+    let hidden = session
         .messages
         .iter()
-        .all(|message| message.role != "assistant"));
+        .find(|message| message.role == "assistant")
+        .expect("streamed thinking is retained only as hidden audit evidence");
+    assert!(hidden.harness_notice);
+    assert_eq!(
+        hidden.reasoning_content.as_deref().map(str::len),
+        Some(1536 * 1024)
+    );
 }
 
 #[tokio::test]
@@ -892,9 +1778,14 @@ async fn commonmark_indented_dsml_is_documentation_not_execution() {
     .await;
     assert_eq!(outcome.kind, dss_agent::CompleteKind::Natural);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(events
+    let streamed_text: String = events
         .iter()
-        .any(|event| matches!(event, dss_agent::AgentEvent::Text { text } if text == &source)));
+        .filter_map(|event| match event {
+            dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_text, source);
     assert!(session
         .messages
         .iter()
@@ -937,7 +1828,17 @@ async fn non_top_level_and_abandoned_container_dsml_fail_without_execution_or_le
             }),
     );
 
+    let mut safe_prefix_cases = 0usize;
     for source in cases {
+        let before_lt = &source[..source.find('<').expect("DSML fixture contains '<'")];
+        let expected_safe_prefix = if before_lt
+            .chars()
+            .any(|character| !character.is_whitespace())
+        {
+            before_lt
+        } else {
+            ""
+        };
         let calls = Arc::new(AtomicUsize::new(0));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(CountingTool {
@@ -946,7 +1847,7 @@ async fn non_top_level_and_abandoned_container_dsml_fail_without_execution_or_le
         }));
         let (outcome, session, events) = run_protocol_events(
             vec![
-                Ok(StreamEvent::Text(source)),
+                Ok(StreamEvent::Text(source.clone())),
                 Ok(StreamEvent::Finish {
                     reason: Some("stop".into()),
                 }),
@@ -958,18 +1859,114 @@ async fn non_top_level_and_abandoned_container_dsml_fail_without_execution_or_le
         assert_eq!(outcome.kind, dss_agent::CompleteKind::Error);
         assert_eq!(outcome.final_text, "");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                dss_agent::AgentEvent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, expected_safe_prefix, "source: {source:?}");
+        assert!(events.iter().all(|event| match event {
+            dss_agent::AgentEvent::Text { text } => {
+                !text.contains('<') && !text.contains("DSML") && !text.contains("CONTEXT_SECRET")
+            }
+            _ => true,
+        }));
         assert!(events.iter().all(|event| {
             !matches!(
                 event,
-                dss_agent::AgentEvent::Text { .. }
-                    | dss_agent::AgentEvent::ToolCalls { .. }
-                    | dss_agent::AgentEvent::ToolResults { .. }
+                dss_agent::AgentEvent::ToolCalls { .. } | dss_agent::AgentEvent::ToolResults { .. }
             )
         }));
+
+        let reset_positions: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(
+                    event,
+                    dss_agent::AgentEvent::DraftReset { reason }
+                        if reason == "assistant_protocol_invalid"
+                )
+                .then_some(index)
+            })
+            .collect();
+        if expected_safe_prefix.is_empty() {
+            assert!(reset_positions.is_empty(), "source: {source:?}");
+        } else {
+            safe_prefix_cases += 1;
+            assert_eq!(reset_positions.len(), 1, "source: {source:?}");
+            let complete_index = events
+                .iter()
+                .position(|event| matches!(event, dss_agent::AgentEvent::Complete { .. }))
+                .expect("terminal error event");
+            assert!(reset_positions[0] < complete_index, "source: {source:?}");
+        }
+
         assert!(session.messages.iter().all(|message| {
             message.content.as_deref().is_none_or(|content| {
                 !content.contains("DSML") && !content.contains("CONTEXT_SECRET")
             }) && message.tool_calls.is_none()
+        }));
+        assert!(session.messages.iter().all(|message| {
+            message.role != "assistant"
+                || (message.harness_notice
+                    && message.content.as_deref() == Some(expected_safe_prefix))
+        }));
+    }
+    assert!(safe_prefix_cases > 0);
+}
+
+#[tokio::test]
+async fn top_level_dsml_candidate_never_crosses_text_events_at_any_scalar_split() {
+    let candidate = concat!(
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"count_probe\">",
+        "<｜DSML｜parameter name=\"code\" string=true>CONTEXT_SECRET</｜DSML｜parameter>",
+        "</｜DSML｜invoke>"
+    );
+    let mut split_points = vec![0];
+    split_points.extend(candidate.char_indices().skip(1).map(|(index, _)| index));
+    split_points.push(candidate.len());
+
+    for split in split_points {
+        let (outcome, session, events) = run_protocol_events(
+            vec![
+                Ok(StreamEvent::Text(candidate[..split].into())),
+                Ok(StreamEvent::Text(candidate[split..].into())),
+                Ok(StreamEvent::Finish {
+                    reason: Some("tool_calls".into()),
+                }),
+            ],
+            ToolRegistry::new(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.kind,
+            dss_agent::CompleteKind::Error,
+            "scalar split at byte {split}"
+        );
+        assert_eq!(outcome.final_text, "");
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event,
+                    dss_agent::AgentEvent::Thinking { .. }
+                        | dss_agent::AgentEvent::Text { .. }
+                        | dss_agent::AgentEvent::DraftReset { .. }
+                        | dss_agent::AgentEvent::ToolCalls { .. }
+                        | dss_agent::AgentEvent::ToolResults { .. }
+                )
+            }),
+            "protocol leaked at scalar split byte {split}"
+        );
+        assert!(session.messages.iter().all(|message| {
+            message.role != "assistant"
+                && message.tool_calls.is_none()
+                && message.content.as_deref().is_none_or(|content| {
+                    !content.contains("DSML") && !content.contains("CONTEXT_SECRET")
+                })
         }));
     }
 }
@@ -2425,7 +3422,7 @@ async fn a2a_mixed_batch_fails_closed_pairs_every_call_then_recovers_standalone(
         result.is_error
             && result
                 .content
-                .contains("call exactly one A2A tool by itself")
+                .contains("call exactly one exclusive tool by itself")
     }));
     assert_eq!(result_batches[1].len(), 1);
     assert_eq!(result_batches[1][0].tool_use_id, "standalone-a2a");
@@ -2447,10 +3444,9 @@ async fn a2a_mixed_batch_fails_closed_pairs_every_call_then_recovers_standalone(
     assert!(recovery_request.iter().any(|message| {
         message.role == "tool"
             && message.tool_call_id.as_deref() == Some("mixed-a2a-1")
-            && message
-                .content
-                .as_deref()
-                .is_some_and(|content| content.contains("call exactly one A2A tool by itself"))
+            && message.content.as_deref().is_some_and(|content| {
+                content.contains("call exactly one exclusive tool by itself")
+            })
     }));
 }
 

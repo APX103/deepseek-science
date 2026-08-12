@@ -225,6 +225,8 @@ mod tests {
         let state = crate::state::build_state(Settings {
             data_dir: root.clone(),
             data_dir_is_default: false,
+            max_iterations: dss_core::DEFAULT_MAX_ITERATIONS,
+            thinking: dss_core::ThinkingSettings::default(),
             server: ServerSettings::default(),
             llm: LlmSettings::default(),
             providers: Vec::new(),

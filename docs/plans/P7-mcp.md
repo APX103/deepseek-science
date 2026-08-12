@@ -1,6 +1,6 @@
 # P7 — MCP streamable HTTP 客户端 + 动态挂载
 
-> 对应 roadmap P7 / modules.md §6。状态：进行中（2026-08-03）。
+> 对应 roadmap P7 / modules.md §6。状态：已完成并扩展 Agent Registry Resources→A2A 链路（2026-08-12）。
 
 ## 目标
 后端能连接一个外部 MCP server（streamable HTTP + SSE），列出其工具，把工具动态挂载为 `mcp__{server}__{tool}`，让 agent 能调用。`GET /api/mcp/{name}/tools` 端点。
@@ -28,11 +28,10 @@
 - GET /api/mcp/unknown/tools → `{connected:false, error:"MCP server not connected"}` 优雅返回。
 - 配置 mcp_servers 后：启动连接 + 挂载工具（经集成测试 echo server 验证全流程）。
 
-**遗留（DEFER）**：
+**后续遗留（DEFER）**：
 - mcp_search/mcp_call meta 工具（>30 工具时；P7 只做 ≤30 全量挂载）。
 - generate_mcp_skills（为每 server 生成 mcp-{slug} skill）。
-- agent-registry 自动注入（A2A）。
-- mcp_read_resource / registry_connect_mcp_server。
+- `registry_connect_mcp_server`（本轮不需要：Registry 是设置中默认 server，热运行时统一连接）。
 - 前端 MCP 设置面板接真实（settings localStorage；后端 settings.json 已可配 mcp_servers）。
 
 ## 改动点
@@ -73,9 +72,17 @@
 - reqwest SSE 流式解析（复用 dss-llm 的手写行解析模式）。
 - MCP server 实际可用性：P7 用内嵌 echo server 验证；真实 server（如 Zhipu 搜索）由用户配置后即用。
 
+## 2026-08-12 Agent Registry 扩展
+
+- 后端默认 `agent-registry = https://a2a-dev.intern-ai.org.cn/mcp`；显式列表覆盖，`[]` 关闭。
+- MCP client 保留协商元数据、会话 header，支持有界分页 `resources/list` 和精确 `resources/read`，同时保留 text/blob content。
+- `mcp_list_resources` / `mcp_read_resource` 仅在 captured runtime 存在已连接且声明 Resources 的 server 时动态提供，server schema 只枚举对应 manager key；`call_agent` 只接受 Registry 返回的 `resource_uri`，不接受任意 endpoint/credential。
+- canonical Registry 强制 Resources-only：连接时不发送 `tools/list`，不挂载/调用它宣称的 MCP Tools。`call_agent` 在同一 captured MCP runtime 中重新 list/read，校验匿名 A2A descriptor，获取并校验 Agent Card，然后经既有 A2A client 发起一次 fresh Send；不接受任意 task/context handle。它保留 exclusive batch、每 run 副作用 guard、完整响应 frame、typed Registry provenance 和稳定结果 schema。
+- 对真实测试服务的 wildcard interface、card/descriptor auth mismatch、direct Task response 仅有显式且留 warning 的窄兼容；普通用户配置的 A2A Agent 仍走严格路径。
+- Hermetic ToolRouter E2E 与显式 ignored live E2E 均已覆盖完整 `list → read → call_agent → A2A Artifact` 流程；live oracle 精确校验 `DSS_A2A_E2E_OK`，并如实保留 `TASK_STATE_INPUT_REQUIRED` 可恢复状态。
+
 ## 不做（DEFER）
 - mcp_search/mcp_call meta 工具（>30 工具时；P7 只做 ≤30 全量挂载）。
 - generate_mcp_skills（为每 server 生成 mcp-{slug} skill）。
-- agent-registry 自动注入（A2A，更后）。
-- mcp_read_resource / registry_connect_mcp_server。
+- `registry_connect_mcp_server`（Registry 已由 settings/runtime 统一连接）。
 - 前端 MCP 设置面板接真实（目前 settings localStorage）。

@@ -12,6 +12,8 @@ export interface A2aResponseFrame extends JsonRecord {
 export interface A2aToolResultEnvelope extends JsonRecord {
   schema: typeof A2A_TOOL_RESULT_SCHEMA
   agent: JsonRecord
+  /** Present only when the remote Agent was selected through a Registry Resource. */
+  registry: JsonRecord | null
   /** Absent when the mandatory pre-call Agent Card refresh itself failed. */
   card: JsonRecord | null
   request: JsonRecord
@@ -47,8 +49,17 @@ export function parseA2aToolResult(content: string): A2aToolResultEnvelope | nul
   const card = value.card === undefined || value.card === null
     ? null
     : isJsonRecord(value.card) ? value.card : undefined
+  const registry = value.registry === undefined || value.registry === null
+    ? null
+    : isJsonRecord(value.registry) ? value.registry : undefined
   if (
     !isJsonRecord(value.agent)
+    || registry === undefined
+    || (registry !== null && (
+      typeof registry.server !== 'string'
+      || typeof registry.resource_uri !== 'string'
+      || typeof registry.resource_name !== 'string'
+    ))
     || card === undefined
     || !isJsonRecord(value.request)
     || !Array.isArray(value.responses)
@@ -76,6 +87,7 @@ export function parseA2aToolResult(content: string): A2aToolResultEnvelope | nul
     ...value,
     schema: A2A_TOOL_RESULT_SCHEMA,
     agent: value.agent,
+    registry,
     card,
     request: value.request,
     responses,

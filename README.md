@@ -18,8 +18,8 @@ Rust · React · Tauri 2 · 从零构建
 
 | | |
 |---|---|
-| **科研原生工具链** | 30+ 内置工具：`python` / `bash` 执行、`search_papers` / `fetch_paper`（OpenAlex）、`web_search` / `fetch_url`、`compile_pdf`（Tectonic）、版本化 artifacts、`install_packages`（venv） |
-| **DeepSeek 深度集成** | 思考模式（`reasoning_content`）流式呈现；**前缀缓存感知**——system 前缀字节稳定、可变内容移到尾部，实测同会话缓存命中率 **98%+**，命中输入按官方约 1/120 计价 |
+| **科研原生工具链** | 20+ 内置工具：`python` / `bash` 执行、`search_papers` / `fetch_paper`（OpenAlex）、`web_search` / `fetch_url`、`compile_pdf`（Tectonic）、文件/记忆/plan/skills 工具 |
+| **可控思考模式** | 设置页可开关 Think、选择低/高/最大思考深度并限制 Agent 最大轮次；受支持的 DeepSeek/OpenAI 请求会携带对应推理字段，`reasoning_content` 实时流式呈现且可折叠；保留前缀缓存感知，同会话缓存命中率实测 **98%+** |
 | **论文写作编排** | 内置 paper-writing skill：clarify → 文献综述 → 结构 → 图表 → 实验设计 → 同行评审 → 编译成 PDF |
 | **长上下文不爆 token** | Rolling Compact：append-only 历史 + 非破坏性 projection，先免费裁剪工具输出、超阈值才付费摘要折叠 |
 | **分层记忆** | 跨项目 profile + 项目级记忆，BM25 召回（CJK 感知），LLM 抽取，后台异步更新 |

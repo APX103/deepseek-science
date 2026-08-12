@@ -1,5 +1,5 @@
 // 工作台页：三栏布局（左右栏宽可拖拽并持久化）+ 右侧 tab 系统 + 文件预览弹层 + Skills 弹层。
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import type { Artifact, WorkspaceFile } from '../types'
 import {
@@ -12,7 +12,6 @@ import {
 } from '../api/client'
 import {
   canExecutePlanNow,
-  composerSendIntent,
   currentAwaitingKind,
 } from '../api/planExecution'
 import {
@@ -27,10 +26,12 @@ import {
   failStream,
   failStreamStop,
   finishStreamStop,
+  getSessionStateSnapshot,
+  getStreamSnapshot,
   loadFromBackend,
   loadMessages,
+  retireStreamAfterBackendFinish,
   useProjects,
-  resumeStreamAfterLateStop,
   sendUserMessage,
   setStreamAborter,
   setStreamPlan,
@@ -41,6 +42,27 @@ import {
   useSessionState,
   useStream,
 } from '../store'
+import {
+  beginQueuedPromptSteering,
+  claimNextQueuedPrompt,
+  claimQueuedPrompt,
+  clearQueuedPromptSteering,
+  deleteQueuedPrompt,
+  editQueuedPrompt,
+  enqueuePrompt,
+  getPromptQueue,
+  reorderQueuedPrompt,
+  usePromptQueue,
+} from '../promptQueueStore'
+import type { QueuedPrompt } from '../api/promptQueue'
+import {
+  coordinateManualPromptStop,
+  coordinateQueuedPromptSteer,
+  promptRunGate,
+  resolvePromptRunIntent,
+  restoreAndMaybeDrainPromptQueue,
+  type PromptRunLease,
+} from '../api/promptRunCoordinator'
 import { filePreviewKind } from '../api/filePreview'
 import FilePreviewModal from '../components/FilePreviewModal'
 import ImagePreviewModal from '../components/ImagePreviewModal'
@@ -73,9 +95,31 @@ export default function WorkbenchPage() {
   const [files, setFiles] = useState<WorkspaceFile[]>([])
   const [filesLoading, setFilesLoading] = useState(false)
   const [filesError, setFilesError] = useState<string | null>(null)
-  const [planMode, setPlanMode] = useState(false)
-  const [approvingPlan, setApprovingPlan] = useState(false)
-  const [planError, setPlanError] = useState<string | null>(null)
+  const [planModes, setPlanModes] = useState<Record<string, boolean | undefined>>({})
+  const [approvingPlans, setApprovingPlans] = useState<Record<string, boolean | undefined>>({})
+  const [planErrors, setPlanErrors] = useState<Record<string, string | undefined>>({})
+  const [queueErrors, setQueueErrors] = useState<Record<string, string | undefined>>({})
+  const visibleSidRef = useRef(sid)
+  visibleSidRef.current = sid
+  const planMode = planModes[sid] ?? false
+  const approvingPlan = approvingPlans[sid] ?? false
+  const planError = planErrors[sid] ?? null
+
+  const updatePlanMode = (targetSid: string, enabled: boolean) => {
+    setPlanModes((current) => ({ ...current, [targetSid]: enabled }))
+  }
+  const updateApprovingPlan = (targetSid: string, approving: boolean) => {
+    setApprovingPlans((current) => ({ ...current, [targetSid]: approving }))
+  }
+  const updatePlanError = (targetSid: string, error: string | null) => {
+    setPlanErrors((current) => {
+      if (current[targetSid] === (error ?? undefined)) return current
+      const next = { ...current }
+      if (error) next[targetSid] = error
+      else delete next[targetSid]
+      return next
+    })
+  }
 
   // 栏宽：localStorage 持久化
   const [leftW, setLeftW] = useState(() => readWidth(LEFT_KEY, 224))
@@ -111,26 +155,41 @@ export default function WorkbenchPage() {
   const sessionState = useSessionState(sid)
   const messages = useMessages(sid)
   const stream = useStream(sid)
-  // A live stream owns the plan snapshot even when that snapshot is explicitly
-  // null (ordinary prompts clear stale approved plans).
-  const plan = stream ? stream.plan : sessionState?.plan ?? null
-  const awaiting = currentAwaitingKind(stream, sessionState?.runs)
+  const promptQueue = usePromptQueue(sid)
+  // Only an active or classified terminal stream owns plan/awaiting. An
+  // unclassified retired shell must yield to the canonical restored session.
+  const classifiedStream = stream && (stream.running || stream.kind !== null)
+    ? stream
+    : undefined
+  const plan = classifiedStream ? classifiedStream.plan : sessionState?.plan ?? null
+  const awaiting = currentAwaitingKind(classifiedStream, sessionState?.runs)
   const awaitingPlan = awaiting === 'plan_approval'
-  const canExecutePlan = canExecutePlanNow(plan, awaiting, stream?.running ?? false)
+  const canExecutePlan = canExecutePlanNow(plan, awaiting, classifiedStream?.running ?? false)
 
-  const refreshFiles = useCallback(async () => {
-    if (!sid) return
-    setFilesLoading(true)
-    setFilesError(null)
-    try {
-      setFiles(await listFiles(sid))
-    } catch (error) {
-      setFiles([])
-      setFilesError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setFilesLoading(false)
+  const refreshFilesForSession = useCallback(async (targetSid: string) => {
+    if (!targetSid) return
+    const visible = visibleSidRef.current === targetSid
+    if (visible) {
+      setFilesLoading(true)
+      setFilesError(null)
     }
-  }, [sid])
+    try {
+      const nextFiles = await listFiles(targetSid)
+      if (visibleSidRef.current === targetSid) setFiles(nextFiles)
+    } catch (error) {
+      if (visibleSidRef.current === targetSid) {
+        setFiles([])
+        setFilesError(error instanceof Error ? error.message : String(error))
+      }
+    } finally {
+      if (visibleSidRef.current === targetSid) setFilesLoading(false)
+    }
+  }, [])
+
+  const refreshFiles = useCallback(
+    () => refreshFilesForSession(sid),
+    [refreshFilesForSession, sid],
+  )
 
   const artifacts = useMemo<Artifact[]>(
     () => files.map(workspaceFileToArtifact),
@@ -149,37 +208,61 @@ export default function WorkbenchPage() {
     setTabs(DEFAULT_TABS)
     setActiveTab(DEFAULT_TABS[0]?.id ?? null)
     setPreviewFile(null)
-    setPlanError(null)
     if (sid) {
       void loadMessages(sid)
       void refreshFiles()
     }
   }, [sid, refreshFiles])
 
-  // 发送：用户气泡立即上屏，然后走 SSE 流（POST /api/sessions/{sid}/stream-sse）
-  const handleSend = (
+  function resolveComposerIntent(targetSid: string, requestedPlanMode: boolean) {
+    const live = getStreamSnapshot(targetSid)
+    const restored = getSessionStateSnapshot(targetSid)
+    return resolvePromptRunIntent(live, restored, requestedPlanMode)
+  }
+
+  // The only local run launcher. A queue claim must happen immediately before
+  // this function; queued text is not written to the transcript any earlier.
+  function launchSessionRun(
+    targetSid: string,
     text: string,
-    requestedPlanMode = planMode,
-    executePlan = false,
-  ) => {
-    if (!sid || stream?.running) return
-    setPlanError(null)
-    sendUserMessage(sid, text)
-    const runId = startStream(sid, executePlan, requestedPlanMode)
-    const abort = connectSSE(sid, text, {
-      onStart: (frameId, taskSummary) => setStreamStart(sid, frameId, taskSummary, runId),
-      onIteration: (iteration) => advanceStreamIteration(sid, iteration, runId),
-      onThinking: (t) => appendStreamThinking(sid, t, runId),
-      onText: (t) => appendStreamText(sid, t, runId),
-      onDraftReset: () => resetStreamDraft(sid, runId),
-      onToolCalls: (calls) => appendStreamToolCall(sid, calls, runId),
+    requestedPlanMode: boolean,
+    executePlanOverride?: boolean,
+    lease?: PromptRunLease,
+  ): boolean {
+    const prompt = text.trim()
+    const ownsGate = !!lease && promptRunGate.isCurrent(lease)
+    if (
+      !targetSid ||
+      !prompt ||
+      getStreamSnapshot(targetSid)?.running ||
+      (promptRunGate.isBlocked(targetSid) && !ownsGate)
+    ) return false
+
+    const intent = executePlanOverride === undefined
+      ? resolveComposerIntent(targetSid, requestedPlanMode)
+      : { planMode: requestedPlanMode, executePlan: executePlanOverride }
+    updatePlanError(targetSid, null)
+    sendUserMessage(targetSid, prompt)
+    const runId = startStream(targetSid, intent.executePlan, intent.planMode)
+    const abort = connectSSE(targetSid, prompt, {
+      onStart: (frameId, taskSummary) =>
+        setStreamStart(targetSid, frameId, taskSummary, runId),
+      onIteration: (iteration) => advanceStreamIteration(targetSid, iteration, runId),
+      onThinking: (t) => appendStreamThinking(targetSid, t, runId),
+      onText: (t) => appendStreamText(targetSid, t, runId),
+      onDraftReset: () => resetStreamDraft(targetSid, runId),
+      onToolCalls: (calls) => appendStreamToolCall(targetSid, calls, runId),
       onToolResults: (results) => {
-        if (appendStreamToolResult(sid, results, runId)) void refreshFiles()
+        if (appendStreamToolResult(targetSid, results, runId)) {
+          void refreshFilesForSession(targetSid)
+        }
       },
-      onPlanUpdate: (nextPlan) => setStreamPlan(sid, nextPlan, runId),
+      onPlanUpdate: (nextPlan) => setStreamPlan(targetSid, nextPlan, runId),
       onComplete: (e) => {
+        const beforeTerminal = getStreamSnapshot(targetSid)
+        const queueBeforeTerminal = getPromptQueue(targetSid)
         const accepted = completeStream(
-          sid,
+          targetSid,
           e.usage ?? null,
           e.iterations ?? 0,
           e.kind,
@@ -191,62 +274,224 @@ export default function WorkbenchPage() {
           runId,
         )
         if (accepted) {
-          void refreshFiles()
-          // Terminal SSE is released only after the backend transaction commits.
-          // Re-read the authoritative DB transcript so live and restored ordering match.
-          void loadMessages(sid)
+          void refreshFilesForSession(targetSid)
+          void restoreAndMaybeDrainPromptQueue(
+            targetSid,
+            runId,
+            {
+              kind: e.kind,
+              awaiting: e.awaiting ?? null,
+              wasStopping: beforeTerminal?.stopping ?? false,
+              steering: queueBeforeTerminal.steering,
+            },
+            {
+              gate: promptRunGate,
+              loadMessages,
+              isRunActive: (sessionId) => !!getStreamSnapshot(sessionId)?.running,
+              claimAndLaunchNext,
+            },
+          )
         }
       },
       onError: (m) => {
-        if (failStream(sid, m, runId)) {
-          void refreshFiles()
-          void loadMessages(sid)
+        if (failStream(targetSid, m, runId)) {
+          void refreshFilesForSession(targetSid)
+          // A transport failure is not proof that the backend session mutex is
+          // free, so retain the queue and never auto-drain from this path.
+          void loadMessages(targetSid)
         }
       },
-    }, { planMode: requestedPlanMode, executePlan, runId })
-    setStreamAborter(sid, abort, runId)
+    }, { planMode: intent.planMode, executePlan: intent.executePlan, runId })
+    setStreamAborter(targetSid, abort, runId)
+    return true
+  }
+
+  function launchQueuedPrompt(targetSid: string, prompt: QueuedPrompt): boolean {
+    return launchSessionRun(targetSid, prompt.text, prompt.requestedPlanMode)
+  }
+
+  function claimAndLaunchNext(
+    targetSid: string,
+    lease: PromptRunLease,
+  ): QueuedPrompt | null {
+    if (!promptRunGate.isCurrent(lease) || getStreamSnapshot(targetSid)?.running) return null
+    const prompt = claimNextQueuedPrompt(targetSid)
+    if (!prompt) return null
+    return launchSessionRun(
+      targetSid,
+      prompt.text,
+      prompt.requestedPlanMode,
+      undefined,
+      lease,
+    ) ? prompt : null
+  }
+
+  function claimAndLaunchSelected(
+    targetSid: string,
+    itemId: string,
+    expectedRevision: number,
+    lease: PromptRunLease,
+  ): QueuedPrompt | null {
+    if (!promptRunGate.isCurrent(lease) || getStreamSnapshot(targetSid)?.running) return null
+    const prompt = claimQueuedPrompt(targetSid, itemId, expectedRevision)
+    if (!prompt) return null
+    return launchSessionRun(
+      targetSid,
+      prompt.text,
+      prompt.requestedPlanMode,
+      undefined,
+      lease,
+    ) ? prompt : null
+  }
+
+  function launchNextQueuedPrompt(targetSid: string): boolean {
+    if (
+      getStreamSnapshot(targetSid)?.running ||
+      getPromptQueue(targetSid).steering ||
+      promptRunGate.isBlocked(targetSid)
+    ) return false
+    const prompt = claimNextQueuedPrompt(targetSid)
+    return prompt ? launchQueuedPrompt(targetSid, prompt) : false
   }
 
   const handleApprovePlan = async () => {
     if (!sid || approvingPlan) return
-    setApprovingPlan(true)
-    setPlanError(null)
+    const targetSid = sid
+    updateApprovingPlan(targetSid, true)
+    updatePlanError(targetSid, null)
     try {
-      const approved = await approvePlan(sid)
-      setStreamPlan(sid, { approved: approved.approved, steps: approved.steps })
-      setPlanMode(false)
-      handleSend('请按照已批准的计划开始执行。', false, true)
+      const approved = await approvePlan(targetSid)
+      setStreamPlan(targetSid, { approved: approved.approved, steps: approved.steps })
+      updatePlanMode(targetSid, false)
+      if (!launchSessionRun(targetSid, '请按照已批准的计划开始执行。', false, true)) {
+        updatePlanError(targetSid, '计划已批准，但会话仍在恢复；请稍后点击“执行计划/重试”。')
+      }
     } catch (error) {
-      setPlanError(`批准计划失败：${error instanceof Error ? error.message : String(error)}`)
+      updatePlanError(
+        targetSid,
+        `批准计划失败：${error instanceof Error ? error.message : String(error)}`,
+      )
     } finally {
-      setApprovingPlan(false)
+      updateApprovingPlan(targetSid, false)
     }
   }
 
   const handleExecutePlan = () => {
     if (!canExecutePlan) return
-    setPlanMode(false)
-    handleSend('请按照已批准的计划开始执行。', false, true)
+    const targetSid = sid
+    updatePlanMode(targetSid, false)
+    if (!launchSessionRun(targetSid, '请按照已批准的计划开始执行。', false, true)) {
+      updatePlanError(targetSid, '会话仍在恢复，暂时无法启动计划；请稍后重试。')
+    }
   }
 
   const handleComposerSend = (text: string) => {
-    const intent = composerSendIntent(awaiting, plan, planMode)
-    handleSend(text, intent.planMode, intent.executePlan)
+    if (!sid || !text.trim()) return
+    const live = getStreamSnapshot(sid)
+    const queue = getPromptQueue(sid)
+    if (live?.running || queue.items.length > 0 || promptRunGate.isBlocked(sid)) {
+      const queued = enqueuePrompt(sid, { text, requestedPlanMode: planMode })
+      if (queued) {
+        updateQueueError(sid, null)
+        if (!live?.running) {
+          // If a terminal restore currently owns this idle session, record the
+          // explicit resume intent. Its lease will claim FIFO after the GET;
+          // direct launch stays blocked so stale history cannot overwrite it.
+          promptRunGate.requestDrain(sid)
+          launchNextQueuedPrompt(sid)
+        }
+      }
+      return
+    }
+    launchSessionRun(sid, text, planMode)
+  }
+
+  const updateQueueError = (targetSid: string, error: string | null) => {
+    setQueueErrors((current) => {
+      if (current[targetSid] === (error ?? undefined)) return current
+      const next = { ...current }
+      if (error) next[targetSid] = error
+      else delete next[targetSid]
+      return next
+    })
+  }
+
+  const handleQueueActivate = (item: QueuedPrompt) => {
+    if (!sid) return
+    const targetSid = sid
+    const live = getStreamSnapshot(targetSid)
+    updateQueueError(targetSid, null)
+
+    if (!live?.running) {
+      if (promptRunGate.isBlocked(targetSid)) {
+        updateQueueError(targetSid, '正在恢复上一轮消息，请稍后重试。')
+        return
+      }
+      const claimed = claimQueuedPrompt(targetSid, item.id, item.revision)
+      if (!claimed) {
+        updateQueueError(targetSid, '队列消息已变化，请重试。')
+        return
+      }
+      if (!launchQueuedPrompt(targetSid, claimed)) {
+        updateQueueError(targetSid, '未能启动队列消息。')
+      }
+      return
+    }
+
+    if (live.stopping) {
+      updateQueueError(targetSid, '当前运行正在停止，请稍后重试。')
+      return
+    }
+    if (!beginQueuedPromptSteering(targetSid, item.id, item.revision)) {
+      updateQueueError(targetSid, '队列消息已变化，请重试。')
+      return
+    }
+
+    const selected = { itemId: item.id, revision: item.revision }
+    void coordinateQueuedPromptSteer(targetSid, live.runId, selected, {
+      gate: promptRunGate,
+      beginStop: (sessionId, runId) => beginStreamStop(sessionId, runId),
+      cancelRun: cancelSessionRun,
+      finishCancelledRun: (sessionId, runId) => {
+        finishStreamStop(sessionId, runId)
+      },
+      retireNormallyFinishedRun: (sessionId, runId) => {
+        retireStreamAfterBackendFinish(sessionId, runId)
+      },
+      failStop: (sessionId, runId, error) => {
+        failStreamStop(sessionId, error, runId)
+      },
+      loadMessages,
+      claimAndLaunchSelected,
+      clearSteering: (sessionId, itemId, revision) => {
+        clearQueuedPromptSteering(sessionId, itemId, revision)
+      },
+    }).then((result) => {
+      if (result.status === 'failed') {
+        updateQueueError(targetSid, `调整方向失败：${result.error}`)
+      } else if (result.status === 'stale') {
+        updateQueueError(targetSid, '当前运行或队列消息已变化，请重试。')
+      } else {
+        updateQueueError(targetSid, null)
+      }
+    })
   }
 
   const handleStop = async () => {
     if (!sid) return
     const runId = beginStreamStop(sid)
     if (!runId) return
-    try {
-      const result = await cancelSessionRun(sid, runId)
-      if (result.cancelled) {
-        if (finishStreamStop(sid, runId)) void loadMessages(sid)
-      }
-      else resumeStreamAfterLateStop(sid, runId)
-    } catch (error) {
-      failStreamStop(sid, error instanceof Error ? error.message : String(error), runId)
-    }
+    await coordinateManualPromptStop(sid, runId, {
+      cancelRun: cancelSessionRun,
+      finishCancelledRun: (sessionId, expectedRunId) =>
+        finishStreamStop(sessionId, expectedRunId),
+      retireNormallyFinishedRun: (sessionId, expectedRunId) =>
+        retireStreamAfterBackendFinish(sessionId, expectedRunId),
+      failStop: (sessionId, expectedRunId, error) => {
+        failStreamStop(sessionId, error, expectedRunId)
+      },
+      loadMessages,
+    })
   }
 
   const handleDeleteFile = async (file: WorkspaceFile) => {
@@ -280,10 +525,28 @@ export default function WorkbenchPage() {
         canExecutePlan={canExecutePlan}
         approvingPlan={approvingPlan}
         planError={planError}
+        queue={promptQueue}
+        queueError={queueErrors[sid] ?? null}
         planMode={planMode}
-        onPlanModeChange={setPlanMode}
+        onPlanModeChange={(enabled) => updatePlanMode(sid, enabled)}
         onApprovePlan={() => void handleApprovePlan()}
         onExecutePlan={handleExecutePlan}
+        onQueueReorder={(itemId, targetId) => {
+          const changed = reorderQueuedPrompt(sid, itemId, targetId)
+          if (changed) updateQueueError(sid, null)
+          return changed
+        }}
+        onQueueEdit={(itemId, revision, text) => {
+          const changed = editQueuedPrompt(sid, itemId, revision, text)
+          if (changed) updateQueueError(sid, null)
+          return changed
+        }}
+        onQueueDelete={(itemId, revision) => {
+          const changed = deleteQueuedPrompt(sid, itemId, revision)
+          if (changed) updateQueueError(sid, null)
+          return changed
+        }}
+        onQueueActivate={handleQueueActivate}
         onSend={handleComposerSend}
         onStop={() => void handleStop()}
         title={projectName}

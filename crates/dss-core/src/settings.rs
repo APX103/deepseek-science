@@ -18,12 +18,74 @@ pub const DEFAULT_PORT: u16 = 17896;
 pub const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_LLM_MODEL: &str = "deepseek-v4-flash";
 pub const DEFAULT_A2A_TIMEOUT_SECONDS: u64 = 120;
+/// Stable authority name for the built-in Agent Registry MCP server.
+pub const DEFAULT_AGENT_REGISTRY_NAME: &str = "agent-registry";
+/// Canonical endpoint for the built-in Agent Registry MCP server.
+pub const DEFAULT_AGENT_REGISTRY_URL: &str = "https://a2a-dev.intern-ai.org.cn/mcp";
+/// Default per-run Agent iteration budget when neither settings file specifies one.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 100;
+/// Smallest useful per-run Agent iteration budget.
+pub const MIN_MAX_ITERATIONS: u32 = 1;
+/// Hard safety ceiling for a user-configurable per-run Agent iteration budget.
+pub const MAX_CONFIGURABLE_ITERATIONS: u32 = 1_000;
+
+/// Validate the shared persisted/API contract for the per-run Agent iteration budget.
+pub fn validate_max_iterations(value: u32) -> Result<(), &'static str> {
+    if (MIN_MAX_ITERATIONS..=MAX_CONFIGURABLE_ITERATIONS).contains(&value) {
+        Ok(())
+    } else {
+        Err("max_iterations must be between 1 and 1000")
+    }
+}
+
+/// Provider reasoning effort exposed by the product. The deliberately small
+/// set is supported by DeepSeek V4 and the currently recognized OpenAI models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingEffort {
+    Low,
+    #[default]
+    High,
+    Max,
+}
+
+impl ThinkingEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Hot, run-scoped reasoning policy. This controls one provider request and is
+/// independent from `max_iterations`, which bounds the Agent/tool loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThinkingSettings {
+    pub enabled: bool,
+    pub effort: ThinkingEffort,
+}
+
+impl Default for ThinkingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            effort: ThinkingEffort::High,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub data_dir: PathBuf,
     /// data_dir 是否为默认值（未设 `DSS_DATA_DIR`）；决定是否允许 SSD 软链。
     pub data_dir_is_default: bool,
+    /// 每次 Agent run 的最大 LLM/工具迭代轮数。
+    pub max_iterations: u32,
+    /// 每个 provider 请求的思考开关和深度。
+    pub thinking: ThinkingSettings,
     pub server: ServerSettings,
     pub llm: LlmSettings,
     /// 持久化的多 provider 列表（供设置界面读写）。
@@ -174,6 +236,70 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
+/// Validate the persisted/public MCP authority contract. Endpoint URLs are
+/// configuration, not a secret transport; embedded credentials and query-token
+/// forms are rejected so settings readback and diagnostics cannot leak them.
+pub fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    for server in servers {
+        let name = server.name.trim();
+        if name.is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || name != server.name
+        {
+            return Err("each MCP server needs a bounded safe name".into());
+        }
+        if name.eq_ignore_ascii_case(DEFAULT_AGENT_REGISTRY_NAME)
+            && name != DEFAULT_AGENT_REGISTRY_NAME
+        {
+            return Err(format!(
+                "reserved MCP server name must use the canonical spelling: {DEFAULT_AGENT_REGISTRY_NAME}"
+            ));
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!("duplicate MCP server name: {name}"));
+        }
+        if server.url.is_empty()
+            || server.url.len() > 2_048
+            || server.url.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "MCP server {name} URL is empty, too long, or unsafe"
+            ));
+        }
+        let url = url::Url::parse(&server.url)
+            .map_err(|_| format!("MCP server {name} URL is invalid"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(format!(
+                "MCP server {name} URL must be absolute http or https"
+            ));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(format!(
+                "MCP server {name} URL credentials, query, and fragment are forbidden"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Backend MCP defaults used by every settings resolver.
+///
+/// File layers remain authoritative: an explicit list replaces this seed and an explicit empty
+/// list opts out completely.
+pub fn default_mcp_servers() -> Vec<McpServerConfig> {
+    vec![McpServerConfig {
+        name: DEFAULT_AGENT_REGISTRY_NAME.to_owned(),
+        url: DEFAULT_AGENT_REGISTRY_URL.to_owned(),
+        enabled: true,
+    }]
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
     pub host: String,
@@ -276,6 +402,12 @@ pub struct ResolvedLlmSettings {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileSettings {
+    /// Missing values preserve the lower-priority layer; an explicit value replaces it.
+    max_iterations: Option<u32>,
+    /// Member-wise layered so a higher-priority file can override only the
+    /// switch or only the effort without resetting the other member.
+    #[serde(default)]
+    thinking: FileThinkingSettings,
     #[serde(default)]
     server: FileServerSettings,
     #[serde(default)]
@@ -307,6 +439,26 @@ struct FileSettings {
 struct FileServerSettings {
     host: Option<String>,
     port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileThinkingSettings {
+    #[serde(default, deserialize_with = "deserialize_present")]
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    effort: Option<ThinkingEffort>,
+}
+
+/// `Option<T>` normally treats an explicit JSON null like an omitted field.
+/// Settings use omission for inheritance, so a present null must instead be a
+/// type error and cannot silently reset or preserve a lower layer.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -415,7 +567,7 @@ impl Settings {
         let mut server = ServerSettings::default();
         let mut llm = LlmSettings::default();
         let mut log_level = None;
-        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut mcp_servers = default_mcp_servers();
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
 
@@ -439,7 +591,7 @@ impl Settings {
         let settings_json = self.data_dir.join("settings.json");
         let file: FileSettings =
             serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
-                path: settings_json,
+                path: settings_json.clone(),
                 message: e.to_string(),
             })?;
         file.apply_to(
@@ -481,7 +633,7 @@ impl Settings {
         let mut server = ServerSettings::default();
         let mut llm = LlmSettings::default();
         let mut log_level = None;
-        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut mcp_servers = default_mcp_servers();
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
 
@@ -505,7 +657,7 @@ impl Settings {
         let settings_json = self.data_dir.join("settings.json");
         let file: FileSettings =
             serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
-                path: settings_json,
+                path: settings_json.clone(),
                 message: e.to_string(),
             })?;
         file.apply_to(
@@ -544,7 +696,7 @@ impl Settings {
         let mut server = ServerSettings::default();
         let mut llm = LlmSettings::default();
         let mut log_level = None;
-        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut mcp_servers = default_mcp_servers();
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
 
@@ -568,7 +720,7 @@ impl Settings {
         let settings_json = self.data_dir.join("settings.json");
         let file: FileSettings =
             serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
-                path: settings_json,
+                path: settings_json.clone(),
                 message: e.to_string(),
             })?;
         file.apply_to(
@@ -579,6 +731,10 @@ impl Settings {
             &mut a2a_agents,
             &mut providers,
         );
+        validate_mcp_servers(&mcp_servers).map_err(|message| Error::ConfigParse {
+            path: settings_json,
+            message,
+        })?;
         Ok(mcp_servers)
     }
 
@@ -649,11 +805,65 @@ impl Settings {
         self.resolve_persisted_candidate_providers(candidate)
     }
 
+    /// Resolve the per-run Agent iteration budget a restart would load if `candidate` were the
+    /// complete contents of settings.json. This deliberately mirrors file-layer precedence and
+    /// validates both the lower-priority config.toml value and the candidate override.
+    pub fn resolve_candidate_max_iterations(&self, candidate: Value) -> Result<u32, Error> {
+        let mut max_iterations = DEFAULT_MAX_ITERATIONS;
+
+        let config_toml = self.data_dir.join("config.toml");
+        if config_toml.is_file() {
+            let text = std::fs::read_to_string(&config_toml)?;
+            let file: FileSettings = toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: config_toml.clone(),
+                message: e.to_string(),
+            })?;
+            file.apply_max_iterations(&mut max_iterations, &config_toml)?;
+        }
+
+        let settings_json = self.data_dir.join("settings.json");
+        let file: FileSettings =
+            serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
+                path: settings_json.clone(),
+                message: e.to_string(),
+            })?;
+        file.apply_max_iterations(&mut max_iterations, &settings_json)?;
+
+        Ok(max_iterations)
+    }
+
+    /// Resolve the reasoning policy a restart would load for a complete
+    /// candidate `settings.json`, including member-wise TOML inheritance.
+    pub fn resolve_candidate_thinking(&self, candidate: Value) -> Result<ThinkingSettings, Error> {
+        let mut thinking = ThinkingSettings::default();
+
+        let config_toml = self.data_dir.join("config.toml");
+        if config_toml.is_file() {
+            let text = std::fs::read_to_string(&config_toml)?;
+            let file: FileSettings = toml::from_str(&text).map_err(|e| Error::ConfigParse {
+                path: config_toml.clone(),
+                message: e.to_string(),
+            })?;
+            file.apply_thinking(&mut thinking);
+        }
+
+        let settings_json = self.data_dir.join("settings.json");
+        let file: FileSettings =
+            serde_json::from_value(candidate).map_err(|e| Error::ConfigParse {
+                path: settings_json,
+                message: e.to_string(),
+            })?;
+        file.apply_thinking(&mut thinking);
+        Ok(thinking)
+    }
+
     fn load_from_data_dir(data_dir: PathBuf, data_dir_is_default: bool) -> Result<Self, Error> {
+        let mut max_iterations = DEFAULT_MAX_ITERATIONS;
+        let mut thinking = ThinkingSettings::default();
         let mut server = ServerSettings::default();
         let mut llm = LlmSettings::default();
         let mut log_level = None;
-        let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
+        let mut mcp_servers = default_mcp_servers();
         let mut a2a_agents: Vec<A2aAgentConfig> = Vec::new();
         let mut providers: Vec<LlmProvider> = Vec::new();
         let mut memory = MemorySettings::default();
@@ -671,6 +881,8 @@ impl Settings {
             let file_memory = file.memory.clone();
             let file_log = file.log.clone();
             let file_api_keys = file.api_keys.clone();
+            file.apply_max_iterations(&mut max_iterations, &config_toml)?;
+            file.apply_thinking(&mut thinking);
             file.apply_to(
                 &mut server,
                 &mut llm,
@@ -703,6 +915,8 @@ impl Settings {
             let file_memory = file.memory.clone();
             let file_log = file.log.clone();
             let file_api_keys = file.api_keys.clone();
+            file.apply_max_iterations(&mut max_iterations, &settings_json)?;
+            file.apply_thinking(&mut thinking);
             file.apply_to(
                 &mut server,
                 &mut llm,
@@ -732,9 +946,16 @@ impl Settings {
         // env（最高优先级）
         let llm_env_overrides = apply_process_environment(&mut server, &mut llm, &mut log_level);
 
+        validate_mcp_servers(&mcp_servers).map_err(|message| Error::ConfigParse {
+            path: data_dir.join("settings.json"),
+            message,
+        })?;
+
         Ok(Settings {
             data_dir,
             data_dir_is_default,
+            max_iterations,
+            thinking,
             server,
             llm,
             providers,
@@ -841,6 +1062,31 @@ fn providers_from_legacy_llm(legacy_llm: &LlmSettings) -> Vec<LlmProvider> {
 }
 
 impl FileSettings {
+    fn apply_thinking(&self, thinking: &mut ThinkingSettings) {
+        if let Some(enabled) = self.thinking.enabled {
+            thinking.enabled = enabled;
+        }
+        if let Some(effort) = self.thinking.effort {
+            thinking.effort = effort;
+        }
+    }
+
+    fn apply_max_iterations(
+        &self,
+        max_iterations: &mut u32,
+        source_path: &std::path::Path,
+    ) -> Result<(), Error> {
+        let Some(value) = self.max_iterations else {
+            return Ok(());
+        };
+        validate_max_iterations(value).map_err(|message| Error::ConfigParse {
+            path: source_path.to_path_buf(),
+            message: message.to_string(),
+        })?;
+        *max_iterations = value;
+        Ok(())
+    }
+
     fn apply_to(
         self,
         server: &mut ServerSettings,
@@ -888,14 +1134,299 @@ impl FileSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{A2aAgentConfig, LlmSettings, Settings, DEFAULT_LLM_MODEL};
+    use super::{
+        default_mcp_servers, validate_mcp_servers, A2aAgentConfig, LlmSettings, McpServerConfig,
+        Settings, ThinkingEffort, ThinkingSettings, DEFAULT_AGENT_REGISTRY_NAME,
+        DEFAULT_AGENT_REGISTRY_URL, DEFAULT_LLM_MODEL, DEFAULT_MAX_ITERATIONS,
+        MAX_CONFIGURABLE_ITERATIONS, MIN_MAX_ITERATIONS,
+    };
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let sequence = TEST_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "dss-core-settings-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temporary settings directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn llm_defaults_to_current_deepseek_v4_flash_model() {
         let settings = LlmSettings::default();
         assert_eq!(DEFAULT_LLM_MODEL, "deepseek-v4-flash");
         assert_eq!(settings.model, DEFAULT_LLM_MODEL);
+    }
+
+    #[test]
+    fn agent_registry_is_an_opt_out_whole_list_default() {
+        let test_dir = TestDir::new("agent-registry-layering");
+
+        let defaults = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load MCP defaults");
+        assert_eq!(defaults.mcp_servers.len(), 1);
+        assert_eq!(defaults.mcp_servers[0].name, DEFAULT_AGENT_REGISTRY_NAME);
+        assert_eq!(defaults.mcp_servers[0].url, DEFAULT_AGENT_REGISTRY_URL);
+        assert!(defaults.mcp_servers[0].enabled);
+        assert_eq!(
+            defaults
+                .resolve_persisted_candidate_mcp_servers(serde_json::json!({}))
+                .expect("resolve an omitted higher-priority MCP list")
+                .len(),
+            1
+        );
+
+        std::fs::write(
+            test_dir.path().join("config.toml"),
+            r#"
+[[mcp_servers]]
+name = "custom"
+url = "https://custom.example.invalid/mcp"
+enabled = true
+"#,
+        )
+        .expect("write custom MCP config layer");
+        std::fs::write(test_dir.path().join("settings.json"), "{}")
+            .expect("write omitted MCP settings layer");
+        let from_config = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load custom MCP config layer");
+        assert_eq!(from_config.mcp_servers.len(), 1);
+        assert_eq!(from_config.mcp_servers[0].name, "custom");
+
+        std::fs::write(
+            test_dir.path().join("settings.json"),
+            r#"{
+  "mcp_servers": [{
+    "name": "agent-registry",
+    "url": "https://user-registry.example.invalid/mcp",
+    "enabled": false
+  }]
+}"#,
+        )
+        .expect("write same-name MCP settings override");
+        let same_name_override = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load same-name MCP override");
+        assert_eq!(same_name_override.mcp_servers.len(), 1);
+        assert_eq!(
+            same_name_override.mcp_servers[0].name,
+            DEFAULT_AGENT_REGISTRY_NAME
+        );
+        assert_eq!(
+            same_name_override.mcp_servers[0].url,
+            "https://user-registry.example.invalid/mcp"
+        );
+        assert!(!same_name_override.mcp_servers[0].enabled);
+
+        std::fs::write(
+            test_dir.path().join("settings.json"),
+            r#"{"mcp_servers":[]}"#,
+        )
+        .expect("write explicit MCP opt-out");
+        let opted_out = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load explicit MCP opt-out");
+        assert!(opted_out.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_urls_are_public_configuration_not_secret_containers() {
+        assert!(validate_mcp_servers(&default_mcp_servers()).is_ok());
+        for url in [
+            "https://user:secret@example.test/mcp",
+            "https://example.test/mcp?api_key=secret",
+            "https://example.test/mcp#secret",
+            "file:///tmp/mcp.sock",
+        ] {
+            assert!(
+                validate_mcp_servers(&[McpServerConfig {
+                    name: "external".into(),
+                    url: url.into(),
+                    enabled: true,
+                }])
+                .is_err(),
+                "unsafe MCP URL unexpectedly accepted: {url}"
+            );
+        }
+        for name in [" agent-registry", "agent-registry ", "Agent-Registry"] {
+            assert!(validate_mcp_servers(&[McpServerConfig {
+                name: name.into(),
+                url: DEFAULT_AGENT_REGISTRY_URL.into(),
+                enabled: true,
+            }])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn max_iterations_defaults_and_respects_file_precedence() {
+        let test_dir = TestDir::new("max-iterations-layering");
+
+        let defaults = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load defaults");
+        assert_eq!(defaults.max_iterations, DEFAULT_MAX_ITERATIONS);
+
+        std::fs::write(
+            test_dir.path().join("config.toml"),
+            "max_iterations = 240\n",
+        )
+        .expect("write config layer");
+        std::fs::write(test_dir.path().join("settings.json"), "{}")
+            .expect("write legacy settings without max_iterations");
+        let from_config = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load config layer");
+        assert_eq!(from_config.max_iterations, 240);
+        assert_eq!(
+            from_config
+                .resolve_candidate_max_iterations(serde_json::json!({}))
+                .expect("resolve candidate missing the higher-priority field"),
+            240
+        );
+        assert_eq!(
+            from_config
+                .resolve_candidate_max_iterations(serde_json::json!({
+                    "max_iterations": 640
+                }))
+                .expect("resolve candidate override"),
+            640
+        );
+
+        std::fs::write(
+            test_dir.path().join("settings.json"),
+            r#"{"max_iterations":320}"#,
+        )
+        .expect("write settings override");
+        let from_settings = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load settings override");
+        assert_eq!(from_settings.max_iterations, 320);
+    }
+
+    #[test]
+    fn max_iterations_accepts_only_the_shared_inclusive_range() {
+        let test_dir = TestDir::new("max-iterations-boundaries");
+        for value in [
+            MIN_MAX_ITERATIONS,
+            DEFAULT_MAX_ITERATIONS,
+            MAX_CONFIGURABLE_ITERATIONS,
+        ] {
+            std::fs::write(
+                test_dir.path().join("settings.json"),
+                format!(r#"{{"max_iterations":{value}}}"#),
+            )
+            .expect("write boundary setting");
+            let loaded = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+                .expect("load valid boundary");
+            assert_eq!(loaded.max_iterations, value);
+        }
+
+        for value in [0, MAX_CONFIGURABLE_ITERATIONS + 1] {
+            let settings_path = test_dir.path().join("settings.json");
+            std::fs::write(&settings_path, format!(r#"{{"max_iterations":{value}}}"#))
+                .expect("write invalid boundary setting");
+            let error = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+                .expect_err("invalid max_iterations must fail configuration loading");
+            let message = error.to_string();
+            assert!(message.contains(&settings_path.display().to_string()));
+            assert!(message.contains("max_iterations must be between 1 and 1000"));
+        }
+    }
+
+    #[test]
+    fn max_iterations_type_errors_identify_the_source_file() {
+        let test_dir = TestDir::new("max-iterations-types");
+        let settings_path = test_dir.path().join("settings.json");
+        std::fs::write(&settings_path, r#"{"max_iterations":"100"}"#)
+            .expect("write wrong JSON type");
+        let error = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect_err("a string max_iterations must fail");
+        assert!(error
+            .to_string()
+            .contains(&settings_path.display().to_string()));
+
+        std::fs::remove_file(&settings_path).expect("remove invalid settings layer");
+        let config_path = test_dir.path().join("config.toml");
+        std::fs::write(&config_path, "max_iterations = 0\n").expect("write invalid config layer");
+        let error = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect_err("an out-of-range config value must fail");
+        let message = error.to_string();
+        assert!(message.contains(&config_path.display().to_string()));
+        assert!(message.contains("max_iterations must be between 1 and 1000"));
+    }
+
+    #[test]
+    fn thinking_defaults_and_layers_members_independently() {
+        let test_dir = TestDir::new("thinking-layering");
+        let defaults = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load thinking defaults");
+        assert_eq!(defaults.thinking, ThinkingSettings::default());
+
+        std::fs::write(
+            test_dir.path().join("config.toml"),
+            "[thinking]\nenabled = false\neffort = \"low\"\n",
+        )
+        .expect("write lower thinking layer");
+        std::fs::write(
+            test_dir.path().join("settings.json"),
+            r#"{"thinking":{"enabled":true}}"#,
+        )
+        .expect("write partial higher thinking layer");
+
+        let loaded = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+            .expect("load layered thinking");
+        assert_eq!(
+            loaded.thinking,
+            ThinkingSettings {
+                enabled: true,
+                effort: ThinkingEffort::Low,
+            }
+        );
+        assert_eq!(
+            loaded
+                .resolve_candidate_thinking(serde_json::json!({
+                    "thinking": { "effort": "max" }
+                }))
+                .expect("resolve candidate member override"),
+            ThinkingSettings {
+                enabled: false,
+                effort: ThinkingEffort::Max,
+            }
+        );
+    }
+
+    #[test]
+    fn thinking_rejects_invalid_or_null_members_with_source() {
+        let test_dir = TestDir::new("thinking-invalid");
+        let settings_path = test_dir.path().join("settings.json");
+        for body in [
+            r#"{"thinking":{"effort":"medium"}}"#,
+            r#"{"thinking":{"effort":null}}"#,
+            r#"{"thinking":{"enabled":null}}"#,
+            r#"{"thinking":null}"#,
+        ] {
+            std::fs::write(&settings_path, body).expect("write invalid thinking setting");
+            let error = Settings::load_from_data_dir(test_dir.path().to_path_buf(), false)
+                .expect_err("invalid thinking setting must fail");
+            assert!(error
+                .to_string()
+                .contains(&settings_path.display().to_string()));
+        }
     }
 
     #[test]

@@ -9,11 +9,55 @@ import type {
   McpServerUpdate,
   MaskedApiKey,
   SkillSettingsValue,
+  ThinkingEffort,
+  ThinkingSettingsValue,
 } from '../types'
 
 export type SettingsKeyDrafts = Readonly<Record<string, string>>
 export type DataSourceKeyDrafts = Readonly<Record<string, string>>
 export const DATA_SOURCE_KEY_MASK: MaskedApiKey = '••••••••'
+export const DEFAULT_MAX_ITERATIONS = 100
+export const MIN_MAX_ITERATIONS = 1
+export const MAX_CONFIGURABLE_ITERATIONS = 1_000
+export const DEFAULT_THINKING_ENABLED = true
+export const DEFAULT_THINKING_EFFORT: ThinkingEffort = 'high'
+
+export function isThinkingEffort(value: unknown): value is ThinkingEffort {
+  return value === 'low' || value === 'high' || value === 'max'
+}
+
+/** Fill legacy/partial GET responses without ever forwarding an unknown effort value. */
+export function normalizeThinkingSettings(value: unknown): ThinkingSettingsValue {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { enabled: DEFAULT_THINKING_ENABLED, effort: DEFAULT_THINKING_EFFORT }
+  }
+  const record = value as Record<string, unknown>
+  return {
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : DEFAULT_THINKING_ENABLED,
+    effort: isThinkingEffort(record.effort) ? record.effort : DEFAULT_THINKING_EFFORT,
+  }
+}
+
+/** Keep legacy/malformed GET responses from creating an unsafe outbound full-form save. */
+export function normalizeMaxIterations(value?: number | null): number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= MIN_MAX_ITERATIONS
+    && value <= MAX_CONFIGURABLE_ITERATIONS
+    ? value
+    : DEFAULT_MAX_ITERATIONS
+}
+
+/** Accept only plain decimal integer drafts; Number inputs may still emit exponent notation. */
+export function parseMaxIterationsDraft(draft: string): number | null {
+  if (!/^\d+$/.test(draft)) return null
+  const value = Number(draft)
+  return Number.isSafeInteger(value)
+    && value >= MIN_MAX_ITERATIONS
+    && value <= MAX_CONFIGURABLE_ITERATIONS
+    ? value
+    : null
+}
 
 /** Normalize skill settings so the shape is always complete regardless of backend version. */
 export function normalizeSkillSettings(value?: SkillSettingsValue | null): SkillSettingsValue {
@@ -142,6 +186,52 @@ export function sanitizeSettings(settings: AppSettings): AppSettings {
     skills: normalizeSkillSettings(publicSettings.skills),
     mcp_servers: normalizeMcpServers(publicSettings.mcp_servers),
     api_keys_masked: apiKeysMasked,
+    max_iterations: normalizeMaxIterations(publicSettings.max_iterations),
+    thinking: normalizeThinkingSettings(publicSettings.thinking),
+  }
+}
+
+export interface AgentThinkingValues {
+  thinking: ThinkingSettingsValue
+  maxIterations: number
+}
+
+/** Require the raw POST body to echo every member; normalized defaults are not confirmation. */
+export function settingsResponseConfirmsAgentThinking(
+  response: AppSettings,
+  requested: AgentThinkingValues,
+): boolean {
+  const rawThinking = (response as unknown as { thinking?: unknown }).thinking
+  if (typeof rawThinking !== 'object' || rawThinking === null || Array.isArray(rawThinking)) {
+    return false
+  }
+  const record = rawThinking as Record<string, unknown>
+  return record.enabled === requested.thinking.enabled
+    && record.effort === requested.thinking.effort
+    && response.max_iterations === requested.maxIterations
+}
+
+export interface AgentThinkingSaveReconciliation {
+  settings: AppSettings
+  confirmed: boolean
+  confirmedValues: AgentThinkingValues
+}
+
+/** Advance the revision on every response, but keep the coherent baseline until all fields echo. */
+export function reconcileAgentThinkingSaveResponse(
+  response: AppSettings,
+  requested: AgentThinkingValues,
+  previousConfirmed: AgentThinkingValues,
+): AgentThinkingSaveReconciliation {
+  const confirmed = settingsResponseConfirmsAgentThinking(response, requested)
+  const baseline = confirmed ? requested : previousConfirmed
+  return {
+    settings: sanitizeSettings(response),
+    confirmed,
+    confirmedValues: {
+      thinking: { ...baseline.thinking },
+      maxIterations: baseline.maxIterations,
+    },
   }
 }
 
@@ -208,6 +298,8 @@ export function buildSettingsPayload(
     ...(Object.keys(apiKeys).length > 0 ? { api_keys: apiKeys } : {}),
     log_retention_days: sanitized.log_retention_days ?? 14,
     log_max_rows: sanitized.log_max_rows ?? 100_000,
+    max_iterations: normalizeMaxIterations(sanitized.max_iterations),
+    thinking: normalizeThinkingSettings(sanitized.thinking),
   }
 }
 

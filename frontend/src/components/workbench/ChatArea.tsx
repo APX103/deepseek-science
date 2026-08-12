@@ -1,17 +1,27 @@
 // 中间对话流：空态欢迎区 / 消息流 + 失败横幅 + 流式渲染区 + 底部输入框。
 // 发送走 store 流式 buffer（connectSSE 由 WorkbenchPage 接线）；离线时输入框禁用。
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { ContentBlock, Message, Plan, SessionRun, Usage } from '../../types'
 import type { StreamBuffer } from '../../store'
+import type { PromptQueueState, QueuedPrompt } from '../../api/promptQueue'
 import { useApp } from '../../App'
 import { planStatusLabel } from '../../api/planExecution'
 import { sanitizeAssistantDisplayText } from '../../api/assistantProtocol'
+import {
+  resolveThinkingDisclosureOpen,
+  restoredThinkingDisclosureId,
+  setThinkingDisclosurePreference,
+  thinkingDisclosureIdsForMessage,
+  thinkingDisclosureButtonId,
+  thinkingDisclosureId,
+  thinkingDisclosurePanelId,
+  type ThinkingDisclosurePreferences,
+} from '../../api/thinkingDisclosure'
+import { MAC_TRAFFIC_LIGHT_INSET } from '../../windowChrome'
 import AgentMarkdown from './AgentMarkdown'
+import PromptQueue from './PromptQueue'
 import ToolCallCard from './ToolCallCard'
 import { IconChevronRight, IconPanelLeft, IconPanelRight, IconSend, IconStop } from '../icons'
-
-// macOS 覆盖式标题栏下，左上角红黄绿三点占据约这么宽的安全区。
-const MAC_TRAFFIC_LIGHT_INSET = 76
 
 interface Props {
   messages: Message[]
@@ -24,10 +34,16 @@ interface Props {
   canExecutePlan: boolean
   approvingPlan: boolean
   planError?: string | null
+  queue: PromptQueueState
+  queueError?: string | null
   planMode: boolean
   onPlanModeChange: (enabled: boolean) => void
   onApprovePlan: () => void
   onExecutePlan: () => void
+  onQueueReorder: (itemId: string, targetId: string) => boolean
+  onQueueEdit: (itemId: string, expectedRevision: number, text: string) => boolean
+  onQueueDelete: (itemId: string, expectedRevision: number) => boolean
+  onQueueActivate: (item: QueuedPrompt) => void
   onSend: (text: string) => void
   onStop: () => void
   /** 显示在中间栏顶部的标题（当前项目名） */
@@ -50,10 +66,16 @@ export default function ChatArea({
   canExecutePlan,
   approvingPlan,
   planError,
+  queue,
+  queueError,
   planMode,
   onPlanModeChange,
   onApprovePlan,
   onExecutePlan,
+  onQueueReorder,
+  onQueueEdit,
+  onQueueDelete,
+  onQueueActivate,
   onSend,
   onStop,
   title,
@@ -62,12 +84,36 @@ export default function ChatArea({
   onToggleLeft,
   onToggleRight,
 }: Props) {
+  const { backend } = useApp()
   const running = stream?.running ?? false
   const stopping = stream?.stopping ?? false
+  const ready = backend.online && backend.llmConfigured
   const hasPersistedFailure = hasPersistedRunFailure(messages)
   const scrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const followTailRef = useRef(true)
+  const restoredMessageIdsRef = useRef(new WeakMap<Message, string>())
+  const restoredMessageIdCounterRef = useRef(0)
+  const [thinkingDisclosurePreferences, setThinkingDisclosurePreferences] =
+    useState<ThinkingDisclosurePreferences>({})
+
+  const messageIdentity = (message: Message): string => {
+    if (message.source_run_id && message.source_seq != null) {
+      return `run:${message.source_run_id}:seq:${message.source_seq}`
+    }
+    const existing = restoredMessageIdsRef.current.get(message)
+    if (existing) return existing
+    restoredMessageIdCounterRef.current += 1
+    const generated = `restored:${restoredMessageIdCounterRef.current}`
+    restoredMessageIdsRef.current.set(message, generated)
+    return generated
+  }
+
+  const updateThinkingDisclosure = (disclosureId: string, open: boolean) => {
+    setThinkingDisclosurePreferences((current) =>
+      setThinkingDisclosurePreference(current, disclosureId, open),
+    )
+  }
 
   useEffect(() => {
     if (!followTailRef.current) return
@@ -95,8 +141,20 @@ export default function ChatArea({
         <div className="flex flex-1 flex-col items-center justify-center px-6">
           <h1 className="text-[20px] font-semibold text-ink">有什么可以帮你？</h1>
           <div className="mt-6 w-full max-w-xl">
+            <PromptQueue
+              queue={queue}
+              running={running}
+              stopping={stopping}
+              disabled={!ready}
+              error={queueError}
+              onReorder={onQueueReorder}
+              onEdit={onQueueEdit}
+              onDelete={onQueueDelete}
+              onActivate={onQueueActivate}
+            />
             <Composer
               large
+              ready={ready}
               running={running}
               stopping={stopping}
               planMode={planMode}
@@ -130,13 +188,35 @@ export default function ChatArea({
             <MessageView
               key={`${m.source_run_id ?? 'live'}:${m.source_seq ?? i}`}
               message={m}
+              messageIdentity={messageIdentity(m)}
+              disclosurePreferences={thinkingDisclosurePreferences}
+              onDisclosureChange={updateThinkingDisclosure}
             />
           ))}
 
           {/* 当前 iteration；已完成的迭代已按真实顺序提交到 messages。 */}
           {stream?.running && (
             <div className="space-y-2">
-              {stream.thinking && <ThinkingBlock text={stream.thinking} running={stream.running} />}
+              {stream.thinking && (() => {
+                const disclosureId = thinkingDisclosureId(
+                  stream.runId,
+                  stream.currentIteration,
+                  stream.draftRevision,
+                )
+                return (
+                  <ThinkingBlock
+                    text={stream.thinking}
+                    running={stream.running}
+                    disclosureId={disclosureId}
+                    open={resolveThinkingDisclosureOpen(
+                      thinkingDisclosurePreferences,
+                      disclosureId,
+                      true,
+                    )}
+                    onOpenChange={(open) => updateThinkingDisclosure(disclosureId, open)}
+                  />
+                )
+              })()}
               {stream.text && <AgentMarkdown content={stream.text} />}
               {stream.toolCalls.map((c) => (
                 <ToolCallCard
@@ -178,7 +258,19 @@ export default function ChatArea({
       {/* 底部输入框 */}
       <div className="shrink-0 border-t border-border px-6 py-3">
         <div className="mx-auto max-w-2xl">
+          <PromptQueue
+            queue={queue}
+            running={running}
+            stopping={stopping}
+            disabled={!ready}
+            error={queueError}
+            onReorder={onQueueReorder}
+            onEdit={onQueueEdit}
+            onDelete={onQueueDelete}
+            onActivate={onQueueActivate}
+          />
           <Composer
+            ready={ready}
             running={running}
             stopping={stopping}
             planMode={planMode}
@@ -346,30 +438,78 @@ function PlanPanel({
           </button>
         </div>
       )}
-      {error && <p className="mt-2 text-[11px] text-danger">{error}</p>}
+      {error && (
+        <p role="alert" className="mt-2 text-[11px] text-danger">
+          {error}
+        </p>
+      )}
     </section>
   )
 }
 
-/** thinking 增量：可折叠块，默认收起。 */
-export function ThinkingBlock({ text, running }: { text: string; running: boolean }) {
-  const [open, setOpen] = useState(false)
-  const displayText = sanitizeAssistantDisplayText(text)
+interface ThinkingBlockProps {
+  text: string
+  running: boolean
+  disclosureId?: string
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}
+
+/** Live thinking opens by default; history starts closed and both remain user-controlled. */
+export function ThinkingBlock({
+  text,
+  running,
+  disclosureId,
+  open: controlledOpen,
+  onOpenChange,
+}: ThinkingBlockProps) {
+  const generatedId = useId()
+  const stableDisclosureId = disclosureId ?? `standalone:${generatedId}`
+  const [localOpen, setLocalOpen] = useState(() => running)
+  const open = controlledOpen ?? localOpen
+  const panelId = thinkingDisclosurePanelId(stableDisclosureId)
+  const buttonId = thinkingDisclosureButtonId(stableDisclosureId)
+  const displayText = open ? sanitizeAssistantDisplayText(text) : ''
+
+  const toggle = () => {
+    const next = !open
+    if (onOpenChange) onOpenChange(next)
+    else setLocalOpen(next)
+  }
+
   return (
-    <div className="rounded-md border border-border bg-surface">
+    <section
+      className="rounded-md border border-border bg-surface"
+      aria-busy={running}
+      data-thinking-disclosure={stableDisclosureId}
+    >
       <button
-        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-medium text-ink2"
-        onClick={() => setOpen((v) => !v)}
+        id={buttonId}
+        type="button"
+        className="flex w-full items-center gap-1.5 rounded-md px-3 py-2 text-left text-[12px] font-medium text-ink2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-1"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={toggle}
       >
-        <IconChevronRight width={12} height={12} className={`text-ink3 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <IconChevronRight
+          width={12}
+          height={12}
+          aria-hidden="true"
+          className={`shrink-0 text-ink3 transition-transform ${open ? 'rotate-90' : ''}`}
+        />
         Thinking{running ? '…' : ''}
       </button>
       {open && (
-        <div className="max-h-64 overflow-y-auto whitespace-pre-wrap border-t border-border px-3 py-2 text-[12px] leading-relaxed text-ink2">
+        <div
+          id={panelId}
+          role="region"
+          aria-labelledby={buttonId}
+          className="max-h-64 overflow-auto whitespace-pre-wrap break-words border-t border-border px-3 py-2 text-[12px] leading-relaxed text-ink2"
+        >
           {displayText}
         </div>
       )}
-    </div>
+    </section>
   )
 }
 
@@ -392,6 +532,7 @@ function BackendHint() {
 
 interface ComposerProps {
   large?: boolean
+  ready: boolean
   running: boolean
   stopping: boolean
   planMode: boolean
@@ -400,15 +541,40 @@ interface ComposerProps {
   onStop: () => void
 }
 
-function Composer({ large, running, stopping, planMode, onPlanModeChange, onSend, onStop }: ComposerProps) {
-  const { backend } = useApp()
+export function shouldSubmitComposerKey(event: {
+  key: string
+  shiftKey: boolean
+  isComposing: boolean
+}): boolean {
+  return event.key === 'Enter' && !event.shiftKey && !event.isComposing
+}
+
+export function submitComposerDraft(
+  value: string,
+  ready: boolean,
+  onSend: (text: string) => void,
+  onAccepted: () => void,
+): boolean {
+  if (!value.trim() || !ready) return false
+  onSend(value)
+  onAccepted()
+  return true
+}
+
+export function Composer({
+  large,
+  ready,
+  running,
+  stopping,
+  planMode,
+  onPlanModeChange,
+  onSend,
+  onStop,
+}: ComposerProps) {
   const [value, setValue] = useState('')
-  const ready = backend.online && backend.llmConfigured
 
   const submit = () => {
-    if (!value.trim() || !ready || running) return
-    onSend(value)
-    setValue('')
+    submitComposerDraft(value, ready, onSend, () => setValue(''))
   }
 
   return (
@@ -416,16 +582,24 @@ function Composer({ large, running, stopping, planMode, onPlanModeChange, onSend
       <textarea
         rows={large ? 3 : 2}
         value={value}
-        disabled={!ready || running}
+        disabled={!ready}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+          if (shouldSubmitComposerKey({
+            key: e.key,
+            shiftKey: e.shiftKey,
+            isComposing: e.nativeEvent.isComposing,
+          })) {
             e.preventDefault()
             submit()
           }
         }}
         placeholder={
-          ready ? '描述你的科研问题、数据和期望产物…' : '后端未连接…'
+          ready
+            ? running
+              ? '继续输入；按 Enter 加入队列，Shift+Enter 换行…'
+              : '描述你的科研问题、数据和期望产物…'
+            : '后端未连接…'
         }
         className="w-full resize-none bg-transparent px-3 pt-2.5 text-[13px] outline-none placeholder:text-ink3 disabled:opacity-50"
       />
@@ -437,16 +611,18 @@ function Composer({ large, running, stopping, planMode, onPlanModeChange, onSend
               planMode ? 'bg-brandSoft font-medium text-brand' : 'btn-ghost'
             }`}
             aria-pressed={planMode}
-            disabled={running}
-            title="先生成研究计划，批准后再执行"
+            disabled={!ready}
+            title={running ? '仅影响新加入队列的消息' : '先生成研究计划，批准后再执行'}
             onClick={() => onPlanModeChange(!planMode)}
           >
             {planMode ? 'Plan on' : 'Plan off'}
           </button>
           {running ? (
             <button
+              type="button"
               className="btn-outline rounded p-1.5 disabled:opacity-40"
               title={stopping ? '正在停止' : '停止'}
+              aria-label={stopping ? '正在停止' : '停止当前运行'}
               disabled={stopping}
               onClick={onStop}
             >
@@ -454,8 +630,10 @@ function Composer({ large, running, stopping, planMode, onPlanModeChange, onSend
             </button>
           ) : (
             <button
+              type="button"
               className="btn-primary rounded p-1.5 disabled:opacity-40"
               title="发送"
+              aria-label="发送消息"
               disabled={!value.trim() || !ready}
               onClick={submit}
             >
@@ -468,7 +646,19 @@ function Composer({ large, running, stopping, planMode, onPlanModeChange, onSend
   )
 }
 
-function MessageView({ message }: { message: Message }) {
+interface MessageViewProps {
+  message: Message
+  messageIdentity: string
+  disclosurePreferences: ThinkingDisclosurePreferences
+  onDisclosureChange: (disclosureId: string, open: boolean) => void
+}
+
+function MessageView({
+  message,
+  messageIdentity,
+  disclosurePreferences,
+  onDisclosureChange,
+}: MessageViewProps) {
   if (message.role === 'user') {
     return (
       <div className="space-y-2">
@@ -500,7 +690,22 @@ function MessageView({ message }: { message: Message }) {
           return <AgentMarkdown key={i} content={b.text} />
         }
         if (b.kind === 'thinking') {
-          return <ThinkingBlock key={i} text={b.text} running={false} />
+          const disclosureId = thinkingDisclosureIdsForMessage(message)?.[b.blockIndex]
+            ?? restoredThinkingDisclosureId(messageIdentity, b.blockIndex)
+          return (
+            <ThinkingBlock
+              key={disclosureId}
+              text={b.text}
+              running={false}
+              disclosureId={disclosureId}
+              open={resolveThinkingDisclosureOpen(
+                disclosurePreferences,
+                disclosureId,
+                false,
+              )}
+              onOpenChange={(open) => onDisclosureChange(disclosureId, open)}
+            />
+          )
         }
         return <ToolCallCard key={b.call.id} call={b.call} result={b.result} />
       })}
@@ -590,7 +795,7 @@ export function hasPersistedRunFailure(messages: Message[]): boolean {
 
 type RenderBlock =
   | { kind: 'text'; text: string }
-  | { kind: 'thinking'; text: string }
+  | { kind: 'thinking'; text: string; blockIndex: number }
   | { kind: 'tool'; call: ToolUse; result?: ToolResult }
 
 /** tool_use 与后续 tool_result 按 id 配对（契约要求两遍重建；此处单消息内配对即可）。 */
@@ -598,10 +803,14 @@ function pairTools(blocks: ContentBlock[]): RenderBlock[] {
   const results = new Map<string, ToolResult>()
   for (const b of blocks) if (b.type === 'tool_result') results.set(b.tool_use_id, b)
   const out: RenderBlock[] = []
+  let thinkingBlockIndex = 0
   for (const b of blocks) {
     if (b.type === 'text') out.push({ kind: 'text', text: b.text })
     else if (b.type === 'tool_use') out.push({ kind: 'tool', call: b, result: results.get(b.id) })
-    else if (b.type === 'thinking') out.push({ kind: 'thinking', text: b.thinking })
+    else if (b.type === 'thinking') {
+      out.push({ kind: 'thinking', text: b.thinking, blockIndex: thinkingBlockIndex })
+      thinkingBlockIndex += 1
+    }
   }
   return out
 }
