@@ -1,5 +1,9 @@
 //! Bounded child-process execution shared by the shell and Python tools.
 
+// Process execution is a production capability only on macOS. The same helpers
+// remain compiled on other platforms for their platform-independent unit tests.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 

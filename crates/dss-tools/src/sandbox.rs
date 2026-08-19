@@ -1,5 +1,9 @@
 //! Fail-closed workspace process isolation for model-controlled shell and Python code.
 
+// The non-macOS build intentionally exposes only fail-closed stubs; the concrete
+// sandbox runtime below is retained there solely for cross-platform unit tests.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -173,7 +177,7 @@ pub(crate) async fn run_workspace_shell(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (workspace, source, timeout);
-        return Err(unsupported_platform());
+        Err(unsupported_platform())
     }
 
     #[cfg(target_os = "macos")]
@@ -203,7 +207,7 @@ pub(crate) async fn run_workspace_python(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (workspace, source, timeout);
-        return Err(unsupported_platform());
+        Err(unsupported_platform())
     }
 
     #[cfg(target_os = "macos")]
@@ -235,7 +239,7 @@ pub(crate) async fn run_workspace_tectonic(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (workspace, executable, cache, home, args, timeout);
-        return Err(unsupported_platform());
+        Err(unsupported_platform())
     }
 
     #[cfg(target_os = "macos")]
