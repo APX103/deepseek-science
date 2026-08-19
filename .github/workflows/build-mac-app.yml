@@ -171,20 +171,34 @@ jobs:
               --title "Deepseek Science $tag"
           fi
 
-          # Never silently replace an already-published asset. A same-name rerun is
-          # successful only when the existing immutable asset is byte-for-byte identical.
-          if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$(basename "$DMG_PATH")"; then
-            echo "release asset already exists; refusing to overwrite it" >&2
-            exit 1
-          fi
-          gh release upload "$tag" "$DMG_PATH"
+          # GitHub normalizes spaces in uploaded asset names. Copy the verified DMG to
+          # an explicit, stable name so upload/readback and reruns use one identity.
+          asset_name="$(basename "$DMG_PATH" | tr ' ' '-')"
+          release_asset="$RUNNER_TEMP/$asset_name"
+          cp "$DMG_PATH" "$release_asset"
 
-          asset_name="$(basename "$DMG_PATH")"
-          asset_count="$(
-            gh release view "$tag" --json assets \
-              --template '{{range .assets}}{{printf "%s\n" .name}}{{end}}' |
-              awk -v wanted="$asset_name" '$0 == wanted { count++ } END { print count + 0 }'
-          )"
+          # A rerun may reuse an existing asset only when it is byte-for-byte identical.
+          if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$asset_name"; then
+            existing_dir="$(mktemp -d)"
+            gh release download "$tag" --pattern "$asset_name" --dir "$existing_dir"
+            if ! cmp -s "$release_asset" "$existing_dir/$asset_name"; then
+              echo "release asset exists with different content; refusing to overwrite it" >&2
+              exit 1
+            fi
+          else
+            gh release upload "$tag" "$release_asset"
+          fi
+
+          asset_count=0
+          for _ in 1 2 3 4 5; do
+            asset_count="$(
+              gh release view "$tag" --json assets \
+                --template '{{range .assets}}{{printf "%s\n" .name}}{{end}}' |
+                awk -v wanted="$asset_name" '$0 == wanted { count++ } END { print count + 0 }'
+            )"
+            [[ "$asset_count" -eq 1 ]] && break
+            sleep 2
+          done
           test "$asset_count" -eq 1
 
           is_draft="$(gh release view "$tag" --json isDraft --template '{{.isDraft}}')"
