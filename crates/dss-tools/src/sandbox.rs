@@ -10,10 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
 
 use crate::error::ToolError;
-use crate::process::{run_bounded, ProcessOutput};
+#[cfg(target_os = "macos")]
+use crate::process::run_bounded;
+use crate::process::ProcessOutput;
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const CLEAN_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
