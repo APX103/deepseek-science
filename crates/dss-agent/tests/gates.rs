@@ -4781,7 +4781,7 @@ async fn free_microcompact_reduction_skips_paid_summarize_in_runner() {
             "read_file",
             "{}".into(),
         )]),
-        ChatMessage::tool("call_1", &"y".repeat(40_000), Some("read_file".into())),
+        ChatMessage::tool("call_1", "y".repeat(40_000), Some("read_file".into())),
         ChatMessage::assistant("done"),
     ];
     let chat_requests = Arc::new(Mutex::new(Vec::new()));

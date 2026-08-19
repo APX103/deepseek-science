@@ -5,6 +5,8 @@ import type {
   AppSettingsUpdate,
   Artifact,
   BackendStatus,
+  Bot,
+  BotJob,
   HealthResponse,
   LogEntry,
   Memory,
@@ -317,6 +319,7 @@ interface SessionRowBE {
   plan_mode?: boolean;
   status: string;
   project_id: string | null;
+  bot_id?: string | null;
   live?: boolean;
   created_at: string;
   updated_at: string;
@@ -329,6 +332,7 @@ function mapSession(r: SessionRowBE): SessionSummary {
     title: r.title ?? "New session",
     status: normalizeSessionStatus(r.status),
     live: r.live ?? false,
+    bot_id: r.bot_id ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,
   };
@@ -446,17 +450,19 @@ export async function probeBackend(): Promise<BackendStatus> {
 /** 真实建会话：POST /api/sessions → {id, frame_id, model, workspace}。 */
 export async function createSessionApi(
   projectId: string,
+  botId?: string,
 ): Promise<{
   id: string;
   frame_id: string;
   mcp_tools: string[];
   model: string;
   workspace: string;
+  bot_id?: string | null;
 }> {
   const r = await apiFetch(`${apiBase()}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project_id: projectId }),
+    body: JSON.stringify({ project_id: projectId, bot_id: botId }),
   });
   if (!r.ok) throw new Error(`POST /api/sessions failed: ${r.status}`);
   return (await r.json()) as {
@@ -465,6 +471,7 @@ export async function createSessionApi(
     mcp_tools: string[];
     model: string;
     workspace: string;
+    bot_id?: string | null;
   };
 }
 
@@ -480,6 +487,7 @@ export async function getSession(sid: string): Promise<SessionState> {
     plan?: Plan | null;
     artifacts?: Record<string, Artifact>;
     project_id: string | null;
+    bot_id?: string | null;
     messages: PersistedSessionMessage[];
     runs?: SessionRunBE[];
   }>(`/sessions/${encodeURIComponent(sid)}`);
@@ -496,7 +504,116 @@ export async function getSession(sid: string): Promise<SessionState> {
     artifacts: data.artifacts ?? {},
     messages,
     runs,
+    bot_id: data.bot_id ?? null,
   };
+}
+
+// ---------- Bot Mode ----------
+export async function listBots(): Promise<Bot[]> {
+  return request<Bot[]>("/bots");
+}
+
+export async function createBot(input: {
+  name: string
+  role: string
+  instructions: string
+  avatar?: string
+  color?: string
+  project_id?: string
+  model?: string
+}): Promise<Bot> {
+  return request<Bot>("/bots", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateBot(botId: string, input: {
+  revision: number
+  name: string
+  role: string
+  instructions: string
+  avatar: string
+  color: string
+  project_id?: string | null
+  model?: string | null
+  thinking_enabled?: boolean | null
+  thinking_effort?: Bot["thinking_effort"]
+  enabled: boolean
+}): Promise<Bot> {
+  return request<Bot>(`/bots/${encodeURIComponent(botId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteBot(botId: string): Promise<void> {
+  return request<void>(`/bots/${encodeURIComponent(botId)}`, { method: "DELETE" });
+}
+
+export async function listBotJobs(sessionId: string): Promise<BotJob[]> {
+  return request<BotJob[]>(`/sessions/${encodeURIComponent(sessionId)}/bot-jobs`);
+}
+
+export async function enqueueBotJob(
+  sessionId: string,
+  input: { id: string; bot_id: string; prompt: string; plan_mode: boolean },
+): Promise<BotJob> {
+  return request<BotJob>(`/sessions/${encodeURIComponent(sessionId)}/bot-jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function editBotJob(
+  jobId: string,
+  input: { revision: number; prompt: string; plan_mode: boolean },
+): Promise<BotJob> {
+  return request<BotJob>(`/bot-jobs/${encodeURIComponent(jobId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteBotJob(jobId: string, revision: number): Promise<void> {
+  return request<void>(`/bot-jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision }),
+  });
+}
+
+export async function reorderBotJobs(sessionId: string, orderedIds: string[]): Promise<BotJob[]> {
+  return request<BotJob[]>(`/sessions/${encodeURIComponent(sessionId)}/bot-jobs/reorder`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ordered_ids: orderedIds }),
+  });
+}
+
+export async function claimBotJob(jobId: string, revision: number, runId: string): Promise<BotJob> {
+  return request<BotJob>(`/bot-jobs/${encodeURIComponent(jobId)}/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision, run_id: runId }),
+  });
+}
+
+export async function finishBotJob(
+  jobId: string,
+  runId: string,
+  succeeded: boolean,
+  error?: string | null,
+): Promise<BotJob> {
+  return request<BotJob>(`/bot-jobs/${encodeURIComponent(jobId)}/finish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_id: runId, succeeded, error }),
+  });
 }
 
 export async function deleteSession(sid: string): Promise<void> {

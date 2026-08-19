@@ -540,10 +540,11 @@ fn parse_tool(value: &Value) -> Result<McpTool, McpError> {
     let name = required_string(value, "name", 256)?;
     let description =
         optional_display_string(value, "description", MAX_STRING_BYTES)?.unwrap_or_default();
-    let input_schema = value
+    let mut input_schema = value
         .get("inputSchema")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    normalize_scalar_or_array_unions(&mut input_schema);
     validate_tool_input_schema(&input_schema)
         .map_err(|message| McpError::Invalid(format!("tool {name} inputSchema: {message}")))?;
     let annotations = parse_tool_annotations(value.get("annotations"))?;
@@ -553,6 +554,80 @@ fn parse_tool(value: &Value) -> Result<McpTool, McpError> {
         input_schema,
         annotations,
     })
+}
+
+/// Normalize the common MCP “one value or many values” input shape to its single-value form.
+///
+/// OpenAI-compatible providers do not consistently accept composition keywords in function
+/// schemas. Silently mounting arbitrary `anyOf` would let one remote tool poison the whole model
+/// request, while dropping the tool loses otherwise compatible single-item functionality. This
+/// narrow transformation accepts only exactly `T | T[]` for a primitive T and preserves the
+/// outer display annotations. The remote tool still accepts the resulting scalar argument.
+fn normalize_scalar_or_array_unions(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+
+    let replacement = object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .and_then(|branches| simple_scalar_or_array_scalar_branch(branches))
+        .map(|mut replacement| {
+            for key in ["title", "description", "default", "examples"] {
+                if let Some(value) = object.get(key) {
+                    replacement.insert(key.to_string(), value.clone());
+                }
+            }
+            replacement
+        });
+    if let Some(replacement) = replacement {
+        *object = replacement;
+    }
+
+    if let Some(Value::Object(properties)) = object.get_mut("properties") {
+        for property in properties.values_mut() {
+            normalize_scalar_or_array_unions(property);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        normalize_scalar_or_array_unions(items);
+    }
+}
+
+fn simple_scalar_or_array_scalar_branch(
+    branches: &[Value],
+) -> Option<serde_json::Map<String, Value>> {
+    if branches.len() != 2 {
+        return None;
+    }
+    let scalar = branches.iter().find_map(|branch| {
+        let object = branch.as_object()?;
+        let kind = object.get("type")?.as_str()?;
+        if matches!(kind, "string" | "number" | "integer" | "boolean")
+            && object.keys().all(|key| key == "type")
+        {
+            Some((kind, object.clone()))
+        } else {
+            None
+        }
+    })?;
+    let has_matching_array = branches.iter().any(|branch| {
+        let Some(object) = branch.as_object() else {
+            return false;
+        };
+        object.get("type").and_then(Value::as_str) == Some("array")
+            && object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "items"))
+            && object
+                .get("items")
+                .and_then(Value::as_object)
+                .is_some_and(|items| {
+                    items.get("type").and_then(Value::as_str) == Some(scalar.0)
+                        && items.keys().all(|key| key == "type")
+                })
+    });
+    has_matching_array.then_some(scalar.1)
 }
 
 fn parse_tool_annotations(value: Option<&Value>) -> Result<McpToolAnnotations, McpError> {
@@ -1030,6 +1105,53 @@ mod tests {
             parse_response(body, Some("application/json")),
             Err(McpError::Rpc { code: -32600, .. })
         ));
+    }
+
+    #[test]
+    fn scalar_or_array_union_is_narrowed_to_provider_safe_single_value() {
+        let tool = parse_tool(&json!({
+            "name": "ask_question",
+            "description": "Ask one or more repositories",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repoName": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ],
+                        "description": "GitHub repository or list of repositories"
+                    },
+                    "question": {"type": "string"}
+                },
+                "required": ["repoName", "question"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["repoName"],
+            json!({
+                "type": "string",
+                "description": "GitHub repository or list of repositories"
+            })
+        );
+    }
+
+    #[test]
+    fn arbitrary_any_of_remains_rejected_instead_of_poisoning_model_tools() {
+        let error = parse_tool(&json!({
+            "name": "unsafe_union",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "value": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+                }
+            }
+        }))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported JSON Schema keyword anyOf"));
     }
 
     #[test]

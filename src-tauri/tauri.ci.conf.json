@@ -1,0 +1,14 @@
+{
+  "build": {
+    "beforeBuildCommand": "if [ -d frontend ]; then cd frontend; elif [ -d ../frontend ]; then cd ../frontend; else echo 'frontend dir not found' >&2; exit 1; fi && bun run build"
+  },
+  "bundle": {
+    "resources": {
+      "../target/release/dss-backend": null,
+      "../target/universal-apple-darwin/release/dss-backend": "dss-backend"
+    },
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

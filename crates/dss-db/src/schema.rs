@@ -74,6 +74,22 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS bots (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                role             TEXT NOT NULL,
+                instructions     TEXT NOT NULL DEFAULT '',
+                avatar           TEXT NOT NULL DEFAULT '🤖',
+                color            TEXT NOT NULL DEFAULT '#4D6BFE',
+                project_id       TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                model            TEXT,
+                thinking_enabled INTEGER,
+                thinking_effort  TEXT,
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                revision         INTEGER NOT NULL DEFAULT 1,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS sessions (
                 id            TEXT PRIMARY KEY,
                 title         TEXT,
@@ -86,6 +102,23 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
                 plan_data     TEXT,
                 created_at    TEXT NOT NULL,
                 updated_at    TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_jobs (
+                id                  TEXT PRIMARY KEY,
+                bot_id              TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+                session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                prompt              TEXT NOT NULL,
+                requested_plan_mode INTEGER NOT NULL DEFAULT 0,
+                priority            INTEGER NOT NULL DEFAULT 0,
+                position            INTEGER NOT NULL,
+                revision            INTEGER NOT NULL DEFAULT 1,
+                status              TEXT NOT NULL DEFAULT 'queued',
+                run_id              TEXT,
+                last_error          TEXT,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                claimed_at          TEXT,
+                completed_at        TEXT
             );
             CREATE TABLE IF NOT EXISTS session_runs (
                 run_id           TEXT PRIMARY KEY,
@@ -171,6 +204,12 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
         "TEXT REFERENCES projects(id) ON DELETE SET NULL",
     )?;
     ensure_column(c, "sessions", "plan_data", "TEXT")?;
+    ensure_column(
+        c,
+        "sessions",
+        "bot_id",
+        "TEXT REFERENCES bots(id) ON DELETE SET NULL",
+    )?;
     // compaction_state：持久化压缩视图态（JSON）。避免重启后首次请求 token 爆炸。
     // 阶段二已为 CompactionState 加 serde derive；完整 restore/save 接线作为增强项。
     ensure_column(c, "sessions", "compaction_state", "TEXT")?;
@@ -221,6 +260,15 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
          WHERE completed_at IS NULL AND status LIKE 'awaiting%'",
         [],
     )?;
+    // No worker survives a backend restart. Requeue a claimed Bot job instead of leaving it
+    // permanently invisible; its stable id/revision keeps the resumed attempt auditable.
+    c.execute(
+        "UPDATE bot_jobs SET status='queued', run_id=NULL, claimed_at=NULL, \
+         last_error=COALESCE(last_error, 'App restarted before this job completed'), \
+         revision=revision+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE status='running'",
+        [],
+    )?;
 
     // Legacy databases did not enforce contiguous `(session_id, seq)` values. Preserve
     // their stable `(seq, id)` order and resequence when any session contains a duplicate,
@@ -235,6 +283,11 @@ fn apply_migrations(c: &mut rusqlite::Connection) -> Result<(), rusqlite::Error>
             CREATE INDEX IF NOT EXISTS idx_sessions_discoverable ON sessions(discoverable);
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_bot ON sessions(bot_id);
+            CREATE INDEX IF NOT EXISTS idx_bots_project ON bots(project_id);
+            CREATE INDEX IF NOT EXISTS idx_bots_updated ON bots(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_bot_jobs_session_position ON bot_jobs(session_id, status, position);
+            CREATE INDEX IF NOT EXISTS idx_bot_jobs_bot_status ON bot_jobs(bot_id, status);
             CREATE INDEX IF NOT EXISTS idx_messages_session ON session_messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON session_messages(session_id, seq);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_session_seq ON session_messages(session_id, seq);
@@ -515,6 +568,68 @@ mod tests {
     }
 
     #[test]
+    fn startup_requeues_orphaned_running_bot_jobs() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        apply_migrations(&mut c).unwrap();
+        c.execute(
+            "INSERT INTO bots \
+             (id, name, role, instructions, avatar, color, enabled, revision, created_at, updated_at) \
+             VALUES ('bot-recovery', 'Recovery Bot', 'Executor', '', '🤖', '#4D6BFE', 1, 1, ?1, ?1)",
+            ["2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO sessions \
+             (id, title, workspace, status, bot_id, created_at, updated_at) \
+             VALUES ('bot-recovery-session', 'Bot Chat', '/tmp/bot-recovery', 'processing', \
+                     'bot-recovery', ?1, ?1)",
+            ["2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO bot_jobs \
+             (id, bot_id, session_id, prompt, position, revision, status, run_id, \
+              created_at, updated_at, claimed_at) \
+             VALUES ('bot-recovery-job', 'bot-recovery', 'bot-recovery-session', 'resume me', \
+                     1, 2, 'running', 'run-before-restart', ?1, ?1, ?1)",
+            ["2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        // A backend restart runs migrations again. No worker survives that process boundary,
+        // so an in-flight durable Bot job must become eligible for an explicit retry.
+        apply_migrations(&mut c).unwrap();
+
+        let restored: (String, Option<String>, Option<String>, Option<String>, i64) = c
+            .query_row(
+                "SELECT status, run_id, claimed_at, last_error, revision \
+                 FROM bot_jobs WHERE id='bot-recovery-job'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(restored.0, "queued");
+        assert_eq!(restored.1, None);
+        assert_eq!(restored.2, None);
+        assert_eq!(
+            restored.3.as_deref(),
+            Some("App restarted before this job completed")
+        );
+        assert_eq!(
+            restored.4, 3,
+            "recovery must advance the optimistic revision"
+        );
+    }
+
+    #[test]
     fn migration_repairs_legacy_sequence_gaps_without_duplicates() {
         let mut c = rusqlite::Connection::open_in_memory().unwrap();
         c.execute_batch(
@@ -582,7 +697,7 @@ mod tests {
         ] {
             let count: i64 = c
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1"),
+                    "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1",
                     [column],
                     |row| row.get(0),
                 )

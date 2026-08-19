@@ -28,7 +28,7 @@ impl Tool for DelegateTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "delegate".into(),
-            description: "Delegate a self-contained subtask to a sub-agent (single LLM call). Use for focused subtasks like drafting a section, analyzing data, or generating options. Depth limit: 2 levels.".into(),
+            description: "Delegate a self-contained subtask to a local sub-agent implemented as one configured-LLM call. This tool does not use MCP, the A2A protocol, SendMessage, GetTask, or any remote Agent Card; never report it as an A2A interaction. Use it for focused subtasks like drafting a section, analyzing data, or generating options. Depth limit: 2 levels.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -79,6 +79,22 @@ impl Tool for DelegateTool {
             }
             Err(e) => Ok(ToolOutput::err(format!("delegate LLM call failed: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegate_contract_cannot_be_mistaken_for_remote_a2a() {
+        let spec = DelegateTool.spec();
+        assert!(spec.description.contains("local sub-agent"));
+        assert!(spec.description.contains("does not use MCP"));
+        assert!(spec.description.contains("A2A protocol"));
+        assert!(spec
+            .description
+            .contains("never report it as an A2A interaction"));
     }
 }
 

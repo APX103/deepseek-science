@@ -11,6 +11,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use url::Url;
 use uuid::Uuid;
 
 use crate::state::{AppRuntimeSnapshot, AppState, LlmRuntimeSnapshot};
@@ -39,6 +40,38 @@ fn settings_json_error(rejection: JsonRejection) -> (StatusCode, Json<Value>) {
         "invalid settings request body"
     };
     json_error(status, message)
+}
+
+fn normalized_provider_url(url: &str) -> Option<Url> {
+    let parsed = Url::parse(url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.username() != ""
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn same_provider_authority(left: &str, right: &str) -> bool {
+    let (Some(left), Some(right)) = (
+        normalized_provider_url(left),
+        normalized_provider_url(right),
+    ) else {
+        return false;
+    };
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.path().trim_end_matches('/') == right.path().trim_end_matches('/')
+        && left.query() == right.query()
+}
+
+fn is_literal_loopback_url(url: &Url) -> bool {
+    url.host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
 }
 
 /// A missing optional settings field means "preserve the current layered value". An explicit
@@ -591,6 +624,18 @@ pub async fn save_settings(
                 &format!("provider \"{name}\" base_url must use http:// or https://"),
             ));
         }
+        let parsed_url = normalized_provider_url(base_url).ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("provider \"{name}\" base_url must not contain credentials or fragments"),
+            )
+        })?;
+        if parsed_url.scheme() == "http" && !is_literal_loopback_url(&parsed_url) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("provider \"{name}\" must use HTTPS unless it targets a literal loopback address"),
+            ));
+        }
         let model = provider
             .model
             .as_deref()
@@ -734,7 +779,10 @@ pub async fn save_settings(
             .map(str::to_owned);
         let preserved_key = persisted_providers_before
             .iter()
-            .find(|existing| existing.id == submitted.id)
+            .find(|existing| {
+                existing.id == submitted.id
+                    && same_provider_authority(&existing.base_url, &submitted.base_url)
+            })
             .and_then(|existing| existing.api_key.clone());
         let id = if submitted.id.trim().is_empty() {
             Uuid::new_v4().to_string()
@@ -1957,7 +2005,7 @@ mod tests {
         let Json(saved) = save_settings(
             State(state.clone()),
             Json(payload(
-                "https://preserved.example.invalid",
+                INITIAL_BASE_URL,
                 "preserved-model",
                 Some("   ".into()),
             )),
@@ -1975,6 +2023,53 @@ mod tests {
         )
         .expect("parse settings file");
         assert!(persisted["llm"].get("api_key").is_some());
+    }
+
+    #[tokio::test]
+    async fn changing_provider_authority_clears_omitted_credential() {
+        if rerun_without_llm_env("changing_provider_authority_clears_omitted_credential") {
+            return;
+        }
+
+        let test_dir = TestDir::new("authority-binding");
+        let state = build_test_state(&test_dir, true).await;
+        let Json(saved) = save_settings(
+            State(state.clone()),
+            Json(payload(
+                "https://attacker.example.invalid/v1",
+                "same-model",
+                Some("   ".into()),
+            )),
+        )
+        .await
+        .expect("save changed authority");
+
+        assert!(!state.llm_snapshot().await.is_configured());
+        assert!(saved.providers[0].api_key_masked.is_empty());
+        assert_eq!(
+            state
+                .settings
+                .reload_llm()
+                .expect("reload settings")
+                .api_key,
+            None
+        );
+    }
+
+    #[test]
+    fn provider_authority_comparison_normalizes_only_safe_equivalents() {
+        assert!(same_provider_authority(
+            "https://EXAMPLE.invalid/v1/",
+            "https://example.invalid/v1"
+        ));
+        assert!(!same_provider_authority(
+            "https://example.invalid/v1",
+            "https://example.invalid/v2"
+        ));
+        assert!(!same_provider_authority(
+            "https://example.invalid/v1",
+            "http://example.invalid/v1"
+        ));
     }
 
     #[tokio::test]
@@ -2250,7 +2345,7 @@ mod tests {
             Json(payload(
                 "https://first.example.invalid",
                 "first-model",
-                None,
+                Some("first-credential".into()),
             )),
         );
         let second = save_settings(
@@ -2258,7 +2353,7 @@ mod tests {
             Json(payload(
                 "https://second.example.invalid",
                 "second-model",
-                None,
+                Some("second-credential".into()),
             )),
         );
         let (first_result, second_result) = tokio::join!(first, second);

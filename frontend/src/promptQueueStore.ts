@@ -22,6 +22,7 @@ export interface PromptQueueStore {
   getSnapshot(sid: string): PromptQueueState
   subscribe(sid: string, listener: () => void): () => void
   dispatch(sid: string, action: PromptQueueAction): QueuedPrompt | null
+  replace(sid: string, items: readonly QueuedPrompt[]): void
   enqueue(sid: string, input: EnqueuePromptInput): QueuedPrompt | null
   edit(sid: string, itemId: string, expectedRevision: number, text: string): boolean
   delete(sid: string, itemId: string, expectedRevision: number): boolean
@@ -94,6 +95,15 @@ export function createPromptQueueStore(
       }
     },
     dispatch,
+    replace(sid, items) {
+      if (!validSid(sid)) return
+      const current = getSnapshot(sid)
+      const steering = current.steering && items.some(
+        (item) => item.id === current.steering?.itemId && item.revision === current.steering.revision,
+      ) ? current.steering : null
+      queues.set(sid, { items: [...items], steering })
+      notify(sid)
+    },
     enqueue(sid, input) {
       const item = createQueuedPrompt({
         id: createId(),
@@ -135,6 +145,8 @@ export function usePromptQueue(sid: string): PromptQueueState {
 export const getPromptQueue = (sid: string) => promptQueueStore.getSnapshot(sid)
 export const subscribePromptQueue = (sid: string, listener: () => void) =>
   promptQueueStore.subscribe(sid, listener)
+export const replacePromptQueue = (sid: string, items: readonly QueuedPrompt[]) =>
+  promptQueueStore.replace(sid, items)
 export const enqueuePrompt = (sid: string, input: EnqueuePromptInput) =>
   promptQueueStore.enqueue(sid, input)
 export const editQueuedPrompt = (

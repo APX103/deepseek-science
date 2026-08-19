@@ -36,8 +36,46 @@ pub struct SessionRow {
     pub plan_mode: bool,
     pub status: String,
     pub project_id: Option<String>,
+    pub bot_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BotRow {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub instructions: String,
+    pub avatar: String,
+    pub color: String,
+    pub project_id: Option<String>,
+    pub model: Option<String>,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_effort: Option<String>,
+    pub enabled: bool,
+    pub revision: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BotJobRow {
+    pub id: String,
+    pub bot_id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub requested_plan_mode: bool,
+    pub priority: i64,
+    pub position: i64,
+    pub revision: i64,
+    pub status: String,
+    pub run_id: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub claimed_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 /// 一条持久化消息（content 是 OpenAI 协议形态 JSON 字符串）。
@@ -292,7 +330,7 @@ pub fn get_project_detail(
 ) -> Result<(ProjectRow, Vec<SessionRow>), DbError> {
     let proj = get_project(conn, id)?.ok_or_else(|| DbError::NotFound(format!("project {id}")))?;
     let mut stmt = conn.prepare(
-        "SELECT id, title, workspace, model, plan_mode, status, project_id, created_at, updated_at \
+        "SELECT id, title, workspace, model, plan_mode, status, project_id, bot_id, created_at, updated_at \
          FROM sessions WHERE project_id = ?1 AND discoverable = 1 ORDER BY updated_at DESC",
     )?;
     let sessions = stmt
@@ -314,6 +352,367 @@ fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
     })
 }
 
+// ----------------- bots / durable jobs -----------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_bot(
+    conn: &Connection,
+    name: &str,
+    role: &str,
+    instructions: &str,
+    avatar: &str,
+    color: &str,
+    project_id: Option<&str>,
+    model: Option<&str>,
+) -> Result<BotRow, DbError> {
+    let now = now();
+    let id = format!("bot_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    conn.execute(
+        "INSERT INTO bots \
+         (id, name, role, instructions, avatar, color, project_id, model, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![
+            id,
+            name,
+            role,
+            instructions,
+            avatar,
+            color,
+            project_id,
+            model,
+            now
+        ],
+    )?;
+    get_bot(conn, &id)?.ok_or_else(|| DbError::Other("just-created bot missing".into()))
+}
+
+pub fn get_bot(conn: &Connection, id: &str) -> Result<Option<BotRow>, DbError> {
+    Ok(conn
+        .query_row(
+            "SELECT id, name, role, instructions, avatar, color, project_id, model, \
+             thinking_enabled, thinking_effort, enabled, revision, created_at, updated_at \
+             FROM bots WHERE id = ?1",
+            params![id],
+            row_to_bot,
+        )
+        .optional()?)
+}
+
+pub fn list_bots(conn: &Connection) -> Result<Vec<BotRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, role, instructions, avatar, color, project_id, model, \
+         thinking_enabled, thinking_effort, enabled, revision, created_at, updated_at \
+         FROM bots ORDER BY enabled DESC, updated_at DESC, id ASC",
+    )?;
+    let bots = stmt
+        .query_map([], row_to_bot)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(bots)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_bot(
+    conn: &Connection,
+    id: &str,
+    expected_revision: i64,
+    name: &str,
+    role: &str,
+    instructions: &str,
+    avatar: &str,
+    color: &str,
+    project_id: Option<&str>,
+    model: Option<&str>,
+    thinking_enabled: Option<bool>,
+    thinking_effort: Option<&str>,
+    enabled: bool,
+) -> Result<BotRow, DbError> {
+    let changed = conn.execute(
+        "UPDATE bots SET name=?1, role=?2, instructions=?3, avatar=?4, color=?5, \
+         project_id=?6, model=?7, thinking_enabled=?8, thinking_effort=?9, enabled=?10, \
+         revision=revision+1, updated_at=?11 WHERE id=?12 AND revision=?13",
+        params![
+            name,
+            role,
+            instructions,
+            avatar,
+            color,
+            project_id,
+            model,
+            thinking_enabled.map(i64::from),
+            thinking_effort,
+            i64::from(enabled),
+            now(),
+            id,
+            expected_revision
+        ],
+    )?;
+    if changed == 0 {
+        return if get_bot(conn, id)?.is_some() {
+            Err(DbError::Conflict(format!(
+                "bot {id} revision no longer matches"
+            )))
+        } else {
+            Err(DbError::NotFound(format!("bot {id}")))
+        };
+    }
+    get_bot(conn, id)?.ok_or_else(|| DbError::NotFound(format!("bot {id}")))
+}
+
+pub fn delete_bot(conn: &Connection, id: &str) -> Result<(), DbError> {
+    if conn.execute("DELETE FROM bots WHERE id=?1", params![id])? == 0 {
+        return Err(DbError::NotFound(format!("bot {id}")));
+    }
+    Ok(())
+}
+
+pub fn enqueue_bot_job(
+    conn: &Connection,
+    requested_id: Option<&str>,
+    bot_id: &str,
+    session_id: &str,
+    prompt: &str,
+    requested_plan_mode: bool,
+) -> Result<BotJobRow, DbError> {
+    let tx = conn.unchecked_transaction()?;
+    let belongs: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND bot_id=?2)",
+        params![session_id, bot_id],
+        |row| row.get(0),
+    )?;
+    if !belongs {
+        return Err(DbError::Conflict(
+            "job session must belong to the selected bot".into(),
+        ));
+    }
+    let position: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position), 0) + 1 FROM bot_jobs \
+         WHERE session_id=?1 AND status='queued'",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    let id = requested_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("job_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+    let timestamp = now();
+    tx.execute(
+        "INSERT INTO bot_jobs \
+         (id, bot_id, session_id, prompt, requested_plan_mode, position, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![
+            id,
+            bot_id,
+            session_id,
+            prompt,
+            i64::from(requested_plan_mode),
+            position,
+            timestamp
+        ],
+    )?;
+    tx.commit()?;
+    get_bot_job(conn, &id)?.ok_or_else(|| DbError::Other("just-created bot job missing".into()))
+}
+
+pub fn get_bot_job(conn: &Connection, id: &str) -> Result<Option<BotJobRow>, DbError> {
+    Ok(conn
+        .query_row(
+            "SELECT id, bot_id, session_id, prompt, requested_plan_mode, priority, position, \
+             revision, status, run_id, last_error, created_at, updated_at, claimed_at, completed_at \
+             FROM bot_jobs WHERE id=?1",
+            params![id],
+            row_to_bot_job,
+        )
+        .optional()?)
+}
+
+pub fn list_bot_jobs(conn: &Connection, session_id: &str) -> Result<Vec<BotJobRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, bot_id, session_id, prompt, requested_plan_mode, priority, position, \
+         revision, status, run_id, last_error, created_at, updated_at, claimed_at, completed_at \
+         FROM bot_jobs WHERE session_id=?1 AND status IN ('queued','running','failed') \
+         ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, \
+         priority DESC, position ASC, created_at ASC",
+    )?;
+    let jobs = stmt
+        .query_map(params![session_id], row_to_bot_job)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(jobs)
+}
+
+pub fn edit_bot_job(
+    conn: &Connection,
+    id: &str,
+    expected_revision: i64,
+    prompt: &str,
+    requested_plan_mode: bool,
+) -> Result<BotJobRow, DbError> {
+    let changed = conn.execute(
+        "UPDATE bot_jobs SET prompt=?1, requested_plan_mode=?2, revision=revision+1, updated_at=?3 \
+         WHERE id=?4 AND revision=?5 AND status='queued'",
+        params![prompt, i64::from(requested_plan_mode), now(), id, expected_revision],
+    )?;
+    if changed == 0 {
+        return Err(DbError::Conflict(format!(
+            "bot job {id} is stale or no longer queued"
+        )));
+    }
+    get_bot_job(conn, id)?.ok_or_else(|| DbError::NotFound(format!("bot job {id}")))
+}
+
+pub fn delete_bot_job(conn: &Connection, id: &str, expected_revision: i64) -> Result<(), DbError> {
+    let changed = conn.execute(
+        "DELETE FROM bot_jobs WHERE id=?1 AND revision=?2 AND status IN ('queued','failed')",
+        params![id, expected_revision],
+    )?;
+    if changed == 0 {
+        return Err(DbError::Conflict(format!(
+            "bot job {id} is stale or cannot be deleted"
+        )));
+    }
+    Ok(())
+}
+
+pub fn reorder_bot_jobs(
+    conn: &Connection,
+    session_id: &str,
+    ordered_ids: &[String],
+) -> Result<Vec<BotJobRow>, DbError> {
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(
+        "SELECT id FROM bot_jobs WHERE session_id=?1 AND status='queued' ORDER BY id ASC",
+    )?;
+    let mut existing = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let mut requested = ordered_ids.to_vec();
+    existing.sort();
+    requested.sort();
+    requested.dedup();
+    if existing != requested || requested.len() != ordered_ids.len() {
+        return Err(DbError::Conflict(
+            "reorder must contain every queued job exactly once".into(),
+        ));
+    }
+    let timestamp = now();
+    for (index, id) in ordered_ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE bot_jobs SET position=?1, revision=revision+1, updated_at=?2 \
+             WHERE id=?3 AND session_id=?4 AND status='queued'",
+            params![index as i64 + 1, timestamp, id, session_id],
+        )?;
+    }
+    tx.commit()?;
+    list_bot_jobs(conn, session_id)
+}
+
+pub fn claim_next_bot_job(
+    conn: &Connection,
+    session_id: &str,
+    run_id: &str,
+) -> Result<Option<BotJobRow>, DbError> {
+    let tx = conn.unchecked_transaction()?;
+    let next_id = tx
+        .query_row(
+            "SELECT id FROM bot_jobs WHERE session_id=?1 AND status='queued' \
+             ORDER BY priority DESC, position ASC, created_at ASC LIMIT 1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(id) = next_id else {
+        return Ok(None);
+    };
+    let timestamp = now();
+    tx.execute(
+        "UPDATE bot_jobs SET status='running', run_id=?1, revision=revision+1, \
+         claimed_at=?2, updated_at=?2 WHERE id=?3 AND status='queued'",
+        params![run_id, timestamp, id],
+    )?;
+    tx.commit()?;
+    get_bot_job(conn, &id)
+}
+
+pub fn finish_bot_job(
+    conn: &Connection,
+    id: &str,
+    run_id: &str,
+    succeeded: bool,
+    error: Option<&str>,
+) -> Result<BotJobRow, DbError> {
+    let timestamp = now();
+    let status = if succeeded { "completed" } else { "failed" };
+    let changed = conn.execute(
+        "UPDATE bot_jobs SET status=?1, last_error=?2, revision=revision+1, \
+         completed_at=?3, updated_at=?3 WHERE id=?4 AND run_id=?5 AND status='running'",
+        params![status, error, timestamp, id, run_id],
+    )?;
+    if changed == 0 {
+        return Err(DbError::Conflict(format!(
+            "bot job {id} is not owned by run {run_id}"
+        )));
+    }
+    get_bot_job(conn, id)?.ok_or_else(|| DbError::NotFound(format!("bot job {id}")))
+}
+
+pub fn claim_bot_job(
+    conn: &Connection,
+    id: &str,
+    expected_revision: i64,
+    run_id: &str,
+) -> Result<BotJobRow, DbError> {
+    let timestamp = now();
+    let changed = conn.execute(
+        "UPDATE bot_jobs SET status='running', run_id=?1, revision=revision+1, \
+         claimed_at=?2, updated_at=?2 WHERE id=?3 AND revision=?4 AND status='queued'",
+        params![run_id, timestamp, id, expected_revision],
+    )?;
+    if changed == 0 {
+        return Err(DbError::Conflict(format!(
+            "bot job {id} is stale or no longer queued"
+        )));
+    }
+    get_bot_job(conn, id)?.ok_or_else(|| DbError::NotFound(format!("bot job {id}")))
+}
+
+fn row_to_bot(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
+    Ok(BotRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        role: row.get(2)?,
+        instructions: row.get(3)?,
+        avatar: row.get(4)?,
+        color: row.get(5)?,
+        project_id: row.get(6)?,
+        model: row.get(7)?,
+        thinking_enabled: row.get::<_, Option<i64>>(8)?.map(|value| value != 0),
+        thinking_effort: row.get(9)?,
+        enabled: row.get::<_, i64>(10)? != 0,
+        revision: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn row_to_bot_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotJobRow> {
+    Ok(BotJobRow {
+        id: row.get(0)?,
+        bot_id: row.get(1)?,
+        session_id: row.get(2)?,
+        prompt: row.get(3)?,
+        requested_plan_mode: row.get::<_, i64>(4)? != 0,
+        priority: row.get(5)?,
+        position: row.get(6)?,
+        revision: row.get(7)?,
+        status: row.get(8)?,
+        run_id: row.get(9)?,
+        last_error: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        claimed_at: row.get(13)?,
+        completed_at: row.get(14)?,
+    })
+}
+
 // ----------------- sessions -----------------
 
 pub fn create_session(
@@ -323,12 +722,23 @@ pub fn create_session(
     model: Option<&str>,
     project_id: Option<&str>,
 ) -> Result<SessionRow, DbError> {
+    create_session_for_bot(conn, id, workspace, model, project_id, None)
+}
+
+pub fn create_session_for_bot(
+    conn: &Connection,
+    id: &str,
+    workspace: &str,
+    model: Option<&str>,
+    project_id: Option<&str>,
+    bot_id: Option<&str>,
+) -> Result<SessionRow, DbError> {
     let now = now();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO sessions (id, title, workspace, model, plan_mode, status, project_id, created_at, updated_at) \
-         VALUES (?1, NULL, ?2, ?3, 0, 'active', ?4, ?5, ?5)",
-        params![id, workspace, model, project_id, now],
+        "INSERT INTO sessions (id, title, workspace, model, plan_mode, status, project_id, bot_id, created_at, updated_at) \
+         VALUES (?1, NULL, ?2, ?3, 0, 'active', ?4, ?5, ?6, ?6)",
+        params![id, workspace, model, project_id, bot_id, now],
     )?;
     if let Some(project_id) = project_id {
         let changed = tx.execute(
@@ -346,7 +756,7 @@ pub fn create_session(
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<SessionRow>, DbError> {
     let row = conn
         .query_row(
-            "SELECT id, title, workspace, model, plan_mode, status, project_id, created_at, updated_at \
+            "SELECT id, title, workspace, model, plan_mode, status, project_id, bot_id, created_at, updated_at \
              FROM sessions WHERE id = ?1",
             params![id],
             row_to_session,
@@ -357,7 +767,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<SessionRow>, Db
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRow>, DbError> {
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.title, s.workspace, s.model, s.plan_mode, s.status, s.project_id, s.created_at, s.updated_at \
+        "SELECT s.id, s.title, s.workspace, s.model, s.plan_mode, s.status, s.project_id, s.bot_id, s.created_at, s.updated_at \
          FROM sessions AS s \
          LEFT JOIN projects AS p ON p.id = s.project_id \
          WHERE s.discoverable = 1 \
@@ -525,8 +935,9 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         plan_mode: r.get::<_, i64>(4)? != 0,
         status: r.get(5)?,
         project_id: r.get(6)?,
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
+        bot_id: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
@@ -1561,9 +1972,27 @@ mod tests {
                 status     TEXT NOT NULL DEFAULT 'active',
                 discoverable INTEGER NOT NULL DEFAULT 1,
                 project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                bot_id TEXT REFERENCES bots(id) ON DELETE SET NULL,
                 plan_data  TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE bots (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
+                instructions TEXT NOT NULL DEFAULT '', avatar TEXT NOT NULL DEFAULT '🤖',
+                color TEXT NOT NULL DEFAULT '#4D6BFE', project_id TEXT REFERENCES projects(id),
+                model TEXT, thinking_enabled INTEGER, thinking_effort TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE bot_jobs (
+                id TEXT PRIMARY KEY, bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                prompt TEXT NOT NULL, requested_plan_mode INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'queued',
+                run_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                claimed_at TEXT, completed_at TEXT
             );
             CREATE TABLE session_runs (
                 run_id TEXT PRIMARY KEY,
@@ -2167,6 +2596,116 @@ mod tests {
                 .as_deref(),
             Some("session-rollback")
         );
+    }
+
+    #[test]
+    fn bot_identity_revision_and_session_binding_are_durable() {
+        let conn = test_connection();
+        let bot = create_bot(
+            &conn,
+            "Nova",
+            "Literature scout",
+            "Prefer primary sources.",
+            "🔭",
+            "#4D6BFE",
+            Some(crate::DEFAULT_PROJECT_ID),
+            Some("deepseek-v4-flash"),
+        )
+        .unwrap();
+        let session = create_session_for_bot(
+            &conn,
+            "bot-session",
+            "/workspaces/bot-session",
+            bot.model.as_deref(),
+            bot.project_id.as_deref(),
+            Some(&bot.id),
+        )
+        .unwrap();
+        assert_eq!(session.bot_id.as_deref(), Some(bot.id.as_str()));
+
+        let updated = update_bot(
+            &conn,
+            &bot.id,
+            bot.revision,
+            "Nova",
+            "Principal literature scout",
+            "Prefer primary sources and preserve citations.",
+            "🔭",
+            "#5A67D8",
+            bot.project_id.as_deref(),
+            bot.model.as_deref(),
+            Some(true),
+            Some("high"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(updated.revision, bot.revision + 1);
+        assert!(matches!(
+            update_bot(
+                &conn,
+                &bot.id,
+                bot.revision,
+                "stale",
+                "stale",
+                "",
+                "🤖",
+                "#4D6BFE",
+                None,
+                None,
+                None,
+                None,
+                true,
+            ),
+            Err(DbError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn durable_bot_queue_reorders_claims_and_finishes_exactly_once() {
+        let conn = test_connection();
+        let bot = create_bot(
+            &conn,
+            "Queue Bot",
+            "Executor",
+            "",
+            "⚙️",
+            "#4D6BFE",
+            Some(crate::DEFAULT_PROJECT_ID),
+            None,
+        )
+        .unwrap();
+        create_session_for_bot(
+            &conn,
+            "queue-session",
+            "/workspaces/queue-session",
+            None,
+            Some(crate::DEFAULT_PROJECT_ID),
+            Some(&bot.id),
+        )
+        .unwrap();
+        let first = enqueue_bot_job(&conn, None, &bot.id, "queue-session", "first", false).unwrap();
+        let second =
+            enqueue_bot_job(&conn, None, &bot.id, "queue-session", "second", true).unwrap();
+
+        let reordered = reorder_bot_jobs(
+            &conn,
+            "queue-session",
+            &[second.id.clone(), first.id.clone()],
+        )
+        .unwrap();
+        assert_eq!(reordered[0].id, second.id);
+        let claimed = claim_next_bot_job(&conn, "queue-session", "run-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, second.id);
+        assert_eq!(claimed.status, "running");
+        let completed = finish_bot_job(&conn, &claimed.id, "run-1", true, None).unwrap();
+        assert_eq!(completed.status, "completed");
+        assert!(matches!(
+            finish_bot_job(&conn, &claimed.id, "run-1", true, None),
+            Err(DbError::Conflict(_))
+        ));
+        assert_eq!(list_bot_jobs(&conn, "queue-session").unwrap().len(), 1);
     }
 
     // ---------- logs prune 测试（D-T07） ----------

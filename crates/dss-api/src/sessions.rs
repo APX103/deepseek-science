@@ -32,6 +32,8 @@ pub struct CreateSessionReq {
     model: Option<String>,
     #[serde(default)]
     project_id: Option<String>,
+    #[serde(default)]
+    bot_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +43,7 @@ pub struct CreateSessionResp {
     mcp_tools: Vec<String>,
     model: String,
     workspace: String,
+    bot_id: Option<String>,
 }
 
 fn json_error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -61,6 +64,18 @@ pub async fn create_session(
     body: Option<Json<CreateSessionReq>>,
 ) -> Result<Json<CreateSessionResp>, (StatusCode, Json<Value>)> {
     let req = body.map(|b| b.0).unwrap_or_default();
+    let bot = if let Some(bot_id) = req.bot_id.as_ref() {
+        let bot = dbq::get_bot(&state.db, bot_id.clone())
+            .await
+            .map_err(map_db_err)?
+            .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "bot not found"))?;
+        if !bot.enabled {
+            return Err(json_error(StatusCode::CONFLICT, "bot is disabled"));
+        }
+        Some(bot)
+    } else {
+        None
+    };
     let sid = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
     let workspace = state.settings.data_dir.join("workspaces").join(&sid);
 
@@ -75,20 +90,34 @@ pub async fn create_session(
     let runtime = state.llm_snapshot().await;
     let model = req
         .model
-        .clone()
+        .or_else(|| bot.as_ref().and_then(|bot| bot.model.clone()))
         .unwrap_or_else(|| runtime.settings().model.clone());
     // 落 DB（project_id 缺省 → 不绑定，或后续 default）。
     let project_id = req
         .project_id
+        .or_else(|| bot.as_ref().and_then(|bot| bot.project_id.clone()))
         .or(Some(dss_db::DEFAULT_PROJECT_ID.to_string()));
-    let row = dbq::create_session_row(
-        &state.db,
-        sid.clone(),
-        workspace.display().to_string(),
-        Some(model.clone()),
-        project_id,
-    )
-    .await
+    let bot_id = bot.as_ref().map(|bot| bot.id.clone());
+    let row = if let Some(bot_id) = bot_id.clone() {
+        dbq::create_bot_session_row(
+            &state.db,
+            sid.clone(),
+            workspace.display().to_string(),
+            Some(model.clone()),
+            project_id,
+            bot_id,
+        )
+        .await
+    } else {
+        dbq::create_session_row(
+            &state.db,
+            sid.clone(),
+            workspace.display().to_string(),
+            Some(model.clone()),
+            project_id,
+        )
+        .await
+    }
     .map_err(map_db_err)?;
 
     let session = Session::new(sid.clone(), workspace);
@@ -106,6 +135,7 @@ pub async fn create_session(
         mcp_tools: Vec::new(),
         model: row.model.unwrap_or(model),
         workspace: row.workspace,
+        bot_id: row.bot_id,
     }))
 }
 
@@ -119,6 +149,7 @@ pub struct SessionListItem {
     live: bool,
     status: String,
     project_id: Option<String>,
+    bot_id: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -140,6 +171,7 @@ pub async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionLis
             live: live_ids.contains(&r.id),
             status: r.status,
             project_id: r.project_id,
+            bot_id: r.bot_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         })
@@ -208,6 +240,7 @@ pub async fn get_session(
         "plan_mode": row.plan_mode,
         "plan": plan,
         "project_id": row.project_id,
+        "bot_id": row.bot_id,
         "artifacts": {},
         "messages": messages,
         "runs": runs,
@@ -1098,7 +1131,35 @@ pub async fn stream_sse(
         .await
         .ok()
         .flatten();
+    // A session may pin a Bot-specific model while still sharing the configured provider.
+    let model = session_row
+        .as_ref()
+        .and_then(|row| row.model.clone())
+        .unwrap_or(model);
     let project_id = session_row.as_ref().and_then(|r| r.project_id.clone());
+    let bot_context = if let Some(bot_id) = session_row.as_ref().and_then(|row| row.bot_id.clone())
+    {
+        dbq::get_bot(&state.db, bot_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|bot| {
+                let instructions = bot.instructions.trim();
+                if instructions.is_empty() {
+                    format!(
+                        "[Bot Identity]\nYou are {}. Your role is: {}. Stay consistent with this identity across the conversation.",
+                        bot.name, bot.role
+                    )
+                } else {
+                    format!(
+                        "[Bot Identity]\nName: {}\nRole: {}\nInstructions:\n{}\n\nStay consistent with this identity across the conversation.",
+                        bot.name, bot.role, instructions
+                    )
+                }
+            })
+    } else {
+        None
+    };
     let set_initial_title = session_row.as_ref().is_some_and(|r| r.title.is_none());
     let project_context = if let Some(pid) = project_id.clone() {
         dbq::get_project(&state.db, pid)
@@ -1119,6 +1180,11 @@ pub async fn stream_sse(
         // are passed separately so rolling-compaction indexes always refer to
         // the canonical, append-only conversation history.
         let mut run_context = Vec::new();
+        if let Some(context) = bot_context.as_deref() {
+            let mut message = ChatMessage::system(context);
+            message.harness_notice = true;
+            run_context.push(message);
+        }
         if let Some(context) = project_context.as_deref() {
             let mut message = ChatMessage::system(format!("[Project Context]\n{context}"));
             message.harness_notice = true;
@@ -1486,6 +1552,7 @@ pub async fn stream_sse(
                 let logs_c = state.logs.clone();
                 let seq_lo = checkpoint_start_seq.unwrap_or(1).max(1);
                 let seq_hi = seq_lo + msgs_snapshot.len() as i64;
+                let memory_settings = state.settings.memory.clone();
                 tokio::spawn(async move {
                     match dss_memory::extract::extract(client_c.as_ref(), &model_c, &msgs_snapshot)
                         .await
@@ -1498,7 +1565,11 @@ pub async fn stream_sse(
                                 seq_start: seq_lo,
                                 seq_end: seq_hi,
                             }];
-                            let cfg = dss_memory::consolidate::ConsolidateConfig::default();
+                            let cfg = dss_memory::consolidate::ConsolidateConfig {
+                                auto_promote_threshold: memory_settings.auto_promote_threshold,
+                                dedupe_similarity: memory_settings.dedupe_similarity,
+                                trust_high_risk_approve: memory_settings.trust_high_risk_approve,
+                            };
                             let stats = dss_memory::consolidate::promote_candidates(
                                 &memory_c, items, pid_c, &evidence, &cfg,
                             )

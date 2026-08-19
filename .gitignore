@@ -37,6 +37,8 @@ venv/
 /trace/
 *.log
 /outputs/
+/output/
+/tmp/
 /.agent-log/
 
 # 测试覆盖率 / profiling 产物

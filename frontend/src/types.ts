@@ -240,6 +240,42 @@ export interface ProjectDetail extends Project {
   sessions: SessionSummary[]
 }
 
+// ---------- Bot Mode ----------
+export interface Bot {
+  id: string
+  name: string
+  role: string
+  instructions: string
+  avatar: string
+  color: string
+  project_id: string | null
+  model: string | null
+  thinking_enabled: boolean | null
+  thinking_effort: ThinkingEffort | null
+  enabled: boolean
+  revision: number
+  created_at: string
+  updated_at: string
+}
+
+export interface BotJob {
+  id: string
+  bot_id: string
+  session_id: string
+  prompt: string
+  requested_plan_mode: boolean
+  priority: number
+  position: number
+  revision: number
+  status: 'queued' | 'running' | 'failed' | 'completed'
+  run_id: string | null
+  last_error: string | null
+  created_at: string
+  updated_at: string
+  claimed_at: string | null
+  completed_at: string | null
+}
+
 // ---------- Sessions ----------
 export type SessionStatus = 'processing' | 'completed' | 'failed' | 'interrupted' | 'awaiting'
 
@@ -249,6 +285,7 @@ export interface SessionSummary {
   title: string
   status: SessionStatus
   live: boolean
+  bot_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -335,6 +372,7 @@ export interface SessionState {
   artifacts: Record<string, Artifact>
   messages: Message[]
   runs: SessionRun[]
+  bot_id?: string | null
 }
 
 // ---------- Files ----------

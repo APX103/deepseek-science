@@ -5,6 +5,7 @@ import { useSyncExternalStore } from 'react'
 import type {
   Artifact,
   AwaitingKind,
+  Bot,
   ContentBlock,
   Message,
   PendingAsk,
@@ -32,6 +33,7 @@ import {
 
 interface State {
   projects: Project[]
+  bots: Bot[]
   sessions: SessionSummary[]
   messages: Record<string, Message[]>
   /** GET /sessions/{sid} 恢复的 frame / plan / artifacts 等完整状态。 */
@@ -44,7 +46,7 @@ const EMPTY_MESSAGES: Message[] = []
 const sessionLoadGuard = new AsyncVersionGuard()
 
 function emptyState(): State {
-  return { projects: [], sessions: [], messages: {}, sessionStates: {}, backendOnline: false }
+  return { projects: [], bots: [], sessions: [], messages: {}, sessionStates: {}, backendOnline: false }
 }
 
 let state: State = emptyState()
@@ -59,7 +61,11 @@ function setState(next: State) {
 /** 从后端拉取 projects + sessions，回填 store。后端离线则置空 + backendOnline=false。 */
 export async function loadFromBackend(): Promise<void> {
   try {
-    const [projects, sessions] = await Promise.all([api.listProjects(), api.listSessions()])
+    const [projects, bots, sessions] = await Promise.all([
+      api.listProjects(),
+      api.listBots(),
+      api.listSessions(),
+    ])
     const sessionCounts = new Map<string, number>()
     for (const session of sessions) {
       sessionCounts.set(session.project_id, (sessionCounts.get(session.project_id) ?? 0) + 1)
@@ -68,9 +74,9 @@ export async function loadFromBackend(): Promise<void> {
       ...project,
       session_count: sessionCounts.get(project.id) ?? 0,
     }))
-    setState({ ...state, projects: projectsWithCounts, sessions, backendOnline: true })
+    setState({ ...state, projects: projectsWithCounts, bots, sessions, backendOnline: true })
   } catch {
-    setState({ ...state, projects: [], sessions: [], backendOnline: false })
+    setState({ ...state, projects: [], bots: [], sessions: [], backendOnline: false })
   }
 }
 
@@ -111,6 +117,10 @@ function subscribe(l: () => void) {
 // ---------- hooks ----------
 export function useProjects(): Project[] {
   return useSyncExternalStore(subscribe, () => state.projects)
+}
+
+export function useBots(): Bot[] {
+  return useSyncExternalStore(subscribe, () => state.bots)
 }
 
 export function useSessions(): SessionSummary[] {
@@ -158,9 +168,22 @@ export function removeProject(pid: string) {
   setState({ ...state, projects: state.projects.filter((p) => p.id !== pid) })
 }
 
+// ---------- bots ----------
+export function addBot(bot: Bot) {
+  setState({ ...state, bots: [bot, ...state.bots] })
+}
+
+export function replaceBot(bot: Bot) {
+  setState({ ...state, bots: state.bots.map((candidate) => candidate.id === bot.id ? bot : candidate) })
+}
+
+export function removeBot(botId: string) {
+  setState({ ...state, bots: state.bots.filter((bot) => bot.id !== botId) })
+}
+
 // ---------- sessions ----------
 /** 用后端已创建的真实 sid 加入本地列表；绝不生成前端伪 sid。 */
-export function createSession(projectId: string, opts: { id: string }): SessionSummary {
+export function createSession(projectId: string, opts: { id: string; botId?: string | null }): SessionSummary {
   const now = new Date().toISOString()
   const s: SessionSummary = {
     id: opts.id,
@@ -168,6 +191,7 @@ export function createSession(projectId: string, opts: { id: string }): SessionS
     title: 'New session',
     status: 'awaiting',
     live: true,
+    bot_id: opts.botId ?? null,
     created_at: now,
     updated_at: now,
   }

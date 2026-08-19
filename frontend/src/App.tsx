@@ -3,6 +3,7 @@ import { Route, Routes } from 'react-router-dom'
 import HomePage from './pages/HomePage'
 import WorkbenchPage from './pages/WorkbenchPage'
 import LogsPage from './pages/LogsPage'
+import BotsPage from './pages/BotsPage'
 import CommandPalette from './components/CommandPalette'
 import SettingsModal from './components/SettingsModal'
 import { probeBackend } from './api/client'
@@ -76,6 +77,7 @@ export default function App(): ReactNode {
         <Route path="/" element={<HomePage />} />
         <Route path="/p/:pid/s/:sid" element={<WorkbenchPage />} />
         <Route path="/logs" element={<LogsPage />} />
+        <Route path="/bots" element={<BotsPage />} />
       </Routes>
       {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}

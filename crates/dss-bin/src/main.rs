@@ -42,6 +42,8 @@ async fn main() -> Result<()> {
                 settings.server.port = port;
             }
 
+            require_auth_for_non_loopback(&settings.server.host)?;
+
             init_tracing(settings.log_level.as_deref());
 
             dss_core::paths::ensure_data_dir(&settings.data_dir, settings.data_dir_is_default)
@@ -76,6 +78,31 @@ async fn main() -> Result<()> {
         }
         Commands::LlmOnce => run_llm_once().await,
     }
+}
+
+fn require_auth_for_non_loopback(host: &str) -> Result<()> {
+    let token_present = std::env::var("DSS_API_TOKEN")
+        .ok()
+        .is_some_and(|token| !token.trim().is_empty());
+    require_auth_for_non_loopback_with_token(host, token_present)
+}
+
+fn require_auth_for_non_loopback_with_token(host: &str, token_present: bool) -> Result<()> {
+    let normalized = host.trim();
+    let address_text = normalized
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(normalized);
+    let loopback = normalized.eq_ignore_ascii_case("localhost")
+        || address_text
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !loopback && !token_present {
+        anyhow::bail!(
+            "refusing non-loopback API host {normalized:?} without DSS_API_TOKEN; use a loopback host or configure authentication"
+        );
+    }
+    Ok(())
 }
 
 /// Execute one deliberately tool-free model request for the isolated A2A interoperability
@@ -304,9 +331,9 @@ fn init_tracing(config_level: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_llm_once_client, execute_llm_once, llm_once_output_json, read_bounded_prompt, Cli,
-        LLM_ONCE_FALLBACK_MAX_OUTPUT_TOKENS, LLM_ONCE_MAX_PROMPT_BYTES,
-        LLM_ONCE_PRIMARY_MAX_OUTPUT_TOKENS,
+        build_llm_once_client, execute_llm_once, llm_once_output_json, read_bounded_prompt,
+        require_auth_for_non_loopback_with_token, Cli, LLM_ONCE_FALLBACK_MAX_OUTPUT_TOKENS,
+        LLM_ONCE_MAX_PROMPT_BYTES, LLM_ONCE_PRIMARY_MAX_OUTPUT_TOKENS,
     };
     use clap::{CommandFactory, Parser};
     use dss_llm::{
@@ -316,6 +343,20 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
+
+    #[test]
+    fn non_loopback_host_requires_a_nonempty_token() {
+        assert!(require_auth_for_non_loopback_with_token("0.0.0.0", false).is_err());
+        assert!(require_auth_for_non_loopback_with_token("192.0.2.10", false).is_err());
+        assert!(require_auth_for_non_loopback_with_token("0.0.0.0", true).is_ok());
+    }
+
+    #[test]
+    fn loopback_hosts_remain_valid_without_a_token() {
+        assert!(require_auth_for_non_loopback_with_token("127.0.0.1", false).is_ok());
+        assert!(require_auth_for_non_loopback_with_token("[::1]", false).is_ok());
+        assert!(require_auth_for_non_loopback_with_token("localhost", false).is_ok());
+    }
 
     #[derive(Debug)]
     struct ScriptedLlm {

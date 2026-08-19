@@ -32,13 +32,16 @@ fn generate_api_token() -> String {
 }
 
 /// 找一个可用端口：优先 DEFAULT_PORT，被占则递增。
-fn find_free_port(start: u16) -> u16 {
-    for port in start..start + 100 {
+fn find_free_port(start: u16) -> Result<u16, String> {
+    let end = start
+        .checked_add(100)
+        .ok_or_else(|| format!("port probe range overflows from {start}"))?;
+    for port in start..end {
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+            return Ok(port);
         }
     }
-    start
+    Err(format!("no free loopback port in {start}..{}", end - 1))
 }
 
 /// 后端数据目录：与后端约定一致 `~/.deepseek-science`。
@@ -346,34 +349,41 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let port = find_free_port(DEFAULT_PORT);
+            let (port, port_error) = match find_free_port(DEFAULT_PORT) {
+                Ok(port) => (port, None),
+                Err(error) => (DEFAULT_PORT, Some(error)),
+            };
             let api_token = generate_api_token();
             let data_dir_override = data_dir_override();
             let log_path = backend_log_path(app.handle());
             let mut child = None;
 
-            let startup_error = match backend_binary_path(app.handle()) {
-                Ok(binary) => {
-                    eprintln!(
-                        "[dss-tauri] starting backend: {} on port {port}",
-                        binary.display()
-                    );
-                    match spawn_backend(
-                        port,
-                        &binary,
-                        open_backend_log(&log_path),
-                        &api_token,
-                        data_dir_override.as_deref(),
-                    ) {
-                        Ok(mut spawned) => {
-                            let readiness = wait_for_backend(&mut spawned, port);
-                            child = Some(spawned);
-                            readiness.err()
+            let startup_error = if let Some(error) = port_error {
+                Some(error)
+            } else {
+                match backend_binary_path(app.handle()) {
+                    Ok(binary) => {
+                        eprintln!(
+                            "[dss-tauri] starting backend: {} on port {port}",
+                            binary.display()
+                        );
+                        match spawn_backend(
+                            port,
+                            &binary,
+                            open_backend_log(&log_path),
+                            &api_token,
+                            data_dir_override.as_deref(),
+                        ) {
+                            Ok(mut spawned) => {
+                                let readiness = wait_for_backend(&mut spawned, port);
+                                child = Some(spawned);
+                                readiness.err()
+                            }
+                            Err(error) => Some(error),
                         }
-                        Err(error) => Some(error),
                     }
+                    Err(error) => Some(error),
                 }
-                Err(error) => Some(error),
             }
             .map(|error| format!("{error}\nBackend log: {}", log_path.display()));
 
@@ -505,6 +515,11 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn exhausted_port_probe_fails_closed_instead_of_reusing_start() {
+        assert!(find_free_port(u16::MAX).is_err());
     }
 
     #[test]

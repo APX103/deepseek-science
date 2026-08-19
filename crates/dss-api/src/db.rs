@@ -3,7 +3,7 @@
 
 use dss_db::{
     repo,
-    repo::{MessageRow, ProjectRow, RunRow, SessionRow},
+    repo::{BotJobRow, BotRow, MessageRow, ProjectRow, RunRow, SessionRow},
     DbError, DbPool,
 };
 
@@ -12,7 +12,7 @@ pub use dss_db::repo::{
 };
 
 /// 取连接并跑一个拿 &Connection 的闭包；interact 内部 spawn_blocking。
-async fn with_conn<F, T>(pool: &DbPool, f: F) -> Result<T, DbError>
+pub(crate) async fn with_conn<F, T>(pool: &DbPool, f: F) -> Result<T, DbError>
 where
     F: FnOnce(&rusqlite::Connection) -> Result<T, DbError> + Send + 'static,
     T: Send + 'static,
@@ -21,6 +21,178 @@ where
     conn.interact(move |c| f(c))
         .await
         .map_err(|e| DbError::Other(format!("db interact: {e:?}")))?
+}
+
+// ---------------- bots / durable jobs ----------------
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_bot(
+    pool: &DbPool,
+    name: String,
+    role: String,
+    instructions: String,
+    avatar: String,
+    color: String,
+    project_id: Option<String>,
+    model: Option<String>,
+) -> Result<BotRow, DbError> {
+    with_conn(pool, move |conn| {
+        repo::create_bot(
+            conn,
+            &name,
+            &role,
+            &instructions,
+            &avatar,
+            &color,
+            project_id.as_deref(),
+            model.as_deref(),
+        )
+    })
+    .await
+}
+
+pub async fn list_bots(pool: &DbPool) -> Result<Vec<BotRow>, DbError> {
+    with_conn(pool, repo::list_bots).await
+}
+
+pub async fn get_bot(pool: &DbPool, id: String) -> Result<Option<BotRow>, DbError> {
+    with_conn(pool, move |conn| repo::get_bot(conn, &id)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_bot(
+    pool: &DbPool,
+    id: String,
+    expected_revision: i64,
+    name: String,
+    role: String,
+    instructions: String,
+    avatar: String,
+    color: String,
+    project_id: Option<String>,
+    model: Option<String>,
+    thinking_enabled: Option<bool>,
+    thinking_effort: Option<String>,
+    enabled: bool,
+) -> Result<BotRow, DbError> {
+    with_conn(pool, move |conn| {
+        repo::update_bot(
+            conn,
+            &id,
+            expected_revision,
+            &name,
+            &role,
+            &instructions,
+            &avatar,
+            &color,
+            project_id.as_deref(),
+            model.as_deref(),
+            thinking_enabled,
+            thinking_effort.as_deref(),
+            enabled,
+        )
+    })
+    .await
+}
+
+pub async fn delete_bot(pool: &DbPool, id: String) -> Result<(), DbError> {
+    with_conn(pool, move |conn| repo::delete_bot(conn, &id)).await
+}
+
+pub async fn enqueue_bot_job(
+    pool: &DbPool,
+    requested_id: Option<String>,
+    bot_id: String,
+    session_id: String,
+    prompt: String,
+    requested_plan_mode: bool,
+) -> Result<BotJobRow, DbError> {
+    with_conn(pool, move |conn| {
+        repo::enqueue_bot_job(
+            conn,
+            requested_id.as_deref(),
+            &bot_id,
+            &session_id,
+            &prompt,
+            requested_plan_mode,
+        )
+    })
+    .await
+}
+
+pub async fn list_bot_jobs(pool: &DbPool, session_id: String) -> Result<Vec<BotJobRow>, DbError> {
+    with_conn(pool, move |conn| repo::list_bot_jobs(conn, &session_id)).await
+}
+
+pub async fn edit_bot_job(
+    pool: &DbPool,
+    id: String,
+    expected_revision: i64,
+    prompt: String,
+    requested_plan_mode: bool,
+) -> Result<BotJobRow, DbError> {
+    with_conn(pool, move |conn| {
+        repo::edit_bot_job(conn, &id, expected_revision, &prompt, requested_plan_mode)
+    })
+    .await
+}
+
+pub async fn delete_bot_job(
+    pool: &DbPool,
+    id: String,
+    expected_revision: i64,
+) -> Result<(), DbError> {
+    with_conn(pool, move |conn| {
+        repo::delete_bot_job(conn, &id, expected_revision)
+    })
+    .await
+}
+
+pub async fn reorder_bot_jobs(
+    pool: &DbPool,
+    session_id: String,
+    ordered_ids: Vec<String>,
+) -> Result<Vec<BotJobRow>, DbError> {
+    with_conn(pool, move |conn| {
+        repo::reorder_bot_jobs(conn, &session_id, &ordered_ids)
+    })
+    .await
+}
+
+pub async fn claim_next_bot_job(
+    pool: &DbPool,
+    session_id: String,
+    run_id: String,
+) -> Result<Option<BotJobRow>, DbError> {
+    with_conn(pool, move |conn| {
+        repo::claim_next_bot_job(conn, &session_id, &run_id)
+    })
+    .await
+}
+
+pub async fn finish_bot_job(
+    pool: &DbPool,
+    id: String,
+    run_id: String,
+    succeeded: bool,
+    error: Option<String>,
+) -> Result<BotJobRow, DbError> {
+    with_conn(pool, move |conn| {
+        repo::finish_bot_job(conn, &id, &run_id, succeeded, error.as_deref())
+    })
+    .await
+}
+
+pub async fn claim_bot_job(
+    pool: &DbPool,
+    id: String,
+    expected_revision: i64,
+    run_id: String,
+) -> Result<BotJobRow, DbError> {
+    with_conn(pool, move |conn| {
+        repo::claim_bot_job(conn, &id, expected_revision, &run_id)
+    })
+    .await
 }
 
 // ---------------- projects ----------------
@@ -103,6 +275,27 @@ pub async fn create_session_row(
 ) -> Result<SessionRow, DbError> {
     with_conn(pool, move |c| {
         repo::create_session(c, &id, &workspace, model.as_deref(), project_id.as_deref())
+    })
+    .await
+}
+
+pub async fn create_bot_session_row(
+    pool: &DbPool,
+    id: String,
+    workspace: String,
+    model: Option<String>,
+    project_id: Option<String>,
+    bot_id: String,
+) -> Result<SessionRow, DbError> {
+    with_conn(pool, move |c| {
+        repo::create_session_for_bot(
+            c,
+            &id,
+            &workspace,
+            model.as_deref(),
+            project_id.as_deref(),
+            Some(&bot_id),
+        )
     })
     .await
 }

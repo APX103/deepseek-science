@@ -2,10 +2,11 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { createSessionApi } from '../../api/client'
-import { createSession, useProjects, useSessions } from '../../store'
+import { createSession, useBots, useProjects, useSessions } from '../../store'
 import { useApp } from '../../App'
 import {
   IconCpu,
+  IconBot,
   IconFile,
   IconMoon,
   IconPlus,
@@ -28,6 +29,7 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
   const navigate = useNavigate()
   const allSessions = useSessions()
   const projects = useProjects()
+  const bots = useBots()
   const project = projects.find((p) => p.id === pid) ?? projects[0]
   const sessions = allSessions.filter((s) => s.project_id === project?.id)
   const [creating, setCreating] = useState(false)
@@ -74,6 +76,7 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
           disabled={!backend.online || creating}
         />
         <NavBtn icon={<IconSearch width={14} height={14} />} label="Search" onClick={openCommandPalette} />
+        <NavBtn icon={<IconBot width={14} height={14} />} label="Bots" onClick={() => navigate('/bots')} />
         <NavBtn icon={<IconSliders width={14} height={14} />} label="Customize" onClick={onOpenSkills} />
         <NavBtn icon={<IconFile width={14} height={14} />} label="Files" onClick={onOpenFiles} />
         <NavBtn icon={<IconCpu width={14} height={14} />} label="Compute（尚未开放）" disabled />
@@ -94,7 +97,7 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
               s.id === sid ? 'bg-brandSoft font-medium text-brand' : 'text-ink2 hover:bg-surface2 hover:text-ink'
             }`}
           >
-            {s.title}
+            {s.bot_id ? `${bots.find((bot) => bot.id === s.bot_id)?.avatar ?? '🤖'} ${s.title}` : s.title}
           </Link>
         ))}
       </div>

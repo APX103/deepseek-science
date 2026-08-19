@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "dss-a2a"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "dss-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dss-compact",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "dss-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "chrono",
@@ -450,12 +450,13 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "dss-bin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -472,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "dss-compact"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dss-core",
@@ -486,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "dss-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -499,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "dss-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "deadpool",
@@ -516,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "dss-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -532,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "dss-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -549,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "dss-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dss-core",
@@ -567,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "dss-observability"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dss-core",
  "dss-db",
@@ -580,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "dss-skills"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dss-core",
  "include_dir",
@@ -592,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "dss-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -614,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "dss-verify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dss-core",

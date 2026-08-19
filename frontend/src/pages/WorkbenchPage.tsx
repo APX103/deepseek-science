@@ -4,10 +4,17 @@ import { useParams } from 'react-router-dom'
 import type { Artifact, WorkspaceFile } from '../types'
 import {
   approvePlan,
+  claimBotJob,
   cancelSessionRun,
   connectSSE,
   deleteFile,
+  deleteBotJob,
+  editBotJob,
+  enqueueBotJob,
+  finishBotJob,
+  listBotJobs,
   listFiles,
+  reorderBotJobs,
   workspaceFileToArtifact,
 } from '../api/client'
 import {
@@ -32,6 +39,7 @@ import {
   loadMessages,
   retireStreamAfterBackendFinish,
   useProjects,
+  useBots,
   sendUserMessage,
   setStreamAborter,
   setStreamPlan,
@@ -52,6 +60,7 @@ import {
   enqueuePrompt,
   getPromptQueue,
   reorderQueuedPrompt,
+  replacePromptQueue,
   usePromptQueue,
 } from '../promptQueueStore'
 import type { QueuedPrompt } from '../api/promptQueue'
@@ -151,7 +160,9 @@ export default function WorkbenchPage() {
   // 会话消息（store 驱动；新会话为空态）
   const session = useSession(sid)
   const projects = useProjects()
+  const bots = useBots()
   const projectName = projects.find((p) => p.id === pid)?.name ?? ''
+  const bot = session?.bot_id ? bots.find((candidate) => candidate.id === session.bot_id) : undefined
   const sessionState = useSessionState(sid)
   const messages = useMessages(sid)
   const stream = useStream(sid)
@@ -191,6 +202,29 @@ export default function WorkbenchPage() {
     [refreshFilesForSession, sid],
   )
 
+  const refreshDurableQueue = useCallback(async (targetSid: string) => {
+    try {
+      const jobs = await listBotJobs(targetSid)
+      replacePromptQueue(
+        targetSid,
+        jobs
+          .filter((job) => job.status === 'queued')
+          .map((job) => ({
+            id: job.id,
+            revision: job.revision,
+            text: job.prompt,
+            createdAt: job.created_at,
+            requestedPlanMode: job.requested_plan_mode,
+          })),
+      )
+    } catch (reason) {
+      updateQueueError(
+        targetSid,
+        `恢复 Bot 队列失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      )
+    }
+  }, [])
+
   const artifacts = useMemo<Artifact[]>(
     () => files.map(workspaceFileToArtifact),
     [files],
@@ -214,6 +248,10 @@ export default function WorkbenchPage() {
     }
   }, [sid, refreshFiles])
 
+  useEffect(() => {
+    if (sid && session?.bot_id) void refreshDurableQueue(sid)
+  }, [sid, session?.bot_id, refreshDurableQueue])
+
   function resolveComposerIntent(targetSid: string, requestedPlanMode: boolean) {
     const live = getStreamSnapshot(targetSid)
     const restored = getSessionStateSnapshot(targetSid)
@@ -228,6 +266,7 @@ export default function WorkbenchPage() {
     requestedPlanMode: boolean,
     executePlanOverride?: boolean,
     lease?: PromptRunLease,
+    durableJob?: QueuedPrompt,
   ): boolean {
     const prompt = text.trim()
     const ownsGate = !!lease && promptRunGate.isCurrent(lease)
@@ -244,6 +283,15 @@ export default function WorkbenchPage() {
     updatePlanError(targetSid, null)
     sendUserMessage(targetSid, prompt)
     const runId = startStream(targetSid, intent.executePlan, intent.planMode)
+    const durableClaim = durableJob && bot
+      ? claimBotJob(durableJob.id, durableJob.revision, runId)
+      : null
+    durableClaim?.catch((reason) => {
+      updateQueueError(
+        targetSid,
+        `Bot 任务领取未确认：${reason instanceof Error ? reason.message : String(reason)}`,
+      )
+    })
     const abort = connectSSE(targetSid, prompt, {
       onStart: (frameId, taskSummary) =>
         setStreamStart(targetSid, frameId, taskSummary, runId),
@@ -274,6 +322,17 @@ export default function WorkbenchPage() {
           runId,
         )
         if (accepted) {
+          if (durableJob && durableClaim) {
+            void durableClaim
+              .then(() => finishBotJob(
+                durableJob.id,
+                runId,
+                e.kind === 'natural' || e.kind === 'awaiting',
+                e.error ?? null,
+              ))
+              .then(() => refreshDurableQueue(targetSid))
+              .catch(() => refreshDurableQueue(targetSid))
+          }
           void refreshFilesForSession(targetSid)
           void restoreAndMaybeDrainPromptQueue(
             targetSid,
@@ -294,6 +353,12 @@ export default function WorkbenchPage() {
         }
       },
       onError: (m) => {
+        if (durableJob && durableClaim) {
+          void durableClaim
+            .then(() => finishBotJob(durableJob.id, runId, false, m))
+            .then(() => refreshDurableQueue(targetSid))
+            .catch(() => refreshDurableQueue(targetSid))
+        }
         if (failStream(targetSid, m, runId)) {
           void refreshFilesForSession(targetSid)
           // A transport failure is not proof that the backend session mutex is
@@ -307,7 +372,7 @@ export default function WorkbenchPage() {
   }
 
   function launchQueuedPrompt(targetSid: string, prompt: QueuedPrompt): boolean {
-    return launchSessionRun(targetSid, prompt.text, prompt.requestedPlanMode)
+    return launchSessionRun(targetSid, prompt.text, prompt.requestedPlanMode, undefined, undefined, prompt)
   }
 
   function claimAndLaunchNext(
@@ -323,6 +388,7 @@ export default function WorkbenchPage() {
       prompt.requestedPlanMode,
       undefined,
       lease,
+      prompt,
     ) ? prompt : null
   }
 
@@ -341,6 +407,7 @@ export default function WorkbenchPage() {
       prompt.requestedPlanMode,
       undefined,
       lease,
+      prompt,
     ) ? prompt : null
   }
 
@@ -393,6 +460,20 @@ export default function WorkbenchPage() {
       const queued = enqueuePrompt(sid, { text, requestedPlanMode: planMode })
       if (queued) {
         updateQueueError(sid, null)
+        if (bot) {
+          void enqueueBotJob(sid, {
+            id: queued.id,
+            bot_id: bot.id,
+            prompt: queued.text,
+            plan_mode: queued.requestedPlanMode,
+          }).catch((reason) => {
+            deleteQueuedPrompt(sid, queued.id, queued.revision)
+            updateQueueError(
+              sid,
+              `保存 Bot 队列失败：${reason instanceof Error ? reason.message : String(reason)}`,
+            )
+          })
+        }
         if (!live?.running) {
           // If a terminal restore currently owns this idle session, record the
           // explicit resume intent. Its lease will claim FIFO after the GET;
@@ -533,23 +614,44 @@ export default function WorkbenchPage() {
         onExecutePlan={handleExecutePlan}
         onQueueReorder={(itemId, targetId) => {
           const changed = reorderQueuedPrompt(sid, itemId, targetId)
-          if (changed) updateQueueError(sid, null)
+          if (changed) {
+            updateQueueError(sid, null)
+            if (bot) {
+              const orderedIds = getPromptQueue(sid).items.map((item) => item.id)
+              void reorderBotJobs(sid, orderedIds)
+                .then((jobs) => replacePromptQueue(sid, jobs.filter((job) => job.status === 'queued').map((job) => ({
+                  id: job.id,
+                  revision: job.revision,
+                  text: job.prompt,
+                  createdAt: job.created_at,
+                  requestedPlanMode: job.requested_plan_mode,
+                }))))
+                .catch(() => refreshDurableQueue(sid))
+            }
+          }
           return changed
         }}
         onQueueEdit={(itemId, revision, text) => {
           const changed = editQueuedPrompt(sid, itemId, revision, text)
-          if (changed) updateQueueError(sid, null)
+          if (changed) {
+            updateQueueError(sid, null)
+            if (bot) void editBotJob(itemId, { revision, prompt: text, plan_mode: getPromptQueue(sid).items.find((item) => item.id === itemId)?.requestedPlanMode ?? false })
+              .catch(() => refreshDurableQueue(sid))
+          }
           return changed
         }}
         onQueueDelete={(itemId, revision) => {
           const changed = deleteQueuedPrompt(sid, itemId, revision)
-          if (changed) updateQueueError(sid, null)
+          if (changed) {
+            updateQueueError(sid, null)
+            if (bot) void deleteBotJob(itemId, revision).catch(() => refreshDurableQueue(sid))
+          }
           return changed
         }}
         onQueueActivate={handleQueueActivate}
         onSend={handleComposerSend}
         onStop={() => void handleStop()}
-        title={projectName}
+        title={bot ? `${bot.avatar} ${bot.name}` : projectName}
         leftCollapsed={leftCollapsed}
         rightCollapsed={rightCollapsed}
         onToggleLeft={() => setLeftCollapsed((v) => !v)}

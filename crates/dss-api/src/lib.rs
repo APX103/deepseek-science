@@ -1,5 +1,6 @@
 //! dss-api: axum HTTP 路由与服务启动。
 
+pub mod bots;
 pub mod db;
 pub mod logs;
 pub mod mcp_endpoints;
@@ -142,7 +143,9 @@ struct HealthResponse {
 }
 
 async fn health() -> Json<HealthResponse> {
-    tracing::info!("GET /api/health");
+    // Readiness probes can be issued frequently by the desktop shell. Keep successful
+    // probes out of the default info log so a local client cannot fill backend.log cheaply.
+    tracing::debug!("GET /api/health");
     Json(HealthResponse {
         status: "ok",
         version: VERSION,
@@ -236,6 +239,36 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/sessions/{sid}/files/{*path}",
             get(workspace_files::read_file).delete(workspace_files::delete_file),
+        )
+        // Bot Mode: durable identities and restart-safe work queues.
+        .route("/api/bots", get(bots::list_bots).post(bots::create_bot))
+        .route(
+            "/api/bots/{bid}",
+            axum::routing::patch(bots::update_bot).delete(bots::delete_bot),
+        )
+        .route(
+            "/api/sessions/{sid}/bot-jobs",
+            get(bots::list_jobs).post(bots::enqueue_job),
+        )
+        .route(
+            "/api/sessions/{sid}/bot-jobs/reorder",
+            axum::routing::post(bots::reorder_jobs),
+        )
+        .route(
+            "/api/sessions/{sid}/bot-jobs/claim",
+            axum::routing::post(bots::claim_job),
+        )
+        .route(
+            "/api/bot-jobs/{jid}",
+            axum::routing::patch(bots::edit_job).delete(bots::delete_job),
+        )
+        .route(
+            "/api/bot-jobs/{jid}/finish",
+            axum::routing::post(bots::finish_job),
+        )
+        .route(
+            "/api/bot-jobs/{jid}/claim",
+            axum::routing::post(bots::claim_selected_job),
         )
         // projects
         .route(

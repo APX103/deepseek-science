@@ -73,7 +73,14 @@ pub fn decide(candidate: &Candidate, existing: &[MemoryRow], cfg: &ConsolidateCo
         }
     }
 
-    // 2. BM25 近似重复 → 找最相似的 active claim
+    // 2. 高风险候选必须先进入审批，不能因为相似度而绕过审批并 supersede active。
+    if cfg.trust_high_risk_approve && candidate.claim_type.is_high_risk() {
+        return Decision::Promote {
+            status: MemoryStatus::Candidate,
+        };
+    }
+
+    // 3. BM25 近似重复 → 找最相似的 active claim
     if !existing.is_empty() {
         // 只对 active 记忆做相似度（candidate/superseded 不参与替代）。
         let active: Vec<MemoryRow> = existing
@@ -99,13 +106,6 @@ pub fn decide(candidate: &Candidate, existing: &[MemoryRow], cfg: &ConsolidateCo
                 }
             }
         }
-    }
-
-    // 3. 高风险 → candidate 待审
-    if cfg.trust_high_risk_approve && candidate.claim_type.is_high_risk() {
-        return Decision::Promote {
-            status: MemoryStatus::Candidate,
-        };
     }
 
     // 4. confidence 达标 → active，否则也进 candidate
@@ -398,5 +398,24 @@ mod tests {
             },
         );
         assert!(matches!(d, Decision::Supersede { old_id } if old_id == "m1"));
+    }
+
+    #[test]
+    fn similar_high_risk_memory_waits_for_approval_before_superseding() {
+        let existing = vec![row("m1", "用户偏好深色主题", None)];
+        let d = decide(
+            &cand("用户仍然偏好深色主题", ClaimType::Preference, 0.99),
+            &existing,
+            &ConsolidateConfig {
+                dedupe_similarity: 0.01,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            d,
+            Decision::Promote {
+                status: MemoryStatus::Candidate
+            }
+        ));
     }
 }

@@ -6,22 +6,30 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  BUN_VERSION: '1.3.14'
+
 jobs:
   build-macos:
     runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: universal-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v1
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -30,33 +38,114 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Cache frontend dependencies
         uses: actions/cache@v4
         with:
           path: frontend/node_modules
-          key: ${{ runner.os }}-frontend-${{ hashFiles('frontend/bun.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ env.BUN_VERSION }}-frontend-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            ${{ runner.os }}-frontend-
+            ${{ runner.os }}-${{ runner.arch }}-bun-${{ env.BUN_VERSION }}-frontend-
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
 
-      - name: Build backend
-        run: cargo build --release --locked --bin dss-backend
+      - name: Run release gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            app_version="$(bun -e "console.log(JSON.parse(await Bun.file('src-tauri/tauri.conf.json').text()).version)")"
+            test "$GITHUB_REF_NAME" = "v$app_version"
+          fi
+          cargo fmt --check
+          cargo clippy --locked -- -D warnings
+          cargo test --locked
+          (
+            cd frontend
+            bun test
+          )
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0.0" --locked
+      - name: Build universal backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin dss-backend --target aarch64-apple-darwin
+          cargo build --release --locked --bin dss-backend --target x86_64-apple-darwin
+
+          universal_dir="target/universal-apple-darwin/release"
+          universal_backend="$universal_dir/dss-backend"
+          mkdir -p "$universal_dir"
+          /usr/bin/lipo -create \
+            "target/aarch64-apple-darwin/release/dss-backend" \
+            "target/x86_64-apple-darwin/release/dss-backend" \
+            -output "$universal_backend"
+
+          archs="$(/usr/bin/lipo -archs "$universal_backend")"
+          test "$(wc -w <<<"$archs" | tr -d ' ')" -eq 2
+          case " $archs " in *" arm64 "*) ;; *) exit 1 ;; esac
+          case " $archs " in *" x86_64 "*) ;; *) exit 1 ;; esac
+
+          /usr/bin/codesign --force --sign - "$universal_backend"
+          /usr/bin/codesign --verify --strict --verbose=2 "$universal_backend"
 
       - name: Build Tauri macOS app
         working-directory: src-tauri
-        run: cargo tauri build --target universal-apple-darwin
+        run: ../frontend/node_modules/.bin/tauri build --target universal-apple-darwin --config tauri.ci.conf.json --ci
         env:
           CI: true
+
+      - name: Verify universal signed bundle
+        id: verify-bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          macos_bundle="$bundle_root/macos"
+          test -d "$bundle_root"
+          test -d "$macos_bundle"
+
+          app_count="$(find "$macos_bundle" -mindepth 1 -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')"
+          test "$app_count" -eq 1
+          app_path="$(find "$macos_bundle" -mindepth 1 -maxdepth 1 -type d -name '*.app' -print)"
+          test -n "$app_path"
+
+          info_plist="$app_path/Contents/Info.plist"
+          test -f "$info_plist"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
+          main_binary="$app_path/Contents/MacOS/$executable"
+          backend="$app_path/Contents/Resources/dss-backend"
+          test -x "$main_binary"
+          test -x "$backend"
+
+          assert_universal() {
+            local binary="$1"
+            local archs
+            archs="$(/usr/bin/lipo -archs "$binary")"
+            test "$(wc -w <<<"$archs" | tr -d ' ')" -eq 2
+            case " $archs " in *" arm64 "*) ;; *) return 1 ;; esac
+            case " $archs " in *" x86_64 "*) ;; *) return 1 ;; esac
+          }
+
+          assert_universal "$main_binary"
+          assert_universal "$backend"
+          test -f "$app_path/Contents/_CodeSignature/CodeResources"
+          /usr/bin/codesign --verify --strict --verbose=2 "$backend"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          dmg_bundle="$bundle_root/dmg"
+          test -d "$dmg_bundle"
+          dmg_count="$(find "$dmg_bundle" -mindepth 1 -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          test "$dmg_count" -eq 1
+          dmg_path="$(find "$dmg_bundle" -mindepth 1 -maxdepth 1 -type f -name '*.dmg' -print)"
+          test -n "$dmg_path"
+          /usr/bin/hdiutil verify "$dmg_path"
+          printf 'dmg_path=%s\n' "$dmg_path" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS bundle artifacts
         uses: actions/upload-artifact@v4
@@ -64,3 +153,42 @@ jobs:
           name: macos-app
           path: src-tauri/target/universal-apple-darwin/release/bundle/
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG_PATH: ${{ steps.verify-bundle.outputs.dmg_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --verify-tag \
+              --generate-notes \
+              --draft \
+              --title "Deepseek Science $tag"
+          fi
+
+          # Never silently replace an already-published asset. A same-name rerun is
+          # successful only when the existing immutable asset is byte-for-byte identical.
+          if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$(basename "$DMG_PATH")"; then
+            echo "release asset already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          gh release upload "$tag" "$DMG_PATH"
+
+          asset_name="$(basename "$DMG_PATH")"
+          asset_count="$(
+            gh release view "$tag" --json assets \
+              --template '{{range .assets}}{{printf "%s\n" .name}}{{end}}' |
+              awk -v wanted="$asset_name" '$0 == wanted { count++ } END { print count + 0 }'
+          )"
+          test "$asset_count" -eq 1
+
+          is_draft="$(gh release view "$tag" --json isDraft --template '{{.isDraft}}')"
+          if [[ "$is_draft" == "true" ]]; then
+            gh release edit "$tag" --draft=false
+          fi
+          test "$(gh release view "$tag" --json isDraft --template '{{.isDraft}}')" = "false"

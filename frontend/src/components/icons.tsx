@@ -51,6 +51,13 @@ export const IconCpu = (p: P) => (
   </svg>
 )
 
+export const IconBot = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="4" y="7" width="16" height="13" rx="3" />
+    <path d="M12 3v4M9 3h6M8 12h.01M16 12h.01M8 16h8" />
+  </svg>
+)
+
 export const IconSliders = (p: P) => (
   <svg {...base(p)}>
     <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3" />
