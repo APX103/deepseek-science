@@ -36,6 +36,11 @@ pub struct CreateSessionReq {
     bot_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateSessionReq {
+    title: String,
+}
+
 #[derive(Serialize)]
 pub struct CreateSessionResp {
     id: String,
@@ -394,6 +399,18 @@ fn run_row_json(run: dss_db::repo::RunRow) -> Value {
         "started_at": run.started_at,
         "completed_at": run.completed_at,
     })
+}
+
+/// `PATCH /api/sessions/{sid}`：更新会话元数据（目前仅 title）。
+pub async fn update_session(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    Json(payload): Json<UpdateSessionReq>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    dbq::set_session_title(&state.db, sid, payload.title)
+        .await
+        .map_err(map_db_err)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/sessions/{sid}`：删 DB 行（cascade messages）+ workspace + 内存。

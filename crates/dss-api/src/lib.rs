@@ -215,7 +215,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/sessions/{sid}",
-            get(sessions::get_session).delete(sessions::delete_session),
+            get(sessions::get_session)
+                .patch(sessions::update_session)
+                .delete(sessions::delete_session),
         )
         .route(
             "/api/sessions/{sid}/events",

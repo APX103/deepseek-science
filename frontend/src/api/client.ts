@@ -629,6 +629,14 @@ export async function deleteSession(sid: string): Promise<void> {
   });
 }
 
+export async function renameSession(sid: string, title: string): Promise<void> {
+  await request<void>(`/sessions/${encodeURIComponent(sid)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+}
+
 /** 批准当前挂起的研究计划；执行由下一次显式 execute_plan stream 启动。 */
 export async function approvePlan(
   sid: string,

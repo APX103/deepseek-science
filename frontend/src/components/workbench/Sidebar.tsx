@@ -1,12 +1,21 @@
 // 工作台左侧栏：项目名 / New / Search / Customize / Files / Compute / 会话列表（Today 分组）/ 底部主题切换。
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { createSessionApi } from '../../api/client'
-import { createSession, useBots, useProjects, useSessions } from '../../store'
+import { createSessionApi, deleteSession as deleteSessionApi } from '../../api/client'
+import {
+  createSession,
+  removeSession,
+  renameSession,
+  useBots,
+  useProjects,
+  useSessions,
+} from '../../store'
 import { useApp } from '../../App'
+import Modal from '../Modal'
 import {
   IconCpu,
   IconBot,
+  IconDots,
   IconFile,
   IconMoon,
   IconPlus,
@@ -34,6 +43,23 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
   const sessions = allSessions.filter((s) => s.project_id === project?.id)
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  const [menuSid, setMenuSid] = useState<string | null>(null)
+  const [renameSid, setRenameSid] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [renameError, setRenameError] = useState<string | null>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuSid(null)
+      }
+    }
+    if (menuSid) {
+      document.addEventListener('mousedown', onClick)
+      return () => document.removeEventListener('mousedown', onClick)
+    }
+  }, [menuSid])
 
   const handleNew = async () => {
     if (!project || !backend.online || creating) return
@@ -89,18 +115,119 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
       {/* 会话列表（Today 分组，新的在顶部） */}
       <div className="min-h-0 flex-1 overflow-y-auto border-t border-border p-2">
         <div className="px-2 pb-1 pt-1 text-[11px] font-medium text-ink3">Today</div>
-        {sessions.map((s) => (
-          <Link
-            key={s.id}
-            to={`/p/${project.id}/s/${s.id}`}
-            className={`block truncate rounded px-2 py-1.5 text-[12px] ${
-              s.id === sid ? 'bg-brandSoft font-medium text-brand' : 'text-ink2 hover:bg-surface2 hover:text-ink'
-            }`}
-          >
-            {s.bot_id ? `${bots.find((bot) => bot.id === s.bot_id)?.avatar ?? '🤖'} ${s.title}` : s.title}
-          </Link>
-        ))}
+        {sessions.map((s) => {
+          const isActive = s.id === sid
+          return (
+            <div
+              key={s.id}
+              className={`group relative flex items-center justify-between rounded text-[12px] ${
+                isActive ? 'bg-brandSoft' : 'hover:bg-surface2'
+              }`}
+            >
+              <Link
+                to={`/p/${project.id}/s/${s.id}`}
+                className={`block min-w-0 flex-1 truncate px-2 py-1.5 ${
+                  isActive ? 'font-medium text-brand' : 'text-ink2 group-hover:text-ink'
+                }`}
+                onClick={() => setMenuSid(null)}
+              >
+                {s.bot_id ? `${bots.find((bot) => bot.id === s.bot_id)?.avatar ?? '🤖'} ${s.title}` : s.title}
+              </Link>
+              <button
+                className={`shrink-0 rounded p-1 text-ink3 ${
+                  isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                } hover:bg-surface2 hover:text-ink`}
+                title="会话选项"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setMenuSid(menuSid === s.id ? null : s.id)
+                }}
+              >
+                <IconDots width={14} height={14} />
+              </button>
+              {menuSid === s.id && (
+                <div
+                  ref={menuRef}
+                  className="absolute right-1 top-7 z-20 w-28 rounded-md border border-border bg-bg shadow-overlay"
+                >
+                  <button
+                    className="w-full px-3 py-1.5 text-left text-[12px] text-ink hover:bg-surface2"
+                    onClick={() => {
+                      setRenameSid(s.id)
+                      setRenameValue(s.title)
+                      setRenameError(null)
+                      setMenuSid(null)
+                    }}
+                  >
+                    重命名
+                  </button>
+                  <button
+                    className="w-full px-3 py-1.5 text-left text-[12px] text-danger hover:bg-surface2"
+                    onClick={async () => {
+                      setMenuSid(null)
+                      if (!window.confirm(`确定删除会话“${s.title}”？此操作不可恢复。`)) return
+                      try {
+                        await deleteSessionApi(s.id)
+                        removeSession(s.id)
+                        if (s.id === sid) {
+                          navigate(`/p/${project.id}`)
+                        }
+                      } catch (error) {
+                        alert(`删除失败：${error instanceof Error ? error.message : String(error)}`)
+                      }
+                    }}
+                  >
+                    删除
+                  </button>
+                </div>
+              )}
+            </div>
+          )
+        })}
       </div>
+
+      {renameSid && (
+        <Modal title="重命名会话" onClose={() => setRenameSid(null)} width="max-w-sm">
+          <form
+            className="p-4"
+            onSubmit={async (e) => {
+              e.preventDefault()
+              setRenameError(null)
+              try {
+                await renameSession(renameSid, renameValue)
+                setRenameSid(null)
+              } catch (error) {
+                setRenameError(`重命名失败：${error instanceof Error ? error.message : String(error)}`)
+              }
+            }}
+          >
+            <input
+              type="text"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              className="w-full rounded-md border border-border bg-surface px-3 py-2 text-[13px] outline-none focus:border-brand"
+              autoFocus
+            />
+            {renameError && <p className="mt-2 text-[11px] text-danger">{renameError}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-md px-3 py-1.5 text-[12px] text-ink2 hover:bg-surface2"
+                onClick={() => setRenameSid(null)}
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                className="rounded-md bg-brand px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brandHover"
+                disabled={!renameValue.trim()}
+              >
+                保存
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
 
       {/* 底部：设置 + 主题切换 */}
       <div className="flex items-center gap-1 border-t border-border p-2">

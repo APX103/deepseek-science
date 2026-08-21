@@ -213,6 +213,36 @@ export function createSession(projectId: string, opts: { id: string; botId?: str
   return s
 }
 
+/** 本地同步移除会话（后端删除成功后调用）。 */
+export function removeSession(sid: string) {
+  const session = state.sessions.find((s) => s.id === sid)
+  const projectId = session?.project_id
+  setState({
+    ...state,
+    projects: state.projects.map((project) =>
+      project.id === projectId && project.last_session_id === sid
+        ? { ...project, last_session_id: null }
+        : project,
+    ),
+    sessions: state.sessions.filter((s) => s.id !== sid),
+    messages: Object.fromEntries(Object.entries(state.messages).filter(([key]) => key !== sid)),
+    sessionStates: Object.fromEntries(Object.entries(state.sessionStates).filter(([key]) => key !== sid)),
+  })
+}
+
+/** 调用后端重命名并同步本地列表。 */
+export async function renameSession(sid: string, title: string): Promise<void> {
+  const trimmed = title.trim()
+  if (!trimmed) return
+  await api.renameSession(sid, trimmed)
+  setState({
+    ...state,
+    sessions: state.sessions.map((s) =>
+      s.id === sid ? { ...s, title: trimmed, updated_at: new Date().toISOString() } : s,
+    ),
+  })
+}
+
 /** 追加一条用户消息；首条消息同时作为会话标题。 */
 export function sendUserMessage(sid: string, text: string) {
   const content = text.trim()
