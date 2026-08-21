@@ -47,6 +47,9 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
   const [renameSid, setRenameSid] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [renameError, setRenameError] = useState<string | null>(null)
+  const [deleteSid, setDeleteSid] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -163,18 +166,10 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
                   </button>
                   <button
                     className="w-full px-3 py-1.5 text-left text-[12px] text-danger hover:bg-surface2"
-                    onClick={async () => {
+                    onClick={() => {
                       setMenuSid(null)
-                      if (!window.confirm(`确定删除会话“${s.title}”？此操作不可恢复。`)) return
-                      try {
-                        await deleteSessionApi(s.id)
-                        removeSession(s.id)
-                        if (s.id === sid) {
-                          navigate(`/p/${project.id}`)
-                        }
-                      } catch (error) {
-                        alert(`删除失败：${error instanceof Error ? error.message : String(error)}`)
-                      }
+                      setDeleteSid(s.id)
+                      setDeleteError(null)
                     }}
                   >
                     删除
@@ -185,6 +180,65 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
           )
         })}
       </div>
+
+      {deleteSid && (
+        <Modal
+          title="删除会话"
+          onClose={() => {
+            if (deleting) return
+            setDeleteSid(null)
+          }}
+          width="max-w-sm"
+        >
+          {(() => {
+            const s = sessions.find((x) => x.id === deleteSid)
+            return (
+              <div className="p-4">
+                <p className="text-[13px] text-ink">
+                  确定删除会话“<span className="font-medium">{s?.title}</span>”？此操作不可恢复。
+                </p>
+                {deleteError && <p className="mt-2 text-[11px] text-danger">{deleteError}</p>}
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="rounded-md px-3 py-1.5 text-[12px] text-ink2 hover:bg-surface2 disabled:opacity-50"
+                    onClick={() => setDeleteSid(null)}
+                    disabled={deleting}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-md bg-danger px-3 py-1.5 text-[12px] font-medium text-white hover:bg-dangerSoft disabled:opacity-50"
+                    disabled={deleting}
+                    onClick={async () => {
+                      if (!s) return
+                      setDeleting(true)
+                      setDeleteError(null)
+                      try {
+                        await deleteSessionApi(s.id)
+                        removeSession(s.id)
+                        setDeleteSid(null)
+                        if (s.id === sid) {
+                          navigate(`/p/${project.id}`)
+                        }
+                      } catch (error) {
+                        setDeleteError(
+                          `删除失败：${error instanceof Error ? error.message : String(error)}`,
+                        )
+                      } finally {
+                        setDeleting(false)
+                      }
+                    }}
+                  >
+                    {deleting ? '删除中…' : '删除'}
+                  </button>
+                </div>
+              </div>
+            )
+          })()}
+        </Modal>
+      )}
 
       {renameSid && (
         <Modal title="重命名会话" onClose={() => setRenameSid(null)} width="max-w-sm">
