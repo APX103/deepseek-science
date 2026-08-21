@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-science"
-version = "0.1.1"
+version = "0.1.2"
 description = "Deepseek Science - 本地优先的科研 AI 工作台"
 authors = ["DSS"]
 edition = "2021"
