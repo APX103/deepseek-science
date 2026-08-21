@@ -67,17 +67,18 @@ fn data_dir_override() -> Option<PathBuf> {
 fn backend_binary_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let mut checked = Vec::new();
 
-    if let Ok(dir) = app.path().resource_dir() {
-        let candidate = dir.join(BACKEND_BINARY_NAME);
+    // Dev 模式优先使用 workspace target 里的 debug 产物，避免误用 Tauri 本地
+    // target/ 里可能存在的旧 bundle 残留。
+    if cfg!(debug_assertions) {
+        let candidate = development_backend_binary_path(Path::new(env!("CARGO_MANIFEST_DIR")));
         if candidate.is_file() {
             return Ok(candidate);
         }
         checked.push(candidate);
     }
 
-    // Release 包必须自包含，不能悄悄回退到打包机的源码目录。
-    if cfg!(debug_assertions) {
-        let candidate = development_backend_binary_path(Path::new(env!("CARGO_MANIFEST_DIR")));
+    if let Ok(dir) = app.path().resource_dir() {
+        let candidate = dir.join(BACKEND_BINARY_NAME);
         if candidate.is_file() {
             return Ok(candidate);
         }
