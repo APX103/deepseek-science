@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd ../frontend && bun run dev",
+    "beforeDevCommand": "if [ -d frontend ]; then cd frontend; elif [ -d ../frontend ]; then cd ../frontend; else echo 'frontend dir not found' >&2; exit 1; fi && bun run dev",
     "beforeBuildCommand": "if [ -d crates/dss-bin ]; then cargo build --release --locked --bin dss-backend; elif [ -d ../crates/dss-bin ]; then cargo build --manifest-path ../Cargo.toml --release --locked --bin dss-backend; else echo 'workspace backend crate not found' >&2; exit 1; fi && if [ -d frontend ]; then cd frontend; elif [ -d ../frontend ]; then cd ../frontend; else echo 'frontend dir not found' >&2; exit 1; fi && bun run build"
   },
   "app": {
