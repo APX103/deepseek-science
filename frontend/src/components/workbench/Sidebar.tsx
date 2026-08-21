@@ -220,7 +220,7 @@ export default function Sidebar({ pid, sid, width, onOpenSkills, onOpenFiles }: 
                         removeSession(s.id)
                         setDeleteSid(null)
                         if (s.id === sid) {
-                          navigate('/')
+                          navigate(`/p/${project.id}`)
                         }
                       } catch (error) {
                         setDeleteError(

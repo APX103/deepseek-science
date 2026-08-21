@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Route, Routes } from 'react-router-dom'
 import HomePage from './pages/HomePage'
+import ProjectPage from './pages/ProjectPage'
 import WorkbenchPage from './pages/WorkbenchPage'
 import LogsPage from './pages/LogsPage'
 import BotsPage from './pages/BotsPage'
@@ -75,6 +76,7 @@ export default function App(): ReactNode {
     >
       <Routes>
         <Route path="/" element={<HomePage />} />
+        <Route path="/p/:pid" element={<ProjectPage />} />
         <Route path="/p/:pid/s/:sid" element={<WorkbenchPage />} />
         <Route path="/logs" element={<LogsPage />} />
         <Route path="/bots" element={<BotsPage />} />
