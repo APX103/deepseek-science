@@ -10,6 +10,7 @@ pub mod projects;
 pub mod sessions;
 pub mod settings_endpoints;
 pub mod state;
+mod subagents;
 pub mod workspace_files;
 mod workspace_resolution;
 
@@ -217,6 +218,15 @@ pub fn build_router(state: AppState) -> Router {
             get(sessions::get_session).delete(sessions::delete_session),
         )
         .route(
+            "/api/sessions/{sid}/events",
+            get(sessions::list_audit_events),
+        )
+        .route("/api/sessions/{sid}/frames", get(sessions::list_frames))
+        .route(
+            "/api/sessions/{sid}/runs/{run_id}/reconcile-tool",
+            get(sessions::list_tool_reconciliation).post(sessions::reconcile_tool),
+        )
+        .route(
             "/api/sessions/{sid}/stream-sse",
             axum::routing::post(sessions::stream_sse),
         )
@@ -240,7 +250,15 @@ pub fn build_router(state: AppState) -> Router {
             "/api/sessions/{sid}/files/{*path}",
             get(workspace_files::read_file).delete(workspace_files::delete_file),
         )
-        // Bot Mode: durable identities and restart-safe work queues.
+        // Agent Profiles + generic JobRuntime. Historical Bot routes remain compatibility aliases.
+        .route(
+            "/api/agent-profiles",
+            get(bots::list_bots).post(bots::create_bot),
+        )
+        .route(
+            "/api/agent-profiles/{bid}",
+            axum::routing::patch(bots::update_bot).delete(bots::delete_bot),
+        )
         .route("/api/bots", get(bots::list_bots).post(bots::create_bot))
         .route(
             "/api/bots/{bid}",
@@ -251,7 +269,15 @@ pub fn build_router(state: AppState) -> Router {
             get(bots::list_jobs).post(bots::enqueue_job),
         )
         .route(
+            "/api/sessions/{sid}/jobs",
+            get(bots::list_jobs).post(bots::enqueue_job),
+        )
+        .route(
             "/api/sessions/{sid}/bot-jobs/reorder",
+            axum::routing::post(bots::reorder_jobs),
+        )
+        .route(
+            "/api/sessions/{sid}/jobs/reorder",
             axum::routing::post(bots::reorder_jobs),
         )
         .route(
@@ -259,7 +285,15 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(bots::claim_job),
         )
         .route(
+            "/api/sessions/{sid}/jobs/claim",
+            axum::routing::post(bots::claim_job),
+        )
+        .route(
             "/api/bot-jobs/{jid}",
+            axum::routing::patch(bots::edit_job).delete(bots::delete_job),
+        )
+        .route(
+            "/api/jobs/{jid}",
             axum::routing::patch(bots::edit_job).delete(bots::delete_job),
         )
         .route(
@@ -267,7 +301,15 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(bots::finish_job),
         )
         .route(
+            "/api/jobs/{jid}/finish",
+            axum::routing::post(bots::finish_job),
+        )
+        .route(
             "/api/bot-jobs/{jid}/claim",
+            axum::routing::post(bots::claim_selected_job),
+        )
+        .route(
+            "/api/jobs/{jid}/claim",
             axum::routing::post(bots::claim_selected_job),
         )
         // projects

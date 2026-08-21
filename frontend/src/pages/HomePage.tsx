@@ -115,7 +115,7 @@ export default function HomePage() {
             {theme === 'light' ? <IconMoon width={16} height={16} /> : <IconSun width={16} height={16} />}
           </button>
           <button className="btn-outline ml-2" onClick={() => navigate('/bots')}>
-            <IconBot width={14} height={14} /> Bot Mode
+            <IconBot width={14} height={14} /> Agents
           </button>
           <button className="btn-outline ml-2" onClick={() => setShowNew(true)}>
             <IconPlus width={14} height={14} /> New project

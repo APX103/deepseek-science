@@ -122,6 +122,7 @@ fn rejected_preapproval_results(calls: &[ToolCall]) -> Vec<ToolResult> {
                 call.function.name
             ),
             is_error: true,
+            outcome_unknown: false,
         })
         .collect()
 }
@@ -140,6 +141,7 @@ fn rejected_inactive_plan_update_results(calls: &[ToolCall]) -> Vec<ToolResult> 
                 )
             },
             is_error: true,
+            outcome_unknown: false,
         })
         .collect()
 }
@@ -157,6 +159,7 @@ fn rejected_exclusive_tool_batch_results(calls: &[ToolCall]) -> Vec<ToolResult> 
                 call.function.name
             ),
             is_error: true,
+            outcome_unknown: false,
         })
         .collect()
 }
@@ -374,10 +377,84 @@ impl Runner {
         plan_mode: bool,
         tx: &mpsc::Sender<AgentEvent>,
     ) -> RunOutcome {
+        Self::run_inner(
+            session,
+            llm,
+            model,
+            prompt,
+            tools,
+            ctx,
+            max_iterations,
+            context_window,
+            memory,
+            project_id,
+            run_context,
+            plan_mode,
+            tx,
+            false,
+        )
+        .await
+    }
+
+    /// Continue a run whose frame and user prompt were durably accepted by the harness before
+    /// the provider call. This is the API crash-recovery path; ordinary in-process callers use
+    /// `run`, which still appends the prompt itself.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_accepted(
+        session: &mut Session,
+        llm: &dyn LlmClient,
+        model: &str,
+        prompt: &str,
+        tools: &ToolRegistry,
+        ctx: &ToolContext,
+        max_iterations: u32,
+        context_window: usize,
+        memory: Option<&dss_memory::MemoryStore>,
+        project_id: Option<&str>,
+        run_context: &[ChatMessage],
+        plan_mode: bool,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> RunOutcome {
+        Self::run_inner(
+            session,
+            llm,
+            model,
+            prompt,
+            tools,
+            ctx,
+            max_iterations,
+            context_window,
+            memory,
+            project_id,
+            run_context,
+            plan_mode,
+            tx,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_inner(
+        session: &mut Session,
+        llm: &dyn LlmClient,
+        model: &str,
+        prompt: &str,
+        tools: &ToolRegistry,
+        ctx: &ToolContext,
+        max_iterations: u32,
+        context_window: usize,
+        memory: Option<&dss_memory::MemoryStore>,
+        project_id: Option<&str>,
+        run_context: &[ChatMessage],
+        plan_mode: bool,
+        tx: &mpsc::Sender<AgentEvent>,
+        prompt_already_appended: bool,
+    ) -> RunOutcome {
         // Decision gates bound retries within one user request. Carrying their counters into
         // a later request would silently disable review or consume that request's retry budget.
         session.gate_state = Default::default();
-        session.frame.begin_run(truncate_chars(prompt, 80));
+        session.frame.start_run(truncate_chars(prompt, 80));
 
         if !send(
             tx,
@@ -427,9 +504,17 @@ impl Runner {
         // The terminal reviewer receives only this request's canonical audit
         // trail, not unrelated earlier conversation. Tool-backed iterations
         // are committed in order before natural completion.
-        let run_trace_start = session.messages.len();
-        session.messages.push(ChatMessage::user(prompt));
-        let mut history_checkpoint_cursor = run_trace_start;
+        let run_trace_start = if prompt_already_appended {
+            debug_assert!(session.messages.last().is_some_and(|message| {
+                message.role == "user" && message.content.as_deref() == Some(prompt)
+            }));
+            session.messages.len().saturating_sub(1)
+        } else {
+            let start = session.messages.len();
+            session.messages.push(ChatMessage::user(prompt));
+            start
+        };
+        let mut history_checkpoint_cursor = session.messages.len();
 
         let mut final_text = String::new();
         let mut progress = RunProgress::default();
@@ -1342,6 +1427,7 @@ impl Runner {
                             pending_ask: checkpoint_pending_ask,
                             status: checkpoint_status.into(),
                             awaiting: checkpoint_awaiting,
+                            compaction_state: serde_json::to_string(&session.compaction).ok(),
                         },
                     )
                     .await
@@ -1357,6 +1443,46 @@ impl Runner {
                     .await;
                 }
                 history_checkpoint_cursor = session.messages.len();
+
+                // A timeout/panic after a possibly-mutating tool crossed its execution boundary
+                // is not an ordinary tool error. The paired assistant/tool messages are already
+                // durably checkpointed above; stop before another model turn can retry or mask
+                // the unknown external outcome.
+                if results.iter().any(|result| result.outcome_unknown) {
+                    if !iteration_text.is_empty() {
+                        final_text = iteration_text;
+                    }
+                    let error = "外部工具可能已经执行，但没有收到可确认的结果。请先人工对账，再继续此 Run。"
+                        .to_string();
+                    if !send(
+                        tx,
+                        AgentEvent::Complete {
+                            kind: CompleteKind::NeedsReconciliation,
+                            final_text: final_text.clone(),
+                            awaiting: Some("tool_reconciliation".to_string()),
+                            error: Some(error.clone()),
+                            usage: progress.usage,
+                            iterations,
+                            frame_status: FrameStatus::NeedsReconciliation,
+                            pending_ask: None,
+                            plan: committed_plan_after_batch,
+                        },
+                    )
+                    .await
+                    {
+                        return cancel(session, &mut progress);
+                    }
+                    session.frame.set_status(FrameStatus::NeedsReconciliation);
+                    return RunOutcome {
+                        kind: CompleteKind::NeedsReconciliation,
+                        final_text,
+                        awaiting: Some("tool_reconciliation".into()),
+                        pending_ask: None,
+                        error: Some(error),
+                        usage: progress.usage,
+                        iterations,
+                    };
+                }
 
                 let errors_in_batch =
                     results.iter().filter(|result| result.is_error).count() as u32;

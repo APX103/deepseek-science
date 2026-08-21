@@ -383,6 +383,10 @@ pub struct WebSearchTool;
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_search".into(),
@@ -905,6 +909,10 @@ pub struct FetchUrlTool;
 
 #[async_trait]
 impl Tool for FetchUrlTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fetch_url".into(),

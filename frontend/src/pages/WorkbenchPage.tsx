@@ -220,7 +220,7 @@ export default function WorkbenchPage() {
     } catch (reason) {
       updateQueueError(
         targetSid,
-        `恢复 Bot 队列失败：${reason instanceof Error ? reason.message : String(reason)}`,
+        `恢复 Agent 任务队列失败：${reason instanceof Error ? reason.message : String(reason)}`,
       )
     }
   }, [])
@@ -258,8 +258,9 @@ export default function WorkbenchPage() {
     return resolvePromptRunIntent(live, restored, requestedPlanMode)
   }
 
-  // The only local run launcher. A queue claim must happen immediately before
-  // this function; queued text is not written to the transcript any earlier.
+  // The only local run launcher. Durable queue ownership is confirmed before
+  // opening SSE so the claim event and run acceptance never contend for the
+  // same append-only session-event sequence.
   function launchSessionRun(
     targetSid: string,
     text: string,
@@ -286,88 +287,116 @@ export default function WorkbenchPage() {
     const durableClaim = durableJob && bot
       ? claimBotJob(durableJob.id, durableJob.revision, runId)
       : null
-    durableClaim?.catch((reason) => {
-      updateQueueError(
-        targetSid,
-        `Bot 任务领取未确认：${reason instanceof Error ? reason.message : String(reason)}`,
-      )
-    })
-    const abort = connectSSE(targetSid, prompt, {
-      onStart: (frameId, taskSummary) =>
-        setStreamStart(targetSid, frameId, taskSummary, runId),
-      onIteration: (iteration) => advanceStreamIteration(targetSid, iteration, runId),
-      onThinking: (t) => appendStreamThinking(targetSid, t, runId),
-      onText: (t) => appendStreamText(targetSid, t, runId),
-      onDraftReset: () => resetStreamDraft(targetSid, runId),
-      onToolCalls: (calls) => appendStreamToolCall(targetSid, calls, runId),
-      onToolResults: (results) => {
-        if (appendStreamToolResult(targetSid, results, runId)) {
-          void refreshFilesForSession(targetSid)
-        }
-      },
-      onPlanUpdate: (nextPlan) => setStreamPlan(targetSid, nextPlan, runId),
-      onComplete: (e) => {
-        const beforeTerminal = getStreamSnapshot(targetSid)
-        const queueBeforeTerminal = getPromptQueue(targetSid)
-        const accepted = completeStream(
-          targetSid,
-          e.usage ?? null,
-          e.iterations ?? 0,
-          e.kind,
-          e.pending_ask ?? null,
-          e.awaiting ?? null,
-          e.plan ?? null,
-          e.error ?? null,
-          e.artifacts,
-          runId,
-        )
-        if (accepted) {
+
+    const connectClaimedRun = () => {
+      const current = getStreamSnapshot(targetSid)
+      if (!current?.running || current.runId !== runId) return false
+      const abort = connectSSE(targetSid, prompt, {
+        onStart: (frameId, taskSummary) =>
+          setStreamStart(targetSid, frameId, taskSummary, runId),
+        onIteration: (iteration) => advanceStreamIteration(targetSid, iteration, runId),
+        onThinking: (t) => appendStreamThinking(targetSid, t, runId),
+        onText: (t) => appendStreamText(targetSid, t, runId),
+        onDraftReset: () => resetStreamDraft(targetSid, runId),
+        onToolCalls: (calls) => appendStreamToolCall(targetSid, calls, runId),
+        onToolResults: (results) => {
+          if (appendStreamToolResult(targetSid, results, runId)) {
+            void refreshFilesForSession(targetSid)
+          }
+        },
+        onPlanUpdate: (nextPlan) => setStreamPlan(targetSid, nextPlan, runId),
+        onComplete: (e) => {
+          const beforeTerminal = getStreamSnapshot(targetSid)
+          const queueBeforeTerminal = getPromptQueue(targetSid)
+          const accepted = completeStream(
+            targetSid,
+            e.usage ?? null,
+            e.iterations ?? 0,
+            e.kind,
+            e.pending_ask ?? null,
+            e.awaiting ?? null,
+            e.plan ?? null,
+            e.error ?? null,
+            e.artifacts,
+            runId,
+          )
+          if (accepted) {
+            if (durableJob && durableClaim) {
+              void durableClaim
+                .then(() => finishBotJob(
+                  durableJob.id,
+                  runId,
+                  e.kind === 'natural' || e.kind === 'awaiting',
+                  e.error ?? null,
+                ))
+                .then(() => refreshDurableQueue(targetSid))
+                .catch(() => refreshDurableQueue(targetSid))
+            }
+            void refreshFilesForSession(targetSid)
+            void restoreAndMaybeDrainPromptQueue(
+              targetSid,
+              runId,
+              {
+                kind: e.kind,
+                awaiting: e.awaiting ?? null,
+                wasStopping: beforeTerminal?.stopping ?? false,
+                steering: queueBeforeTerminal.steering,
+              },
+              {
+                gate: promptRunGate,
+                loadMessages,
+                isRunActive: (sessionId) => !!getStreamSnapshot(sessionId)?.running,
+                claimAndLaunchNext,
+              },
+            )
+          }
+        },
+        onError: (m) => {
           if (durableJob && durableClaim) {
             void durableClaim
-              .then(() => finishBotJob(
-                durableJob.id,
-                runId,
-                e.kind === 'natural' || e.kind === 'awaiting',
-                e.error ?? null,
-              ))
+              .then(() => finishBotJob(durableJob.id, runId, false, m))
               .then(() => refreshDurableQueue(targetSid))
               .catch(() => refreshDurableQueue(targetSid))
           }
-          void refreshFilesForSession(targetSid)
-          void restoreAndMaybeDrainPromptQueue(
+          if (failStream(targetSid, m, runId)) {
+            void refreshFilesForSession(targetSid)
+            // A transport failure is not proof that the backend session mutex is
+            // free, so retain the queue and never auto-drain from this path.
+            void loadMessages(targetSid)
+          }
+        },
+      }, { planMode: intent.planMode, executePlan: intent.executePlan, runId })
+      setStreamAborter(targetSid, abort, runId)
+      return true
+    }
+
+    if (durableClaim) {
+      void durableClaim
+        .then(() => {
+          if (!connectClaimedRun() && durableJob) {
+            return finishBotJob(
+              durableJob.id,
+              runId,
+              false,
+              'Local run retired before the claimed job could connect',
+            )
+          }
+          return undefined
+        })
+        .then(() => refreshDurableQueue(targetSid))
+        .catch((reason) => {
+          updateQueueError(
             targetSid,
-            runId,
-            {
-              kind: e.kind,
-              awaiting: e.awaiting ?? null,
-              wasStopping: beforeTerminal?.stopping ?? false,
-              steering: queueBeforeTerminal.steering,
-            },
-            {
-              gate: promptRunGate,
-              loadMessages,
-              isRunActive: (sessionId) => !!getStreamSnapshot(sessionId)?.running,
-              claimAndLaunchNext,
-            },
+            `Agent 任务领取未确认：${reason instanceof Error ? reason.message : String(reason)}`,
           )
-        }
-      },
-      onError: (m) => {
-        if (durableJob && durableClaim) {
-          void durableClaim
-            .then(() => finishBotJob(durableJob.id, runId, false, m))
-            .then(() => refreshDurableQueue(targetSid))
-            .catch(() => refreshDurableQueue(targetSid))
-        }
-        if (failStream(targetSid, m, runId)) {
-          void refreshFilesForSession(targetSid)
-          // A transport failure is not proof that the backend session mutex is
-          // free, so retain the queue and never auto-drain from this path.
-          void loadMessages(targetSid)
-        }
-      },
-    }, { planMode: intent.planMode, executePlan: intent.executePlan, runId })
-    setStreamAborter(targetSid, abort, runId)
+          if (failStream(targetSid, 'Agent 任务领取失败，请从队列重试。', runId)) {
+            void loadMessages(targetSid)
+          }
+          void refreshDurableQueue(targetSid)
+        })
+    } else {
+      connectClaimedRun()
+    }
     return true
   }
 
@@ -470,7 +499,7 @@ export default function WorkbenchPage() {
             deleteQueuedPrompt(sid, queued.id, queued.revision)
             updateQueueError(
               sid,
-              `保存 Bot 队列失败：${reason instanceof Error ? reason.message : String(reason)}`,
+              `保存 Agent 任务队列失败：${reason instanceof Error ? reason.message : String(reason)}`,
             )
           })
         }
@@ -598,6 +627,7 @@ export default function WorkbenchPage() {
       )}
 
       <ChatArea
+        sessionId={sid}
         messages={messages}
         failed={session?.status === 'failed'}
         stream={stream}

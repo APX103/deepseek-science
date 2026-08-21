@@ -555,9 +555,10 @@ function commitStreamMessage(sid: string, s: StreamBuffer): boolean {
 }
 
 function runStatus(kind: RunKind, error: string | null): SessionStatus {
+  if (kind === 'reconciliation') return 'needs_reconciliation'
+  if (kind === 'cancelled') return 'interrupted'
   if (kind === 'error' || kind === 'max_iters' || error) return 'failed'
   if (kind === 'awaiting') return 'awaiting'
-  if (kind === 'cancelled') return 'interrupted'
   return 'completed'
 }
 

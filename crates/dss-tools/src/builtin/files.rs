@@ -24,6 +24,10 @@ pub struct ReadFileTool;
 
 #[async_trait]
 impl Tool for ReadFileTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         read_spec()
     }
@@ -240,6 +244,10 @@ pub struct ListFilesTool;
 
 #[async_trait]
 impl Tool for ListFilesTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         list_spec()
     }

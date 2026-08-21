@@ -38,6 +38,10 @@ struct ListResourcesArgs {
 
 #[async_trait]
 impl Tool for McpListResourcesTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: MCP_LIST_RESOURCES_TOOL_NAME.into(),
@@ -112,6 +116,10 @@ struct ReadResourceArgs {
 
 #[async_trait]
 impl Tool for McpReadResourceTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: MCP_READ_RESOURCE_TOOL_NAME.into(),
@@ -246,6 +254,14 @@ impl McpDynamicTool {
 
 #[async_trait]
 impl Tool for McpDynamicTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        if self.retry_safe {
+            crate::spec::ToolEffectClass::Idempotent
+        } else {
+            crate::spec::ToolEffectClass::ExternalSideEffect
+        }
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: dss_mcp::mcp_tool_name(&self.server, &self.tool_name),

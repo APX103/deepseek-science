@@ -2,7 +2,9 @@
 // 发送走 store 流式 buffer（connectSSE 由 WorkbenchPage 接线）；离线时输入框禁用。
 import { useEffect, useId, useRef, useState } from 'react'
 import type { ContentBlock, Message, Plan, SessionRun, Usage } from '../../types'
-import type { StreamBuffer } from '../../store'
+import type { ToolReconciliationCall } from '../../types'
+import { loadMessages, type StreamBuffer } from '../../store'
+import { listToolReconciliation, reconcileToolCall } from '../../api/client'
 import type { PromptQueueState, QueuedPrompt } from '../../api/promptQueue'
 import { useApp } from '../../App'
 import { planStatusLabel } from '../../api/planExecution'
@@ -24,6 +26,7 @@ import ToolCallCard from './ToolCallCard'
 import { IconChevronRight, IconPanelLeft, IconPanelRight, IconSend, IconStop } from '../icons'
 
 interface Props {
+  sessionId: string
   messages: Message[]
   /** 失败会话才显示 Agent Failed / interrupted 横幅 */
   failed?: boolean
@@ -58,6 +61,7 @@ type ToolUse = Extract<ContentBlock, { type: 'tool_use' }>
 type ToolResult = Extract<ContentBlock, { type: 'tool_result' }>
 
 export default function ChatArea({
+  sessionId,
   messages,
   failed,
   stream,
@@ -87,7 +91,11 @@ export default function ChatArea({
   const { backend } = useApp()
   const running = stream?.running ?? false
   const stopping = stream?.stopping ?? false
-  const ready = backend.online && backend.llmConfigured
+  const needsReconciliation = messages.some(
+    (message) => message.run?.status === 'needs_reconciliation'
+      || message.run?.kind === 'reconciliation',
+  )
+  const ready = backend.online && backend.llmConfigured && !needsReconciliation
   const hasPersistedFailure = hasPersistedRunFailure(messages)
   const scrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -185,7 +193,8 @@ export default function ChatArea({
       >
         <div className="mx-auto max-w-2xl space-y-4 px-6 py-6">
           {messages.map((m, i) => (
-            <MessageView
+              <MessageView
+                sessionId={sessionId}
               key={`${m.source_run_id ?? 'live'}:${m.source_seq ?? i}`}
               message={m}
               messageIdentity={messageIdentity(m)}
@@ -647,6 +656,7 @@ export function Composer({
 }
 
 interface MessageViewProps {
+  sessionId: string
   message: Message
   messageIdentity: string
   disclosurePreferences: ThinkingDisclosurePreferences
@@ -654,6 +664,7 @@ interface MessageViewProps {
 }
 
 function MessageView({
+  sessionId,
   message,
   messageIdentity,
   disclosurePreferences,
@@ -667,7 +678,7 @@ function MessageView({
             {typeof message.content === 'string' ? message.content : null}
           </div>
         </div>
-        {message.run && <RunFooter run={message.run} />}
+        {message.run && <RunFooter sessionId={sessionId} run={message.run} />}
       </div>
     )
   }
@@ -678,7 +689,7 @@ function MessageView({
     return (
       <div>
         <AgentMarkdown content={message.content as string} />
-        {message.run ? <RunFooter run={message.run} /> : message.usage && <MessageUsage usage={message.usage} />}
+        {message.run ? <RunFooter sessionId={sessionId} run={message.run} /> : message.usage && <MessageUsage usage={message.usage} />}
       </div>
     )
   }
@@ -709,7 +720,7 @@ function MessageView({
         }
         return <ToolCallCard key={b.call.id} call={b.call} result={b.result} />
       })}
-      {message.run ? <RunFooter run={message.run} /> : message.usage && <MessageUsage usage={message.usage} />}
+      {message.run ? <RunFooter sessionId={sessionId} run={message.run} /> : message.usage && <MessageUsage usage={message.usage} />}
     </div>
   )
 }
@@ -731,7 +742,20 @@ function cacheSuffix(usage: Pick<Usage, 'cache_hit_tokens' | 'cache_miss_tokens'
   return ` · cache ${pct}% (${hit.toLocaleString()}h/${miss.toLocaleString()}m)`
 }
 
-export function RunFooter({ run }: { run: SessionRun }) {
+export function RunFooter({ sessionId, run }: { sessionId?: string; run: SessionRun }) {
+  if (run.status === 'needs_reconciliation' || run.kind === 'reconciliation') {
+    return (
+      <div className="space-y-1.5">
+        {sessionId ? <ToolReconciliationPanel sessionId={sessionId} run={run} /> : (
+          <div className="rounded-lg border border-amber-500/35 bg-amber-500/5 p-3 text-xs text-ink">
+            <p className="font-medium text-amber-700 dark:text-amber-300">外部工具结果未知</p>
+            <p className="mt-1 text-ink2">需要人工对账后才能继续。</p>
+          </div>
+        )}
+        <RunMetrics run={run} />
+      </div>
+    )
+  }
   if (run.kind === 'max_iters') {
     const detail = run.error ? `\n详细信息：${run.error}` : ''
     return (
@@ -740,6 +764,9 @@ export function RunFooter({ run }: { run: SessionRun }) {
         <RunMetrics run={run} />
       </div>
     )
+  }
+  if (run.status === 'interrupted' || run.kind === 'cancelled') {
+    return <RunMetrics run={run} />
   }
   if (run.status === 'failed' || run.kind === 'error' || run.error) {
     return (
@@ -762,12 +789,14 @@ export function RunFooter({ run }: { run: SessionRun }) {
 
 function RunMetrics({ run }: { run: SessionRun }) {
   const status =
-    run.kind === 'max_iters'
+    run.status === 'needs_reconciliation' || run.kind === 'reconciliation'
+      ? '等待外部结果对账'
+      : run.kind === 'max_iters'
       ? '达到迭代上限'
-      : run.status === 'failed' || run.kind === 'error' || run.error
-        ? '执行失败'
-        : run.kind === 'cancelled'
+      : run.status === 'interrupted' || run.kind === 'cancelled'
           ? '已停止'
+        : run.status === 'failed' || run.kind === 'error' || run.error
+          ? '执行失败'
           : run.kind === 'awaiting'
             ? run.awaiting === 'plan_approval'
               ? '等待计划批准'
@@ -783,13 +812,119 @@ function RunMetrics({ run }: { run: SessionRun }) {
   )
 }
 
+function ToolReconciliationPanel({
+  sessionId,
+  run,
+}: {
+  sessionId: string
+  run: SessionRun
+}) {
+  const [calls, setCalls] = useState<ToolReconciliationCall[] | null>(null)
+  const [loadingCall, setLoadingCall] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let active = true
+    setCalls(null)
+    setError(null)
+    void listToolReconciliation(sessionId, run.run_id)
+      .then((next) => {
+        if (active) setCalls(next)
+      })
+      .catch((reason) => {
+        if (active) setError(reason instanceof Error ? reason.message : String(reason))
+      })
+    return () => {
+      active = false
+    }
+  }, [sessionId, run.run_id])
+
+  const resolve = async (call: ToolReconciliationCall, succeeded: boolean) => {
+    const label = succeeded ? '确认该外部操作已经成功' : '确认该外部操作未成功或已失败'
+    if (!window.confirm(`${label}？此判断会写入审计记录。`)) return
+    setLoadingCall(call.call_id)
+    setError(null)
+    try {
+      const result = await reconcileToolCall(
+        sessionId,
+        run.run_id,
+        call.call_id,
+        succeeded,
+      )
+      if (result.ready_to_resume) {
+        await loadMessages(sessionId)
+      } else {
+        setCalls(await listToolReconciliation(sessionId, run.run_id))
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setLoadingCall(null)
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-amber-500/35 bg-amber-500/5 p-3 text-xs text-ink">
+      <p className="font-medium text-amber-700 dark:text-amber-300">需要确认外部工具结果</p>
+      <p className="mt-1 text-ink2">
+        工具可能已改变外部状态，但响应在确认前中断。请选择你实际观察到的结果；不确定时请保持此状态。
+      </p>
+      {calls === null && !error && <p className="mt-2 text-ink3">正在读取待对账调用…</p>}
+      {calls?.map((call) => (
+        <div key={call.call_id} className="mt-2 rounded border border-line bg-surface px-2.5 py-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-mono text-[11px]">{call.tool_name}</span>
+            <span className="text-[10px] text-ink3">{call.call_id}</span>
+          </div>
+          <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-all text-[10px] text-ink2">
+            {JSON.stringify(call.input, null, 2)}
+          </pre>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn-outline rounded px-2 py-1 disabled:opacity-40"
+              disabled={loadingCall !== null}
+              onClick={() => void resolve(call, true)}
+            >
+              确认已成功
+            </button>
+            <button
+              type="button"
+              className="btn-outline rounded px-2 py-1 disabled:opacity-40"
+              disabled={loadingCall !== null}
+              onClick={() => void resolve(call, false)}
+            >
+              确认失败
+            </button>
+          </div>
+        </div>
+      ))}
+      {calls?.length === 0 && !error && (
+        <p className="mt-2 text-ink3">没有找到待对账调用，请刷新会话或查看审计日志。</p>
+      )}
+      {error && <p className="mt-2 text-red-600 dark:text-red-400">{error}</p>}
+    </div>
+  )
+}
+
 export function hasPersistedRunFailure(messages: Message[]): boolean {
   return messages.some(
-    (message) =>
-      message.run?.status === 'failed' ||
-      message.run?.kind === 'error' ||
-      message.run?.kind === 'max_iters' ||
-      !!message.run?.error,
+    (message) => {
+      const run = message.run
+      if (
+        !run
+        || run.status === 'interrupted'
+        || run.kind === 'cancelled'
+        || run.status === 'needs_reconciliation'
+        || run.kind === 'reconciliation'
+      ) return false
+      return (
+        run.status === 'failed' ||
+        run.kind === 'error' ||
+        run.kind === 'max_iters' ||
+        !!run.error
+      )
+    },
   )
 }
 

@@ -11,6 +11,7 @@ use crate::frame::FrameStatus;
 pub enum CompleteKind {
     Natural,
     Awaiting,
+    NeedsReconciliation,
     MaxIters,
     Error,
     Cancelled,
@@ -88,6 +89,12 @@ pub struct ToolResultView {
     pub tool_use_id: String,
     pub content: String,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outcome_unknown: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl From<dss_tools::ToolResult> for ToolResultView {
@@ -96,6 +103,7 @@ impl From<dss_tools::ToolResult> for ToolResultView {
             tool_use_id: r.tool_use_id,
             content: r.content,
             is_error: r.is_error,
+            outcome_unknown: r.outcome_unknown,
         }
     }
 }

@@ -102,7 +102,7 @@ export default function BotsPage() {
       const session = createSession(projectId, { id: created.id, botId: bot.id })
       navigate(`/p/${projectId}/s/${session.id}`)
     } catch (reason) {
-      setError(`打开 Bot 失败：${reason instanceof Error ? reason.message : String(reason)}`)
+      setError(`打开 Agent 失败：${reason instanceof Error ? reason.message : String(reason)}`)
     } finally {
       setOpeningId(null)
     }
@@ -119,7 +119,7 @@ export default function BotsPage() {
           <div>
             <div className="flex items-center gap-2">
               <IconBot width={20} height={20} className="text-brand" />
-              <h1 className="text-[22px] font-semibold tracking-tight text-ink">Bot Mode</h1>
+              <h1 className="text-[22px] font-semibold tracking-tight text-ink">Agent Profiles</h1>
             </div>
             <p className="mt-1 max-w-xl text-[12px] leading-relaxed text-ink2">
               Create persistent research teammates with a stable role, memory context, workspace and restart-safe work queue.
@@ -133,7 +133,7 @@ export default function BotsPage() {
               {theme === 'light' ? <IconMoon width={16} height={16} /> : <IconSun width={16} height={16} />}
             </button>
             <button className="btn-primary ml-2" onClick={() => setEditing('new')} disabled={!online}>
-              <IconPlus width={14} height={14} /> New Bot
+              <IconPlus width={14} height={14} /> New Agent
             </button>
           </div>
         </header>
@@ -200,7 +200,7 @@ export default function BotsPage() {
         </section>
 
         {bots.length === 0 && !online && (
-          <p className="mt-8 text-center text-[12px] text-danger">Backend is offline. Start it to create or open Bots.</p>
+          <p className="mt-8 text-center text-[12px] text-danger">Backend is offline. Start it to create or open Agents.</p>
         )}
       </main>
 
@@ -275,7 +275,7 @@ function BotEditor({ bot, projectId, projects, onClose, onSaved, onDeleted }: {
   }
 
   const remove = async () => {
-    if (!bot || saving || !window.confirm(`Delete Bot “${bot.name}”? Its conversations and files will be kept.`)) return
+    if (!bot || saving || !window.confirm(`Delete Agent “${bot.name}”? Its conversations and files will be kept.`)) return
     setSaving(true)
     try {
       await api.deleteBot(bot.id)
@@ -288,10 +288,10 @@ function BotEditor({ bot, projectId, projects, onClose, onSaved, onDeleted }: {
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/25 p-4" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section role="dialog" aria-modal="true" aria-label={bot ? 'Edit Bot' : 'Create Bot'} className="w-full max-w-xl rounded-xl border border-border bg-surface shadow-xl">
+      <section role="dialog" aria-modal="true" aria-label={bot ? 'Edit Agent' : 'Create Agent'} className="w-full max-w-xl rounded-xl border border-border bg-surface shadow-xl">
         <header className="flex items-center border-b border-border px-5 py-4">
           <div>
-            <h2 className="text-[15px] font-semibold text-ink">{bot ? 'Edit Bot' : 'Create Bot'}</h2>
+            <h2 className="text-[15px] font-semibold text-ink">{bot ? 'Edit Agent' : 'Create Agent'}</h2>
             <p className="mt-0.5 text-[11px] text-ink3">This identity is reused across conversations and app restarts.</p>
           </div>
           <button className="btn-ghost ml-auto rounded p-1.5" aria-label="Close" onClick={onClose}><IconX /></button>
@@ -335,7 +335,7 @@ function BotEditor({ bot, projectId, projects, onClose, onSaved, onDeleted }: {
           {bot && <button className="btn-ghost text-danger" onClick={() => void remove()} disabled={saving}><IconTrash width={13} /> Delete</button>}
           <div className="ml-auto flex gap-2">
             <button className="btn-outline" onClick={onClose} disabled={saving}>Cancel</button>
-            <button className="btn-primary" onClick={() => void save()} disabled={!valid || saving}>{saving ? 'Saving…' : bot ? 'Save changes' : 'Create Bot'}</button>
+            <button className="btn-primary" onClick={() => void save()} disabled={!valid || saving}>{saving ? 'Saving…' : bot ? 'Save changes' : 'Create Agent'}</button>
           </div>
         </footer>
       </section>

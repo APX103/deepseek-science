@@ -260,6 +260,8 @@ export interface Bot {
 
 export interface BotJob {
   id: string
+  profile_id: string
+  /** @deprecated compatibility alias; use profile_id for new code. */
   bot_id: string
   session_id: string
   prompt: string
@@ -277,7 +279,13 @@ export interface BotJob {
 }
 
 // ---------- Sessions ----------
-export type SessionStatus = 'processing' | 'completed' | 'failed' | 'interrupted' | 'awaiting'
+export type SessionStatus =
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'interrupted'
+  | 'awaiting'
+  | 'needs_reconciliation'
 
 export interface SessionSummary {
   id: string
@@ -383,8 +391,31 @@ export interface WorkspaceFile {
 }
 
 // ---------- Run / Compile ----------
-export type RunKind = 'natural' | 'awaiting' | 'max_iters' | 'error' | 'cancelled'
-export type AwaitingKind = 'user_response' | 'plan_approval' | 'plan_execution' | null
+export type RunKind =
+  | 'natural'
+  | 'awaiting'
+  | 'reconciliation'
+  | 'max_iters'
+  | 'error'
+  | 'cancelled'
+export type AwaitingKind =
+  | 'user_response'
+  | 'plan_approval'
+  | 'plan_execution'
+  | 'tool_reconciliation'
+  | null
+
+export interface ToolReconciliationCall {
+  call_id: string
+  run_id: string
+  attempt_id: string | null
+  tool_name: string
+  effect_class: 'external_side_effect'
+  status: 'started' | 'unknown'
+  input: Record<string, unknown>
+  detail: Record<string, unknown> | null
+  started_at: string
+}
 
 /** ask_user 工具挂起的提问（complete.pending_ask）。 */
 export interface PendingAskOption {
@@ -437,7 +468,7 @@ export type SSEEvent =
   | { type: 'text'; text: string }
   | { type: 'draft_reset'; reason: string }
   | { type: 'tool_calls'; calls: { id: string; name: string; input: Record<string, unknown> }[] }
-  | { type: 'tool_results'; results: { tool_use_id: string; content: string; is_error: boolean }[] }
+  | { type: 'tool_results'; results: { tool_use_id: string; content: string; is_error: boolean; outcome_unknown?: boolean }[] }
   | { type: 'plan_update'; plan: Plan }
   | { type: 'notice'; event: string; detail: string }
   | {

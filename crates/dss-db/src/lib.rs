@@ -4,6 +4,8 @@
 //! memories/artifacts/verification/compaction/frames/logs 留对应阶段。
 
 pub mod error;
+pub mod events;
+pub mod harness;
 pub mod repo;
 pub mod schema;
 

@@ -39,10 +39,11 @@ pub struct GateState {
 
 impl Session {
     pub fn new(id: impl Into<String>, workspace: PathBuf) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
+            frame: Frame::new_root_with_id(id.clone(), ""),
+            id,
             workspace,
-            frame: Frame::new_root(""),
             messages: Vec::new(),
             compaction: CompactionState::new(),
             gate_state: GateState::default(),

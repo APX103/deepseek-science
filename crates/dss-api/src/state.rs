@@ -535,6 +535,9 @@ pub struct AppState {
     pub(crate) session_restore_lock: Arc<Mutex<()>>,
     /// Exact-id cancellation registry shared across session restore races.
     pub(crate) run_controls: Arc<RunControlRegistry>,
+    /// Process-local handles for durable child executions. SQLite is authoritative;
+    /// this registry exists only so a parent can interrupt work hosted by this process.
+    pub(crate) subagent_tasks: Arc<crate::subagents::SubagentTaskRegistry>,
 }
 
 impl AppState {
@@ -1002,6 +1005,7 @@ pub async fn build_state(settings: Settings) -> Result<AppState, dss_db::DbError
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session_restore_lock: Arc::new(Mutex::new(())),
         run_controls: Arc::new(RunControlRegistry::default()),
+        subagent_tasks: Arc::new(crate::subagents::SubagentTaskRegistry::default()),
     })
 }
 

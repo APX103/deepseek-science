@@ -1,7 +1,7 @@
-//! Bot Mode persistence API.
+//! Agent Profile and JobRuntime compatibility API.
 //!
-//! A Bot is a durable identity. Sessions bind conversation context to that identity, while
-//! bot_jobs form a revisioned, restart-safe execution queue.
+//! Historical `/bots` and `/bot-jobs` routes remain aliases. Identity is an Agent Profile;
+//! execution is stored in the generic `agent_jobs` runtime table.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -216,6 +216,7 @@ fn validate_color(value: &str) -> Result<String, ApiError> {
 pub struct EnqueueJobRequest {
     #[serde(default)]
     id: Option<String>,
+    #[serde(alias = "profile_id")]
     bot_id: String,
     prompt: String,
     #[serde(default)]
@@ -261,7 +262,7 @@ fn validate_job_id(value: &str) -> Result<String, ApiError> {
     {
         Ok(trimmed.to_owned())
     } else {
-        Err(error(StatusCode::BAD_REQUEST, "invalid bot job id"))
+        Err(error(StatusCode::BAD_REQUEST, "invalid agent job id"))
     }
 }
 
@@ -469,12 +470,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bot_identity_session_and_durable_job_flow_survives_api_boundaries() {
+    async fn agent_profile_and_generic_job_flow_survives_api_boundaries() {
         let (app, _directory) = app().await;
         let (status, bot) = json_request(
             &app,
             "POST",
-            "/api/bots",
+            "/api/agent-profiles",
             json!({
                 "name": "Nova",
                 "role": "Literature scout",
@@ -502,10 +503,10 @@ mod tests {
         let (status, job) = json_request(
             &app,
             "POST",
-            &format!("/api/sessions/{session_id}/bot-jobs"),
+            &format!("/api/sessions/{session_id}/jobs"),
             json!({
                 "id": "job-client-stable",
-                "bot_id": bot_id,
+                "profile_id": bot_id,
                 "prompt": "Find the newest primary source",
                 "plan_mode": true
             }),
@@ -517,7 +518,7 @@ mod tests {
         let (status, claimed) = json_request(
             &app,
             "POST",
-            "/api/bot-jobs/job-client-stable/claim",
+            "/api/jobs/job-client-stable/claim",
             json!({"revision": 1, "run_id": "run-bot-e2e"}),
         )
         .await;
@@ -527,7 +528,7 @@ mod tests {
         let (status, completed) = json_request(
             &app,
             "POST",
-            "/api/bot-jobs/job-client-stable/finish",
+            "/api/jobs/job-client-stable/finish",
             json!({"run_id": "run-bot-e2e", "succeeded": true}),
         )
         .await;

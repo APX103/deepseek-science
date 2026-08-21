@@ -10,4 +10,4 @@
 - **风险**
 - **回顾**（阶段末填：实际做了什么、偏离、遗留）
 
-实现期创建。当前为空。
+当前实施阶段：[`P9-harness-foundation.md`](P9-harness-foundation.md)。

@@ -2,14 +2,40 @@
 //! 在 spawn_blocking 里跑同步 repo 函数（rusqlite::Connection 非 Send，必须这样访问）。
 
 use dss_db::{
+    events::{NewSessionEvent, SessionEventRow},
     repo,
     repo::{BotJobRow, BotRow, MessageRow, ProjectRow, RunRow, SessionRow},
     DbError, DbPool,
 };
 
+pub use dss_db::events::SessionEventKind;
 pub use dss_db::repo::{
-    PersistCheckpointRequest, PersistMessage, PersistRunRequest, PersistRunResult,
+    PersistAttemptLease, PersistCheckpointRequest, PersistMessage, PersistRunRequest,
+    PersistRunResult,
 };
+
+pub async fn resolve_tool_reconciliation(
+    pool: &DbPool,
+    run_id: String,
+    call_id: String,
+    succeeded: bool,
+    output: serde_json::Value,
+) -> Result<bool, DbError> {
+    with_conn(pool, move |conn| {
+        dss_db::harness::resolve_tool_reconciliation(conn, &run_id, &call_id, succeeded, &output)
+    })
+    .await
+}
+
+pub async fn list_frame_tree(
+    pool: &DbPool,
+    root_frame_id: String,
+) -> Result<Vec<dss_db::harness::ExecutionFrameRow>, DbError> {
+    with_conn(pool, move |conn| {
+        dss_db::harness::list_frame_tree(conn, &root_frame_id)
+    })
+    .await
+}
 
 /// 取连接并跑一个拿 &Connection 的闭包；interact 内部 spawn_blocking。
 pub(crate) async fn with_conn<F, T>(pool: &DbPool, f: F) -> Result<T, DbError>
@@ -37,7 +63,7 @@ pub async fn create_bot(
     model: Option<String>,
 ) -> Result<BotRow, DbError> {
     with_conn(pool, move |conn| {
-        repo::create_bot(
+        repo::create_agent_profile(
             conn,
             &name,
             &role,
@@ -52,11 +78,11 @@ pub async fn create_bot(
 }
 
 pub async fn list_bots(pool: &DbPool) -> Result<Vec<BotRow>, DbError> {
-    with_conn(pool, repo::list_bots).await
+    with_conn(pool, repo::list_agent_profiles).await
 }
 
 pub async fn get_bot(pool: &DbPool, id: String) -> Result<Option<BotRow>, DbError> {
-    with_conn(pool, move |conn| repo::get_bot(conn, &id)).await
+    with_conn(pool, move |conn| repo::get_agent_profile(conn, &id)).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -76,7 +102,7 @@ pub async fn update_bot(
     enabled: bool,
 ) -> Result<BotRow, DbError> {
     with_conn(pool, move |conn| {
-        repo::update_bot(
+        repo::update_agent_profile(
             conn,
             &id,
             expected_revision,
@@ -96,7 +122,7 @@ pub async fn update_bot(
 }
 
 pub async fn delete_bot(pool: &DbPool, id: String) -> Result<(), DbError> {
-    with_conn(pool, move |conn| repo::delete_bot(conn, &id)).await
+    with_conn(pool, move |conn| repo::delete_agent_profile(conn, &id)).await
 }
 
 pub async fn enqueue_bot_job(
@@ -108,7 +134,7 @@ pub async fn enqueue_bot_job(
     requested_plan_mode: bool,
 ) -> Result<BotJobRow, DbError> {
     with_conn(pool, move |conn| {
-        repo::enqueue_bot_job(
+        repo::enqueue_agent_job(
             conn,
             requested_id.as_deref(),
             &bot_id,
@@ -121,7 +147,7 @@ pub async fn enqueue_bot_job(
 }
 
 pub async fn list_bot_jobs(pool: &DbPool, session_id: String) -> Result<Vec<BotJobRow>, DbError> {
-    with_conn(pool, move |conn| repo::list_bot_jobs(conn, &session_id)).await
+    with_conn(pool, move |conn| repo::list_agent_jobs(conn, &session_id)).await
 }
 
 pub async fn edit_bot_job(
@@ -132,7 +158,7 @@ pub async fn edit_bot_job(
     requested_plan_mode: bool,
 ) -> Result<BotJobRow, DbError> {
     with_conn(pool, move |conn| {
-        repo::edit_bot_job(conn, &id, expected_revision, &prompt, requested_plan_mode)
+        repo::edit_agent_job(conn, &id, expected_revision, &prompt, requested_plan_mode)
     })
     .await
 }
@@ -143,7 +169,7 @@ pub async fn delete_bot_job(
     expected_revision: i64,
 ) -> Result<(), DbError> {
     with_conn(pool, move |conn| {
-        repo::delete_bot_job(conn, &id, expected_revision)
+        repo::delete_agent_job(conn, &id, expected_revision)
     })
     .await
 }
@@ -154,7 +180,7 @@ pub async fn reorder_bot_jobs(
     ordered_ids: Vec<String>,
 ) -> Result<Vec<BotJobRow>, DbError> {
     with_conn(pool, move |conn| {
-        repo::reorder_bot_jobs(conn, &session_id, &ordered_ids)
+        repo::reorder_agent_jobs(conn, &session_id, &ordered_ids)
     })
     .await
 }
@@ -165,7 +191,7 @@ pub async fn claim_next_bot_job(
     run_id: String,
 ) -> Result<Option<BotJobRow>, DbError> {
     with_conn(pool, move |conn| {
-        repo::claim_next_bot_job(conn, &session_id, &run_id)
+        repo::claim_next_agent_job(conn, &session_id, &run_id)
     })
     .await
 }
@@ -178,7 +204,7 @@ pub async fn finish_bot_job(
     error: Option<String>,
 ) -> Result<BotJobRow, DbError> {
     with_conn(pool, move |conn| {
-        repo::finish_bot_job(conn, &id, &run_id, succeeded, error.as_deref())
+        repo::settle_agent_job(conn, &id, &run_id, succeeded, error.as_deref())
     })
     .await
 }
@@ -190,7 +216,7 @@ pub async fn claim_bot_job(
     run_id: String,
 ) -> Result<BotJobRow, DbError> {
     with_conn(pool, move |conn| {
-        repo::claim_bot_job(conn, &id, expected_revision, &run_id)
+        repo::claim_agent_job(conn, &id, expected_revision, &run_id)
     })
     .await
 }
@@ -355,6 +381,35 @@ pub async fn get_session_plan(pool: &DbPool, id: String) -> Result<Option<String
     with_conn(pool, move |c| repo::get_session_plan(c, &id)).await
 }
 
+pub async fn get_session_compaction_state(
+    pool: &DbPool,
+    id: String,
+) -> Result<Option<String>, DbError> {
+    with_conn(pool, move |c| repo::get_session_compaction_state(c, &id)).await
+}
+
+pub async fn append_session_event(
+    pool: &DbPool,
+    event: NewSessionEvent,
+) -> Result<SessionEventRow, DbError> {
+    with_conn(pool, move |c| {
+        dss_db::events::append_session_event(c, &event)
+    })
+    .await
+}
+
+pub async fn list_session_events(
+    pool: &DbPool,
+    session_id: String,
+    after_seq: i64,
+    limit: usize,
+) -> Result<Vec<SessionEventRow>, DbError> {
+    with_conn(pool, move |c| {
+        dss_db::events::list_session_events(c, &session_id, after_seq, limit)
+    })
+    .await
+}
+
 pub async fn delete_session_row(pool: &DbPool, id: String) -> Result<(), DbError> {
     with_conn(pool, move |c| repo::delete_session(c, &id)).await
 }
@@ -394,6 +449,87 @@ pub async fn append_history_checkpoint(
     request: PersistCheckpointRequest,
 ) -> Result<usize, DbError> {
     with_conn(pool, move |c| repo::append_history_checkpoint(c, &request)).await
+}
+
+pub async fn record_tool_call_started(
+    pool: &DbPool,
+    call_id: String,
+    run_id: String,
+    attempt: PersistAttemptLease,
+    tool_name: String,
+    effect_class: String,
+    input: serde_json::Value,
+) -> Result<(), DbError> {
+    with_conn(pool, move |conn| {
+        dss_db::harness::record_tool_call_started(
+            conn,
+            &dss_db::harness::ToolCallStart {
+                call_id: &call_id,
+                run_id: &run_id,
+                attempt_id: &attempt.attempt_id,
+                lease_token: &attempt.lease_token,
+                tool_name: &tool_name,
+                effect_class: &effect_class,
+                input: &input,
+                idempotency_key: None,
+            },
+        )
+    })
+    .await
+}
+
+pub async fn record_tool_call_settled(
+    pool: &DbPool,
+    call_id: String,
+    run_id: String,
+    attempt: PersistAttemptLease,
+    succeeded: bool,
+    output: serde_json::Value,
+) -> Result<(), DbError> {
+    with_conn(pool, move |conn| {
+        dss_db::harness::record_tool_call_settled(
+            conn,
+            &call_id,
+            &run_id,
+            &attempt.attempt_id,
+            &attempt.lease_token,
+            succeeded,
+            &output,
+        )
+    })
+    .await
+}
+
+pub async fn record_tool_call_uncertain(
+    pool: &DbPool,
+    call_id: String,
+    run_id: String,
+    attempt: PersistAttemptLease,
+    reason: String,
+    detail: serde_json::Value,
+) -> Result<(), DbError> {
+    with_conn(pool, move |conn| {
+        dss_db::harness::record_tool_call_uncertain(
+            conn,
+            &call_id,
+            &run_id,
+            &attempt.attempt_id,
+            &attempt.lease_token,
+            &reason,
+            &detail,
+        )
+    })
+    .await
+}
+
+pub async fn list_unresolved_tool_calls(
+    pool: &DbPool,
+    run_id: String,
+) -> Result<Vec<dss_db::harness::UnresolvedToolCallRow>, DbError> {
+    with_conn(pool, move |conn| {
+        dss_db::harness::list_unresolved_tool_calls(conn, &run_id)
+    })
+    .await
 }
 
 /// 批量顺序写入若干消息（一个 interact 任务里，避免多次取连接）。

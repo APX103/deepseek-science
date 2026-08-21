@@ -30,6 +30,10 @@ pub struct AskUserTool;
 
 #[async_trait]
 impl Tool for AskUserTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::Idempotent
+    }
+
     fn spec(&self) -> ToolSpec {
         ask_spec()
     }

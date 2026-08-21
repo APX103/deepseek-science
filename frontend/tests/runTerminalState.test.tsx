@@ -71,6 +71,38 @@ describe('run terminal state', () => {
     expect(normalizeSessionStatus('ERRORED')).toBe('failed')
     expect(normalizeSessionStatus('future_terminal_state')).toBe('failed')
     expect(normalizeSessionStatus('completed')).toBe('completed')
+    expect(normalizeSessionStatus('needs_reconciliation')).toBe('needs_reconciliation')
+  })
+
+  test('reconciliation is rendered as an actionable safety boundary, not a generic failure', () => {
+    const reconciliation = run({
+      status: 'needs_reconciliation',
+      kind: 'reconciliation',
+      awaiting: 'tool_reconciliation',
+      error: 'External result unknown',
+      completed_at: null,
+    })
+    const html = renderToStaticMarkup(<RunFooter run={reconciliation} />)
+    expect(html).toContain('外部工具结果未知')
+    expect(html).toContain('等待外部结果对账')
+    expect(html).not.toContain('Agent Failed')
+    expect(
+      hasPersistedRunFailure([{ role: 'assistant', content: '', run: reconciliation }]),
+    ).toBe(false)
+
+    const restored = mapSessionRun({
+      run_id: reconciliation.run_id,
+      ordinal: reconciliation.ordinal,
+      frame_id: reconciliation.frame_id,
+      task_summary: reconciliation.task_summary,
+      plan_mode: false,
+      status: 'needs_reconciliation',
+      kind: 'reconciliation',
+      awaiting: 'tool_reconciliation',
+      error: reconciliation.error,
+      started_at: reconciliation.started_at,
+    })
+    expect(restored.status).toBe('needs_reconciliation')
   })
 
   test('restored failed status renders failure even with natural kind and no error detail', () => {
@@ -92,5 +124,53 @@ describe('run terminal state', () => {
     expect(html).toContain('已完成')
     expect(html).not.toContain('Agent Failed')
     expect(html).not.toContain('以上输出可能不完整')
+  })
+
+  test('restored interrupted run never masquerades as completed', () => {
+    const interrupted = run({
+      status: 'interrupted',
+      kind: 'cancelled',
+      error: 'App exited before this run completed',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      iterations: 0,
+    })
+    const html = renderToStaticMarkup(
+      <RunFooter run={interrupted} />,
+    )
+    expect(html).toContain('已停止')
+    expect(html).not.toContain('已完成')
+    expect(html).not.toContain('Agent Failed')
+    expect(hasPersistedRunFailure([{ role: 'assistant', content: '', run: interrupted }])).toBe(
+      false,
+    )
+
+    const restored = mapSessionRun({
+      run_id: interrupted.run_id,
+      ordinal: interrupted.ordinal,
+      frame_id: interrupted.frame_id,
+      task_summary: interrupted.task_summary,
+      plan_mode: false,
+      status: 'interrupted',
+      kind: 'cancelled',
+      error: interrupted.error,
+      started_at: interrupted.started_at,
+    })
+    expect(restored.status).toBe('interrupted')
+  })
+
+  test('legacy interrupted status is truthful even when kind is missing', () => {
+    const html = renderToStaticMarkup(
+      <RunFooter
+        run={run({
+          status: 'interrupted',
+          kind: null,
+          error: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+          iterations: 0,
+        })}
+      />,
+    )
+    expect(html).toContain('已停止')
+    expect(html).not.toContain('已完成')
   })
 })

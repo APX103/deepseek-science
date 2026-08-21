@@ -13,10 +13,10 @@ pub mod spec;
 
 pub use context::{
     HistoryCheckpoint, HistoryCheckpointState, PendingAsk, PendingAskOption, PlanState, PlanStep,
-    SecureWorkspace, ToolContext, WorkspaceEntry,
+    SecureWorkspace, SubagentRuntime, ToolAuditSink, ToolContext, WorkspaceEntry,
 };
 pub use error::ToolError;
 pub use router::{
     parse_arguments, PendingToolCall, ToolRegistry, ToolRegistryError, ToolResult, ToolRouter,
 };
-pub use spec::{Tool, ToolBatchPolicy, ToolDef, ToolOutput, ToolSpec};
+pub use spec::{Tool, ToolBatchPolicy, ToolDef, ToolEffectClass, ToolOutput, ToolSpec};

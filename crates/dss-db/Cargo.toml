@@ -16,3 +16,6 @@ rusqlite.workspace = true
 deadpool.workspace = true
 deadpool-sqlite.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

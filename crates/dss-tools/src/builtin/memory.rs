@@ -28,6 +28,10 @@ pub struct SearchMemoryTool;
 
 #[async_trait]
 impl Tool for SearchMemoryTool {
+    fn effect_class(&self, _args: &serde_json::Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search_memory".into(),
@@ -107,6 +111,10 @@ pub struct ReadMemoryTool;
 
 #[async_trait]
 impl Tool for ReadMemoryTool {
+    fn effect_class(&self, _args: &serde_json::Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_memory".into(),

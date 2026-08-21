@@ -21,6 +21,12 @@ struct DelegateArgs {
     task: String,
     #[serde(default)]
     context_summary: Option<String>,
+    #[serde(default = "default_wait")]
+    wait: bool,
+}
+
+fn default_wait() -> bool {
+    true
 }
 
 #[async_trait]
@@ -34,6 +40,7 @@ impl Tool for DelegateTool {
                 "properties": {
                     "task": { "type": "string", "description": "The subtask to delegate (should be self-contained and specific)." },
                     "context_summary": { "type": "string", "description": "Brief context for the subtask (optional)." }
+                    ,"wait": { "type": "boolean", "description": "Wait for the result. Set false to dispatch and collect later.", "default": true }
                 },
                 "required": ["task"]
             }),
@@ -49,6 +56,15 @@ impl Tool for DelegateTool {
         }
 
         let a: DelegateArgs = parse_args(&args)?;
+        if let Some(runtime) = ctx.subagents.as_ref() {
+            return match runtime
+                .delegate(&a.task, a.context_summary.as_deref(), a.wait)
+                .await
+            {
+                Ok(value) => Ok(ToolOutput::ok(value.to_string())),
+                Err(error) => Ok(ToolOutput::err(error)),
+            };
+        }
         let Some(llm) = ctx.llm.as_ref() else {
             return Ok(ToolOutput::err("LLM not available for delegation"));
         };
@@ -78,6 +94,130 @@ impl Tool for DelegateTool {
                 Ok(ToolOutput::ok(text))
             }
             Err(e) => Ok(ToolOutput::err(format!("delegate LLM call failed: {e}"))),
+        }
+    }
+}
+
+pub struct CollectChildrenTool;
+
+#[derive(Deserialize)]
+struct CollectArgs {
+    frame_ids: Vec<String>,
+    #[serde(default = "default_collect_timeout")]
+    timeout_seconds: u64,
+}
+
+fn default_collect_timeout() -> u64 {
+    30
+}
+
+#[async_trait]
+impl Tool for CollectChildrenTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "collect_children".into(),
+            description: "Collect durable results from previously delegated child Frames. Waiting is bounded; a timeout never cancels the child.".into(),
+            parameters: json!({"type":"object","properties":{"frame_ids":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":0,"maximum":1800,"default":30}},"required":["frame_ids"]}),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError> {
+        let args: CollectArgs = parse_args(&args)?;
+        let Some(runtime) = ctx.subagents.as_ref() else {
+            return Ok(ToolOutput::err("durable subagent runtime is unavailable"));
+        };
+        match runtime
+            .collect(&args.frame_ids, args.timeout_seconds.min(1800))
+            .await
+        {
+            Ok(value) => Ok(ToolOutput::ok(value.to_string())),
+            Err(error) => Ok(ToolOutput::err(error)),
+        }
+    }
+}
+
+pub struct SendChildMessageTool;
+
+#[derive(Deserialize)]
+struct SendArgs {
+    frame_id: String,
+    message: String,
+}
+
+#[async_trait]
+impl Tool for SendChildMessageTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "send_child_message".into(),
+            description: "Send a durable message to an idle direct child Frame. A busy child rejects the message instead of pretending it can consume mid-Run input; wait for its result or stop it first. A completed child resumes on a new Run while retaining its Frame transcript.".into(),
+            parameters: json!({"type":"object","properties":{"frame_id":{"type":"string"},"message":{"type":"string"}},"required":["frame_id","message"]}),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError> {
+        let args: SendArgs = parse_args(&args)?;
+        let Some(runtime) = ctx.subagents.as_ref() else {
+            return Ok(ToolOutput::err("durable subagent runtime is unavailable"));
+        };
+        match runtime.send_message(&args.frame_id, &args.message).await {
+            Ok(value) => Ok(ToolOutput::ok(value.to_string())),
+            Err(error) => Ok(ToolOutput::err(error)),
+        }
+    }
+}
+
+pub struct StopChildTool;
+
+#[derive(Deserialize)]
+struct ChildIdArgs {
+    frame_id: String,
+}
+
+#[async_trait]
+impl Tool for StopChildTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "stop_child".into(),
+            description: "Cancel the active Run of a direct child Frame without deleting its transcript or Frame identity.".into(),
+            parameters: json!({"type":"object","properties":{"frame_id":{"type":"string"}},"required":["frame_id"]}),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError> {
+        let args: ChildIdArgs = parse_args(&args)?;
+        let Some(runtime) = ctx.subagents.as_ref() else {
+            return Ok(ToolOutput::err("durable subagent runtime is unavailable"));
+        };
+        match runtime.stop_child(&args.frame_id).await {
+            Ok(value) => Ok(ToolOutput::ok(value.to_string())),
+            Err(error) => Ok(ToolOutput::err(error)),
+        }
+    }
+}
+
+pub struct ListChildrenTool;
+
+#[async_trait]
+impl Tool for ListChildrenTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_children".into(),
+            description: "List durable direct child Frames and their current activity.".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, _args: Value) -> Result<ToolOutput, ToolError> {
+        let Some(runtime) = ctx.subagents.as_ref() else {
+            return Ok(ToolOutput::err("durable subagent runtime is unavailable"));
+        };
+        match runtime.children().await {
+            Ok(value) => Ok(ToolOutput::ok(value.to_string())),
+            Err(error) => Ok(ToolOutput::err(error)),
         }
     }
 }

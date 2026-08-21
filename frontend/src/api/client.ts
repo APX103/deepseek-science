@@ -361,6 +361,7 @@ export function normalizeSessionStatus(status: string): SessionSummary["status"]
     canceled: "interrupted",
     interrupted: "interrupted",
     stopped: "interrupted",
+    needs_reconciliation: "needs_reconciliation",
   };
   return statusMap[status.trim().toLowerCase()] ?? "failed";
 }
@@ -386,6 +387,7 @@ export interface SessionRunBE {
 }
 
 export function mapSessionRun(run: SessionRunBE): SessionRun {
+  const normalizedStatus = normalizeSessionStatus(run.status)
   const error =
     run.error ??
     (run.kind === "error"
@@ -400,9 +402,13 @@ export function mapSessionRun(run: SessionRunBE): SessionRun {
     task_summary: run.task_summary,
     plan_mode: run.plan_mode,
     status:
-      run.kind === "error" || run.kind === "max_iters" || error
+      run.kind === "reconciliation" || normalizedStatus === "needs_reconciliation"
+        ? "needs_reconciliation"
+        : run.kind === "cancelled" || normalizedStatus === "interrupted"
+        ? "interrupted"
+        : run.kind === "error" || run.kind === "max_iters" || error
         ? "failed"
-        : normalizeSessionStatus(run.status),
+        : normalizedStatus,
     kind: run.kind,
     awaiting: run.awaiting ?? null,
     pending_ask: run.pending_ask ?? null,
@@ -508,9 +514,9 @@ export async function getSession(sid: string): Promise<SessionState> {
   };
 }
 
-// ---------- Bot Mode ----------
+// ---------- Agent Profiles + durable jobs ----------
 export async function listBots(): Promise<Bot[]> {
-  return request<Bot[]>("/bots");
+  return request<Bot[]>("/agent-profiles");
 }
 
 export async function createBot(input: {
@@ -522,7 +528,7 @@ export async function createBot(input: {
   project_id?: string
   model?: string
 }): Promise<Bot> {
-  return request<Bot>("/bots", {
+  return request<Bot>("/agent-profiles", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -542,7 +548,7 @@ export async function updateBot(botId: string, input: {
   thinking_effort?: Bot["thinking_effort"]
   enabled: boolean
 }): Promise<Bot> {
-  return request<Bot>(`/bots/${encodeURIComponent(botId)}`, {
+  return request<Bot>(`/agent-profiles/${encodeURIComponent(botId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -550,21 +556,22 @@ export async function updateBot(botId: string, input: {
 }
 
 export async function deleteBot(botId: string): Promise<void> {
-  return request<void>(`/bots/${encodeURIComponent(botId)}`, { method: "DELETE" });
+  return request<void>(`/agent-profiles/${encodeURIComponent(botId)}`, { method: "DELETE" });
 }
 
 export async function listBotJobs(sessionId: string): Promise<BotJob[]> {
-  return request<BotJob[]>(`/sessions/${encodeURIComponent(sessionId)}/bot-jobs`);
+  return request<BotJob[]>(`/sessions/${encodeURIComponent(sessionId)}/jobs`);
 }
 
 export async function enqueueBotJob(
   sessionId: string,
   input: { id: string; bot_id: string; prompt: string; plan_mode: boolean },
 ): Promise<BotJob> {
-  return request<BotJob>(`/sessions/${encodeURIComponent(sessionId)}/bot-jobs`, {
+  const { bot_id: profile_id, ...job } = input;
+  return request<BotJob>(`/sessions/${encodeURIComponent(sessionId)}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
+    body: JSON.stringify({ ...job, profile_id }),
   });
 }
 
@@ -572,7 +579,7 @@ export async function editBotJob(
   jobId: string,
   input: { revision: number; prompt: string; plan_mode: boolean },
 ): Promise<BotJob> {
-  return request<BotJob>(`/bot-jobs/${encodeURIComponent(jobId)}`, {
+  return request<BotJob>(`/jobs/${encodeURIComponent(jobId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -580,7 +587,7 @@ export async function editBotJob(
 }
 
 export async function deleteBotJob(jobId: string, revision: number): Promise<void> {
-  return request<void>(`/bot-jobs/${encodeURIComponent(jobId)}`, {
+  return request<void>(`/jobs/${encodeURIComponent(jobId)}`, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ revision }),
@@ -588,7 +595,7 @@ export async function deleteBotJob(jobId: string, revision: number): Promise<voi
 }
 
 export async function reorderBotJobs(sessionId: string, orderedIds: string[]): Promise<BotJob[]> {
-  return request<BotJob[]>(`/sessions/${encodeURIComponent(sessionId)}/bot-jobs/reorder`, {
+  return request<BotJob[]>(`/sessions/${encodeURIComponent(sessionId)}/jobs/reorder`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ordered_ids: orderedIds }),
@@ -596,7 +603,7 @@ export async function reorderBotJobs(sessionId: string, orderedIds: string[]): P
 }
 
 export async function claimBotJob(jobId: string, revision: number, runId: string): Promise<BotJob> {
-  return request<BotJob>(`/bot-jobs/${encodeURIComponent(jobId)}/claim`, {
+  return request<BotJob>(`/jobs/${encodeURIComponent(jobId)}/claim`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ revision, run_id: runId }),
@@ -609,7 +616,7 @@ export async function finishBotJob(
   succeeded: boolean,
   error?: string | null,
 ): Promise<BotJob> {
-  return request<BotJob>(`/bot-jobs/${encodeURIComponent(jobId)}/finish`, {
+  return request<BotJob>(`/jobs/${encodeURIComponent(jobId)}/finish`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ run_id: runId, succeeded, error }),
@@ -645,6 +652,36 @@ export async function cancelSessionRun(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ run_id: runId }),
+    },
+  );
+}
+
+export async function listToolReconciliation(
+  sid: string,
+  runId: string,
+): Promise<import('../types').ToolReconciliationCall[]> {
+  const result = await request<{ calls: import('../types').ToolReconciliationCall[] }>(
+    `/sessions/${encodeURIComponent(sid)}/runs/${encodeURIComponent(runId)}/reconcile-tool`,
+  );
+  return result.calls;
+}
+
+export async function reconcileToolCall(
+  sid: string,
+  runId: string,
+  callId: string,
+  succeeded: boolean,
+): Promise<{ ready_to_resume: boolean }> {
+  return request<{ ready_to_resume: boolean }>(
+    `/sessions/${encodeURIComponent(sid)}/runs/${encodeURIComponent(runId)}/reconcile-tool`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        call_id: callId,
+        succeeded,
+        output: { operator_resolution: succeeded ? 'confirmed_succeeded' : 'confirmed_failed' },
+      }),
     },
   );
 }

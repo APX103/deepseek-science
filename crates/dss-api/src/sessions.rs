@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
@@ -244,6 +244,124 @@ pub async fn get_session(
         "artifacts": {},
         "messages": messages,
         "runs": runs,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditEventsQuery {
+    #[serde(default)]
+    after_seq: i64,
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+fn default_audit_limit() -> usize {
+    200
+}
+
+/// Ordered durable facts for audit, replay and incremental projection consumers.
+pub async fn list_audit_events(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    Query(query): Query<AuditEventsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if dbq::get_session_row(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?
+        .is_none()
+    {
+        return Err(json_error(StatusCode::NOT_FOUND, "session not found"));
+    }
+    let events = dbq::list_session_events(&state.db, sid, query.after_seq, query.limit)
+        .await
+        .map_err(map_db_err)?;
+    let next_after_seq = events
+        .last()
+        .map_or(query.after_seq.max(0), |event| event.seq);
+    Ok(Json(json!({
+        "events": events,
+        "next_after_seq": next_after_seq,
+    })))
+}
+
+/// Stable Frame topology and current activity projection for audit/debug UIs.
+pub async fn list_frames(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if dbq::get_session_row(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?
+        .is_none()
+    {
+        return Err(json_error(StatusCode::NOT_FOUND, "session not found"));
+    }
+    let frames = dbq::list_frame_tree(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?;
+    Ok(Json(json!({"root_frame_id": sid, "frames": frames})))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconcileToolReq {
+    call_id: String,
+    succeeded: bool,
+    #[serde(default)]
+    output: Value,
+}
+
+/// List the external tool calls that prevent this Run from being resumed. This endpoint exposes
+/// the exact durable call ids consumed by `reconcile_tool`; callers never need to scrape events.
+pub async fn list_tool_reconciliation(
+    State(state): State<AppState>,
+    Path((sid, run_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let run_belongs_to_session = dbq::list_runs(&state.db, sid)
+        .await
+        .map_err(map_db_err)?
+        .into_iter()
+        .any(|run| run.run_id == run_id);
+    if !run_belongs_to_session {
+        return Err(json_error(StatusCode::NOT_FOUND, "run not found"));
+    }
+    let calls = dbq::list_unresolved_tool_calls(&state.db, run_id.clone())
+        .await
+        .map_err(map_db_err)?;
+    Ok(Json(json!({"run_id": run_id, "calls": calls})))
+}
+
+/// Human/operator resolution for an external tool call whose result became unknown at restart.
+pub async fn reconcile_tool(
+    State(state): State<AppState>,
+    Path((sid, run_id)): Path<(String, String)>,
+    Json(request): Json<ReconcileToolReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let run_belongs_to_session = dbq::list_runs(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?
+        .into_iter()
+        .any(|run| run.run_id == run_id);
+    if !run_belongs_to_session {
+        return Err(json_error(StatusCode::NOT_FOUND, "run not found"));
+    }
+    let ready_to_resume = dbq::resolve_tool_reconciliation(
+        &state.db,
+        run_id.clone(),
+        request.call_id.clone(),
+        request.succeeded,
+        request.output,
+    )
+    .await
+    .map_err(map_db_err)?;
+    if ready_to_resume {
+        // Reconciliation appended a canonical tool-result message directly in SQLite.
+        // Evict the cold cache so the resumed attempt cannot miss that transcript entry.
+        state.sessions.lock().await.remove(&sid);
+    }
+    Ok(Json(json!({
+        "run_id": run_id,
+        "call_id": request.call_id,
+        "ready_to_resume": ready_to_resume,
     })))
 }
 
@@ -569,9 +687,7 @@ async fn restore_session(
     // 恢复历史与 frame 摘要。
     session.messages = messages;
     if let Some(latest_run) = runs.last() {
-        session.frame.id = latest_run.frame_id.clone();
         session.frame.task_summary = latest_run.task_summary.clone();
-        session.frame.root_frame_id = Some(latest_run.frame_id.clone());
     } else if let Some(t) = row.title {
         session.frame.task_summary = t;
     }
@@ -582,6 +698,7 @@ async fn restore_session(
         "awaiting_plan_approval" => FrameStatus::AwaitingPlanApproval,
         "awaiting_plan_execution" => FrameStatus::AwaitingPlanExecution,
         "awaiting_user_response" | "awaiting" => FrameStatus::AwaitingUserResponse,
+        "needs_reconciliation" => FrameStatus::NeedsReconciliation,
         _ => FrameStatus::Completed,
     };
     session.frame.set_status(restored_status);
@@ -589,6 +706,14 @@ async fn restore_session(
     if let Ok(Some(json)) = dbq::get_session_plan(&state.db, sid.to_string()).await {
         if let Ok(plan) = serde_json::from_str::<dss_tools::PlanState>(&json) {
             session.plan = Some(plan);
+        }
+    }
+    if let Some(json) = dbq::get_session_compaction_state(&state.db, sid.to_string()).await? {
+        match serde_json::from_str::<dss_compact::CompactionState>(&json) {
+            Ok(compaction) => session.compaction = compaction,
+            Err(error) => {
+                tracing::warn!(%error, session_id = sid, "ignoring invalid persisted compaction state");
+            }
         }
     }
 
@@ -814,6 +939,7 @@ fn complete_kind_name(kind: CompleteKind) -> &'static str {
     match kind {
         CompleteKind::Natural => "natural",
         CompleteKind::Awaiting => "awaiting",
+        CompleteKind::NeedsReconciliation => "reconciliation",
         CompleteKind::MaxIters => "max_iters",
         CompleteKind::Error => "error",
         CompleteKind::Cancelled => "cancelled",
@@ -890,6 +1016,62 @@ struct CheckpointWorkerContext {
     durable_checkpoint: Arc<StdMutex<Option<DurableToolCheckpointSnapshot>>>,
     initial_count: usize,
     initial_title: String,
+    attempt: Option<dbq::PersistAttemptLease>,
+}
+
+struct DurableToolAudit {
+    db: Arc<dss_db::DbPool>,
+    run_id: String,
+    attempt: dbq::PersistAttemptLease,
+}
+
+#[async_trait::async_trait]
+impl dss_tools::ToolAuditSink for DurableToolAudit {
+    async fn started(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        effect_class: dss_tools::ToolEffectClass,
+        input: &Value,
+    ) -> Result<(), String> {
+        dbq::record_tool_call_started(
+            &self.db,
+            call_id.into(),
+            self.run_id.clone(),
+            self.attempt.clone(),
+            tool_name.into(),
+            effect_class.as_str().into(),
+            input.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn settled(&self, call_id: &str, succeeded: bool, output: &Value) -> Result<(), String> {
+        dbq::record_tool_call_settled(
+            &self.db,
+            call_id.into(),
+            self.run_id.clone(),
+            self.attempt.clone(),
+            succeeded,
+            output.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn uncertain(&self, call_id: &str, reason: &str, output: &Value) -> Result<(), String> {
+        dbq::record_tool_call_uncertain(
+            &self.db,
+            call_id.into(),
+            self.run_id.clone(),
+            self.attempt.clone(),
+            reason.into(),
+            output.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
 }
 
 async fn persist_history_checkpoints(
@@ -910,6 +1092,7 @@ async fn persist_history_checkpoints(
             pending_ask,
             status,
             awaiting,
+            compaction_state,
             ack,
         } = checkpoint;
         let serialized = messages
@@ -947,10 +1130,14 @@ async fn persist_history_checkpoints(
                         awaiting: awaiting.clone(),
                         pending_ask_json,
                         plan_data,
+                        compaction_state,
                         title: title.take(),
                         started_at: context.started_at.clone(),
                         expected_count,
                         messages,
+                        accepted_event_payload: None,
+                        resumed_event_payload: None,
+                        attempt: context.attempt.clone(),
                     },
                 )
                 .await
@@ -970,6 +1157,7 @@ async fn persist_history_checkpoints(
                     "awaiting_plan_approval" => FrameStatus::AwaitingPlanApproval,
                     "awaiting_plan_execution" => FrameStatus::AwaitingPlanExecution,
                     "awaiting_user_response" | "awaiting" => FrameStatus::AwaitingUserResponse,
+                    "needs_reconciliation" => FrameStatus::NeedsReconciliation,
                     "failed" => FrameStatus::Failed,
                     "cancelled" | "interrupted" => FrameStatus::Cancelled,
                     "completed" => FrameStatus::Completed,
@@ -1030,6 +1218,39 @@ pub async fn stream_sse(
 
     let plan_mode = req.plan_mode.unwrap_or(false);
     let execute_plan = req.execute_plan.unwrap_or(false);
+    let latest_open_run = dbq::list_runs(&state.db, sid.clone())
+        .await
+        .map_err(map_db_err)?
+        .into_iter()
+        .rev()
+        .find(|run| run.completed_at.is_none());
+    if latest_open_run
+        .as_ref()
+        .is_some_and(|run| run.status == "needs_reconciliation")
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "the previous Run has an external side effect with unknown outcome; reconcile it before continuing",
+        ));
+    }
+    let resumes_parked_run = latest_open_run.as_ref().is_some_and(|run| {
+        run.status == "interrupted"
+            || run.status == "awaiting_user_response"
+            || (execute_plan && run.status == "awaiting_plan_execution")
+    });
+    let parked_run = resumes_parked_run
+        .then(|| latest_open_run.clone())
+        .flatten();
+    if resumes_parked_run && parked_run.is_none() {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "session is awaiting but its durable Run is not resumable",
+        ));
+    }
+    let durable_run_id = parked_run
+        .as_ref()
+        .map(|run| run.run_id.clone())
+        .unwrap_or_else(|| run_id.clone());
     let initial_plan = select_run_plan(session.plan.as_ref(), plan_mode, execute_plan).map_err(
         |error| match error {
             RunPlanError::ConflictingModes => json_error(
@@ -1075,6 +1296,7 @@ pub async fn stream_sse(
     .await
     .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
     let tools = Arc::new(run_tools);
+    let tool_definitions = tools.definitions();
     let a2a_catalog_notice = dss_tools::builtin::a2a::harness_catalog_notice(runtime.a2a());
 
     // Publish cancellation before the first fallible/awaiting acceptance step.
@@ -1122,7 +1344,7 @@ pub async fn stream_sse(
     let memory = state.memory.clone();
     let prompt = req.prompt;
     let sid_clone = sid.clone();
-    let run_id_for_persist = run_id.clone();
+    let run_id_for_persist = durable_run_id.clone();
     let run_id_for_extract = run_id.clone();
     let run_started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let persistence_control = run_control.clone();
@@ -1171,6 +1393,116 @@ pub async fn stream_sse(
     } else {
         None
     };
+
+    // Acceptance is the first durable run checkpoint, not merely an audit event. Commit the
+    // event, processing projection, and canonical user message together before contacting the
+    // provider. A process kill at any later instruction boundary can therefore be recovered as
+    // an interrupted run without losing the request from the transcript.
+    let before_accept = DurableSessionSnapshot::capture(&session);
+    let persisted_before_accept = validated_persistence_cursor(&active, &before_accept).map_err(
+        |(persisted, messages_len)| {
+            tracing::error!(
+                sid = %sid,
+                persisted,
+                messages_len,
+                "refusing run acceptance with a drifted persistence cursor"
+            );
+            json_error(StatusCode::CONFLICT, "session persistence cursor drifted")
+        },
+    )?;
+    session
+        .frame
+        .start_run(prompt.chars().take(80).collect::<String>());
+    let attempt_lease = dbq::PersistAttemptLease {
+        attempt_id: uuid::Uuid::new_v4().to_string(),
+        lease_token: uuid::Uuid::new_v4().to_string(),
+        lease_owner: format!("dss-api:{}", std::process::id()),
+        // The frontend-compatible worker has no heartbeat yet. Startup reconciliation remains
+        // authoritative, while this bound still prevents an abandoned lease living forever.
+        lease_expires_at: (chrono::Utc::now() + chrono::Duration::hours(24))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    };
+    let accepted_message = ChatMessage::user(&prompt);
+    let accepted_content = serde_json::to_string(&accepted_message).map_err(|error| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to serialize accepted prompt: {error}"),
+        )
+    })?;
+    session.messages.push(accepted_message);
+    let accepted_count = match dbq::append_history_checkpoint(
+        &state.db,
+        dbq::PersistCheckpointRequest {
+            run_id: durable_run_id.clone(),
+            session_id: sid.clone(),
+            frame_id: session.frame.id.clone(),
+            task_summary: session.frame.task_summary.clone(),
+            plan_mode,
+            status: "processing".into(),
+            awaiting: None,
+            pending_ask_json: None,
+            plan_data: session
+                .plan
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to serialize accepted plan: {error}"),
+                    )
+                })?,
+            compaction_state: serde_json::to_string(&session.compaction).ok(),
+            title: set_initial_title.then(|| prompt.chars().take(60).collect()),
+            started_at: run_started_at.clone(),
+            expected_count: persisted_before_accept,
+            messages: vec![dbq::PersistMessage {
+                role: "user".into(),
+                content: accepted_content,
+                harness_notice: false,
+            }],
+            accepted_event_payload: (!resumes_parked_run).then(|| {
+                json!({
+                    "request": {
+                        "prompt": prompt,
+                        "plan_mode": plan_mode,
+                        "execute_plan": execute_plan,
+                    },
+                    "envelope": {
+                        "model": model,
+                        "tools": tool_definitions,
+                        "started_at": run_started_at,
+                    }
+                })
+            }),
+            resumed_event_payload: resumes_parked_run.then(|| {
+                json!({
+                    "request": {
+                        "prompt": prompt,
+                        "execute_plan": execute_plan,
+                    },
+                    "client_run_id": run_id,
+                    "previous_status": parked_run.as_ref().map(|run| run.status.as_str()),
+                })
+            }),
+            attempt: Some(attempt_lease.clone()),
+        },
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            before_accept.restore(&mut session);
+            return Err(map_db_err(error));
+        }
+    };
+    active
+        .persisted_count
+        .store(accepted_count, std::sync::atomic::Ordering::Relaxed);
+    let accepted_start_seq = parked_run
+        .as_ref()
+        .and_then(|run| run.start_seq)
+        .unwrap_or(persisted_before_accept as i64 + 1);
 
     tokio::spawn(async move {
         let _finish_guard = finish_guard;
@@ -1262,14 +1594,27 @@ pub async fn stream_sse(
             let mut tc = ToolContext::new(session.workspace.clone())
                 .with_skill_catalog(cat)
                 .with_mcp_arc(mcp_runtime.manager.clone())
-                .with_history_checkpoint(history_checkpoint_tx);
+                .with_history_checkpoint(history_checkpoint_tx)
+                .with_tool_audit(Arc::new(DurableToolAudit {
+                    db: db.clone(),
+                    run_id: run_id_for_persist.clone(),
+                    attempt: attempt_lease.clone(),
+                }));
             tc = tc.with_plan(initial_plan).await;
             // 注入 LLM（delegate 工具用）。
             if let Some(client) = &llm {
-                tc = tc.with_llm(
-                    client.clone() as std::sync::Arc<dyn dss_llm::LlmClient>,
-                    model.clone(),
-                );
+                let client: Arc<dyn dss_llm::LlmClient> = client.clone();
+                tc = tc.with_llm(client.clone(), model.clone());
+                tc = tc.with_subagent_runtime(Arc::new(
+                    crate::subagents::DurableSubagentRuntime::new(
+                        db.clone(),
+                        client,
+                        model.clone(),
+                        session.frame.id.clone(),
+                        session.workspace.display().to_string(),
+                        state.subagent_tasks.clone(),
+                    ),
+                ));
             }
             // 注入记忆库（search_memory/read_memory 工具用）。enabled=false 时不注入（工具报未启用）。
             if state.settings.memory.enabled {
@@ -1300,7 +1645,7 @@ pub async fn stream_sse(
                 return;
             }
         };
-        let run_message_start = session.messages.len();
+        let run_message_start = session.messages.len().saturating_sub(1);
         let durable_checkpoint = Arc::new(StdMutex::new(None));
         let checkpoint_worker = tokio::spawn(persist_history_checkpoints(
             history_checkpoint_rx,
@@ -1314,6 +1659,7 @@ pub async fn stream_sse(
                 durable_checkpoint: durable_checkpoint.clone(),
                 initial_count: persisted_before,
                 initial_title: prompt.chars().take(60).collect(),
+                attempt: Some(attempt_lease.clone()),
             },
         ));
         // —— agent 日志：run_start ——
@@ -1330,7 +1676,7 @@ pub async fn stream_sse(
 
         let outcome = match llm {
             Some(client) => {
-                Runner::run(
+                Runner::run_accepted(
                     &mut session,
                     client.as_ref(),
                     &model,
@@ -1348,10 +1694,6 @@ pub async fn stream_sse(
                 .await
             }
             None => {
-                session
-                    .frame
-                    .begin_run(prompt.chars().take(80).collect::<String>());
-                session.messages.push(ChatMessage::user(&prompt));
                 let _ = tx
                     .send(AgentEvent::Start {
                         frame_id: session.frame.id.clone(),
@@ -1401,7 +1743,7 @@ pub async fn stream_sse(
         let prev = active
             .persisted_count
             .load(std::sync::atomic::Ordering::Relaxed);
-        let checkpoint_start_seq = (prev > persisted_before).then_some(persisted_before as i64 + 1);
+        let checkpoint_start_seq = accepted_start_seq;
         let persisted_status = match outcome.kind {
             CompleteKind::Natural => "completed",
             CompleteKind::Awaiting => match session.frame.status {
@@ -1409,6 +1751,7 @@ pub async fn stream_sse(
                 FrameStatus::AwaitingPlanExecution => "awaiting_plan_execution",
                 _ => "awaiting_user_response",
             },
+            CompleteKind::NeedsReconciliation => "needs_reconciliation",
             CompleteKind::Cancelled => "cancelled",
             CompleteKind::Error => "failed",
             CompleteKind::MaxIters => "failed",
@@ -1456,10 +1799,12 @@ pub async fn stream_sse(
                     output_tokens: i64::from(outcome.usage.output_tokens),
                     iterations: i64::from(outcome.iterations),
                     plan_data: plan_json,
+                    compaction_state: serde_json::to_string(&session.compaction).ok(),
                     title: set_initial_title.then(|| prompt.chars().take(60).collect::<String>()),
                     started_at: run_started_at,
-                    checkpoint_start_seq,
+                    checkpoint_start_seq: Some(checkpoint_start_seq),
                     messages,
+                    attempt: Some(attempt_lease),
                 };
                 match finalize_run_persistence(
                     dbq::persist_run(&db, request).await,
@@ -1550,7 +1895,7 @@ pub async fn stream_sse(
                 let sid_c = sid_clone.clone();
                 let rid_c = run_id_for_extract.clone();
                 let logs_c = state.logs.clone();
-                let seq_lo = checkpoint_start_seq.unwrap_or(1).max(1);
+                let seq_lo = checkpoint_start_seq.max(1);
                 let seq_hi = seq_lo + msgs_snapshot.len() as i64;
                 let memory_settings = state.settings.memory.clone();
                 tokio::spawn(async move {
@@ -1758,7 +2103,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::body::to_bytes;
-    use axum::extract::{Path as AxumPath, State};
+    use axum::extract::{Path as AxumPath, Query, State};
     use axum::http::header;
     use axum::response::IntoResponse;
     use axum::routing::post;
@@ -1772,8 +2117,9 @@ mod tests {
 
     use super::{
         approve_plan, cancel_run, create_session, delete_session, find_original_plan_request,
-        get_session, plan_requires_execution, relay_agent_events, restore_session, select_run_plan,
-        should_extract_memory, stream_sse, CancelRunReq, RunPlanError, RunReq,
+        get_session, list_audit_events, plan_requires_execution, relay_agent_events,
+        restore_session, select_run_plan, should_extract_memory, stream_sse, AuditEventsQuery,
+        CancelRunReq, RunPlanError, RunReq,
     };
     use crate::state::{ActiveRunControl, ActiveSession};
 
@@ -2122,7 +2468,7 @@ mod tests {
             crate::db::PersistRunRequest {
                 run_id: "run-restored".into(),
                 session_id: sid.clone(),
-                frame_id: "frame-restored".into(),
+                frame_id: sid.clone(),
                 task_summary: "choose a dataset".into(),
                 plan_mode: true,
                 status: "awaiting_user_response".into(),
@@ -2134,6 +2480,9 @@ mod tests {
                 output_tokens: 8,
                 iterations: 3,
                 plan_data: Some(plan_json),
+                compaction_state: Some(
+                    r#"{"folds":[{"start_idx":0,"end_idx":1,"summary":"restored summary","level":1}],"l1_summary_count":1}"#.into(),
+                ),
                 title: Some("choose a dataset".into()),
                 started_at: "2026-08-04T10:00:00.000Z".into(),
                 checkpoint_start_seq: None,
@@ -2154,6 +2503,7 @@ mod tests {
                         harness_notice: false,
                     },
                 ],
+                attempt: None,
             },
         )
         .await
@@ -2166,7 +2516,7 @@ mod tests {
             .expect("restore session")
             .0;
 
-        assert_eq!(restored["frame_id"], "frame-restored");
+        assert_eq!(restored["frame_id"], sid);
         assert_eq!(restored["status"], "awaiting_user_response");
         assert_eq!(restored["plan_mode"], true);
         assert_eq!(restored["messages"][0]["seq"], 1);
@@ -2184,6 +2534,25 @@ mod tests {
         assert_eq!(restored["runs"][0]["start_seq"], 1);
         assert_eq!(restored["runs"][0]["end_seq"], 3);
         assert_eq!(restored["runs"][0]["plan"]["approved"], false);
+        let audit = list_audit_events(
+            State(state.clone()),
+            AxumPath(sid.clone()),
+            Query(AuditEventsQuery {
+                after_seq: 0,
+                limit: 100,
+            }),
+        )
+        .await
+        .expect("list audit events")
+        .0;
+        assert_eq!(audit["events"][0]["kind"], "session_created");
+        assert_eq!(audit["events"].as_array().unwrap().len(), 7);
+        assert_eq!(audit["events"][6]["kind"], "run_waiting");
+        let active = state.sessions.lock().await.get(&sid).cloned().unwrap();
+        let session = active.session.lock().await;
+        assert_eq!(session.compaction.l1_summary_count, 1);
+        assert_eq!(session.compaction.folds[0].summary, "restored summary");
+        drop(session);
 
         let project = crate::db::get_project(&state.db, dss_db::DEFAULT_PROJECT_ID.into())
             .await
@@ -2743,6 +3112,7 @@ mod tests {
                 durable_checkpoint: durable.clone(),
                 initial_count: 0,
                 initial_title: "checkpoint title".into(),
+                attempt: None,
             },
         ));
         let plan = plan(false, &["pending"]);
@@ -2770,6 +3140,7 @@ mod tests {
             pending_ask: Some(ask),
             status: "awaiting_user_response".into(),
             awaiting: Some("user_response".into()),
+            compaction_state: None,
             ack,
         })
         .await
@@ -2832,7 +3203,7 @@ mod tests {
         session.frame.status = FrameStatus::Completed;
         let run_start = super::DurableSessionSnapshot::capture(&session);
 
-        session.frame.begin_run("new run");
+        session.frame.start_run("new run");
         let checkpoint_frame_id = session.frame.id.clone();
         session.messages.push(ChatMessage::user("delegate"));
         session.messages.push(ChatMessage::tool(
@@ -2955,6 +3326,7 @@ mod tests {
                 output_tokens: 1,
                 iterations: 1,
                 plan_data: None,
+                compaction_state: None,
                 title: Some("uncommitted run".into()),
                 started_at: "2026-08-04T10:00:00.000Z".into(),
                 checkpoint_start_seq: None,
@@ -2963,6 +3335,7 @@ mod tests {
                     content: r#"{"role":"user","content":"not durable"}"#.into(),
                     harness_notice: false,
                 }],
+                attempt: None,
             },
         )
         .await;

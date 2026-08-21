@@ -5,6 +5,56 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+#[async_trait::async_trait]
+pub trait ToolAuditSink: Send + Sync {
+    async fn started(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        effect_class: crate::spec::ToolEffectClass,
+        input: &serde_json::Value,
+    ) -> Result<(), String>;
+
+    async fn settled(
+        &self,
+        call_id: &str,
+        succeeded: bool,
+        output: &serde_json::Value,
+    ) -> Result<(), String>;
+
+    /// Record that a possibly-mutating tool crossed the execution boundary but its external
+    /// outcome could not be observed. This is intentionally distinct from `settled(false)`: a
+    /// timeout or worker panic does not prove that the remote side effect failed.
+    async fn uncertain(
+        &self,
+        call_id: &str,
+        reason: &str,
+        output: &serde_json::Value,
+    ) -> Result<(), String>;
+}
+
+#[async_trait::async_trait]
+pub trait SubagentRuntime: Send + Sync {
+    async fn delegate(
+        &self,
+        task: &str,
+        context_summary: Option<&str>,
+        wait: bool,
+    ) -> Result<serde_json::Value, String>;
+    async fn collect(
+        &self,
+        frame_ids: &[String],
+        timeout_seconds: u64,
+    ) -> Result<serde_json::Value, String>;
+    async fn send_message(
+        &self,
+        frame_id: &str,
+        message: &str,
+    ) -> Result<serde_json::Value, String>;
+    async fn stop_child(&self, frame_id: &str) -> Result<serde_json::Value, String>;
+    async fn children(&self) -> Result<serde_json::Value, String>;
+}
+
 /// One canonical history checkpoint emitted by the Runner after a delivered tool batch. The API
 /// acknowledges only after SQLite commits, preventing a long post-tool LLM turn from being the
 /// sole copy of an already visible A2A trace.
@@ -19,6 +69,7 @@ pub struct HistoryCheckpoint {
     pub pending_ask: Option<PendingAsk>,
     pub status: String,
     pub awaiting: Option<String>,
+    pub compaction_state: Option<String>,
     pub ack: oneshot::Sender<Result<(), String>>,
 }
 
@@ -32,6 +83,7 @@ pub struct HistoryCheckpointState {
     pub pending_ask: Option<PendingAsk>,
     pub status: String,
     pub awaiting: Option<String>,
+    pub compaction_state: Option<String>,
 }
 
 /// ask_user 工具的一个候选项。
@@ -86,6 +138,8 @@ pub struct ToolContext {
     /// delegate 深度（modules.md 上限 2；主 agent 为 0，子为 1，孙为 2）。
     pub delegate_depth: u32,
     history_checkpoint_tx: Option<mpsc::Sender<HistoryCheckpoint>>,
+    tool_audit: Option<Arc<dyn ToolAuditSink>>,
+    pub subagents: Option<Arc<dyn SubagentRuntime>>,
     /// 记忆库（阶段二：search_memory/read_memory 工具用）。None = 记忆功能关闭。
     pub memory: Option<Arc<dss_memory::MemoryStore>>,
     /// 当前 project_id（记忆按项目隔离召回）。
@@ -157,6 +211,8 @@ impl ToolContext {
             model: String::new(),
             delegate_depth: 0,
             history_checkpoint_tx: None,
+            tool_audit: None,
+            subagents: None,
             memory: None,
             project_id: None,
             api_keys: HashMap::new(),
@@ -223,6 +279,53 @@ impl ToolContext {
         self
     }
 
+    pub fn with_tool_audit(mut self, audit: Arc<dyn ToolAuditSink>) -> Self {
+        self.tool_audit = Some(audit);
+        self
+    }
+
+    pub fn with_subagent_runtime(mut self, runtime: Arc<dyn SubagentRuntime>) -> Self {
+        self.subagents = Some(runtime);
+        self
+    }
+
+    pub(crate) async fn audit_tool_started(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        effect_class: crate::spec::ToolEffectClass,
+        input: &serde_json::Value,
+    ) -> Result<(), String> {
+        match self.tool_audit.as_ref() {
+            Some(audit) => audit.started(call_id, tool_name, effect_class, input).await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn audit_tool_settled(
+        &self,
+        call_id: &str,
+        succeeded: bool,
+        output: &serde_json::Value,
+    ) -> Result<(), String> {
+        match self.tool_audit.as_ref() {
+            Some(audit) => audit.settled(call_id, succeeded, output).await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn audit_tool_uncertain(
+        &self,
+        call_id: &str,
+        reason: &str,
+        output: &serde_json::Value,
+    ) -> Result<(), String> {
+        match self.tool_audit.as_ref() {
+            Some(audit) => audit.uncertain(call_id, reason, output).await,
+            None => Ok(()),
+        }
+    }
+
     /// Returns after durable acknowledgement. Contexts used by unit tests and non-API callers
     /// have no sender and therefore retain the old no-op behavior.
     pub async fn checkpoint_history(
@@ -246,6 +349,7 @@ impl ToolContext {
             pending_ask,
             status,
             awaiting,
+            compaction_state,
         } = state;
         let (ack, receive_ack) = oneshot::channel();
         sender
@@ -260,6 +364,7 @@ impl ToolContext {
                 pending_ask,
                 status,
                 awaiting,
+                compaction_state,
                 ack,
             })
             .await

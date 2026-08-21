@@ -2,7 +2,7 @@
 
 > **本文回答**：SQLite schema 长什么样？消息/会话/记忆/artifact 怎么建模？本项目内 schema 如何演进？
 
-> 状态：schema 大部分已定；frames 落库与迁移细节待定
+> 状态：Harness 核心 schema 已落地；ArtifactStore/verification 仍按阶段演进
 
 ---
 
@@ -57,6 +57,8 @@ id            INTEGER PK AUTOINCREMENT
 session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
 seq           INTEGER NOT NULL       -- 会话内单调递增
 run_id        TEXT REFERENCES session_runs(run_id) ON DELETE SET NULL
+frame_id      TEXT REFERENCES execution_frames(id) ON DELETE SET NULL
+frame_seq     INTEGER                -- Frame 内单调递增
 role          TEXT NOT NULL          -- system|user|assistant|tool
 content       TEXT NOT NULL          -- JSON: content blocks 数组
 harness_notice INTEGER NOT NULL DEFAULT 0   -- ★ 显式列
@@ -87,6 +89,45 @@ Task handle，而是阻止模型纠错循环产生第二个远端副作用。
 错误与 `completed_at`。应用启动时，未完成且仍为 `processing` 的 provisional run 标为
 `interrupted`；已落到 plan/user awaiting 的 provisional run 保留可操作状态。这样崩溃恢复不会出现
 “工具轨迹存在但计划/提问状态丢失”，也不会为一个 run 重复分配 ordinal。
+
+### 3.5 `session_events`（Harness 事实日志）
+
+```text
+event_id       TEXT PK
+session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+seq            INTEGER NOT NULL             -- session-local 单调序号
+run_id         TEXT
+frame_id       TEXT
+event_type      TEXT NOT NULL
+schema_version INTEGER NOT NULL DEFAULT 1
+payload         TEXT NOT NULL                -- typed JSON payload
+created_at      TEXT NOT NULL
+UNIQUE(session_id, seq)
+```
+
+P9 期间 `sessions` / `session_runs` / `session_messages` 是兼容 projection，新写入与事件在同一事务双写。未来 replay consistency checker 稳定后，projection 可完全由事件重建。
+
+### 3.6 `agent_jobs`（通用持久任务）
+
+```text
+id                  TEXT PK
+job_kind            TEXT NOT NULL            -- 当前为 agent_turn
+profile_id          TEXT REFERENCES bots(id) ON DELETE SET NULL
+session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+prompt              TEXT NOT NULL
+requested_plan_mode INTEGER NOT NULL DEFAULT 0
+priority / position INTEGER NOT NULL
+revision            INTEGER NOT NULL DEFAULT 1
+status              TEXT NOT NULL            -- queued|running|completed|failed|cancelled
+run_id              TEXT
+attempt             INTEGER NOT NULL DEFAULT 0
+lease_owner         TEXT
+lease_expires_at    TEXT
+last_error          TEXT
+created_at / updated_at / claimed_at / completed_at TEXT
+```
+
+`bots` 在本阶段保留为 Agent Profile 的兼容存储名；`bot_jobs` 只作为旧数据库迁移来源。所有新任务写入 `agent_jobs`，生命周期变更写入 `session_events`。当前执行 owner 为 `frontend-compat`，后续 backend worker 接管时无需再迁移任务数据。
 
 ### 4. `memories`（三层记忆）
 ```
@@ -193,49 +234,51 @@ created_at    TEXT NOT NULL
 ```
 索引：`(frame_id)`。
 
-### 10. `frames`
-
-> 待定（见下）
+### 10. `execution_frames`
 
 ```
--- 候选 schema（若决定落库）
 id            TEXT PK
-parent_frame_id TEXT REFERENCES frames(id) ON DELETE SET NULL
-root_frame_id  TEXT REFERENCES frames(id) ON DELETE SET NULL
-agent_name    TEXT NOT NULL          -- MAIN|SUBAGENT|REVIEWER|BOOKMARKER
-delegate_name TEXT
-status        TEXT NOT NULL DEFAULT 'processing'
-model         TEXT
-input_tokens  INTEGER
-output_tokens INTEGER
-cache_read_tokens INTEGER
-cache_write_tokens INTEGER
-project_id    TEXT REFERENCES projects(id) ON DELETE CASCADE
-name          TEXT
-conversation_type TEXT NOT NULL DEFAULT 'agent'
-is_hidden     INTEGER NOT NULL DEFAULT 0
-task_summary  TEXT
+session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+parent_frame_id TEXT REFERENCES execution_frames(id) ON DELETE SET NULL
+root_frame_id TEXT NOT NULL
+kind          TEXT NOT NULL          -- root|delegate|reviewer|bookmarker|aside
+profile_id    TEXT REFERENCES bots(id) ON DELETE SET NULL
+visibility    TEXT NOT NULL          -- normal|hidden
+activity      TEXT NOT NULL          -- idle|running|waiting|suspended|closed
+active_run_id TEXT
+workspace_scope_id TEXT
+revision      INTEGER NOT NULL
 created_at    TEXT NOT NULL
 updated_at    TEXT NOT NULL
-completed_at  TEXT
-last_user_message_at TEXT
+closed_at     TEXT
 ```
+
+Frame 是稳定 actor/对话拓扑，Run 是一次逻辑任务，RunAttempt 是一次执行所有权。root Frame ID
+等于 Session ID；普通用户轮次不再替换 Frame ID。`legacy_frame_aliases` 保存旧 `frame_id` 到稳定
+Frame 的映射，迁移不伪造旧事件。
+
+### 11. `run_attempts`、`tool_call_attempts` 与子 Frame 交付
+
+- `run_attempts`：`attempt_id/run_id/attempt_no/lease_owner/lease_token/lease_expires_at/status/checkpoint_event_seq`。
+  lease token 是 fencing token；失去所有权的 worker 不得 checkpoint 或提交终态。
+- `tool_call_attempts`：工具执行前写 intent，执行后写结果，并记录
+  `read_only|idempotent|external_side_effect`。外部副作用发生 timeout/panic、结果持久化不确定或
+  重启时，状态写为/恢复为 `unknown`，Run 进入 `needs_reconciliation`，禁止盲重放；人工对账结果
+  写入 canonical harness notice 后才允许恢复同一 Run。
+- `frame_mailbox`：只允许直接父子边通信；`child_landed` 仅是小型唤醒信号。
+- 当前 child worker 不消费 mid-Run parent message，因此 active child 会明确拒绝新消息；idle child
+  才通过新 Run 接收 follow-up，避免返回虚假的 queued 状态。
+- `child_results`：子结果的权威存储；`child_result_collections` 保证每个父 Frame 恰好收集一次。
 
 ### 日志表（本项目新增）
 
 本项目新增 `logs` 表承载日志列表功能，完整定义见 [logging 日志系统](logging.md#数据模型)。字段：`id/ts/level/source/system|agent/kind/session_id/frame_id/iteration/message/detail(JSON)/trace_id`，索引 `(ts)`/`(session_id,ts)`/`(level)`/`(source,kind)`。默认保留 N 天自动清理。
 
-### frames 是否落库
+### Frame 持久化决策
 
-> 待定
-
-**运行时**：frame 树存内存（`FrameService._frames` dict），会话恢复靠 `session_messages` 重建。
-
-**选项**：
-- **A. 不落库**：frame 树纯内存，session 恢复靠 `session_messages` + `plan_data` 重建 root frame。简单，但进程崩溃丢 frame 运行时态（消息已持久，只是 frame status 丢失）。
-- **B. 落库**（改进）：frame 状态持久化，崩溃可恢复 frame status。但 `verification_checks`/`compaction_archives` 有 FK→frames，需 frames 存在。
-
-**倾向**：**B（落库）**。因为 `verification_checks` 和 `compaction_archives` 已引用 `frames.id`，落库让外键有效；且崩溃恢复是长程自主研究（增强方向）的需求。
+已采用落库方案。内存 `Session.frame` 是 root Frame 的热 projection，SQLite
+`execution_frames` 才是拓扑与执行活动的权威来源。等待用户输入不会完成 Run；恢复产生新的
+RunAttempt。崩溃后普通可恢复 Run 保留 `completed_at=NULL` 和同一 `active_run_id`；只有终态才清除。
 
 ---
 

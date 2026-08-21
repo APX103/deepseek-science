@@ -77,6 +77,26 @@ pub enum ToolBatchPolicy {
     Exclusive,
 }
 
+/// Recovery policy for a tool invocation that loses its worker before a durable result exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolEffectClass {
+    ReadOnly,
+    Idempotent,
+    /// Safe default: an unknown external outcome requires reconciliation and is never replayed.
+    #[default]
+    ExternalSideEffect,
+}
+
+impl ToolEffectClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Idempotent => "idempotent",
+            Self::ExternalSideEffect => "external_side_effect",
+        }
+    }
+}
+
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
@@ -110,6 +130,12 @@ pub trait Tool: Send + Sync {
     /// entire mixed batch before executing anything, preserving one result for every call.
     fn batch_policy(&self) -> ToolBatchPolicy {
         ToolBatchPolicy::Ordered
+    }
+
+    /// Conservative by default. Tools should opt into replay only when their implementation,
+    /// not merely their name, establishes read-only or idempotent semantics.
+    fn effect_class(&self, _args: &Value) -> ToolEffectClass {
+        ToolEffectClass::ExternalSideEffect
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutput, ToolError>;

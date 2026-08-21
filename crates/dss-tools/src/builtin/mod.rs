@@ -40,6 +40,10 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register(Arc::new(plan::UpdateStepStatusTool));
     registry.register(Arc::new(delegate::DelegateTool));
     registry.register(Arc::new(delegate::SubmitOutputTool));
+    registry.register(Arc::new(delegate::CollectChildrenTool));
+    registry.register(Arc::new(delegate::SendChildMessageTool));
+    registry.register(Arc::new(delegate::StopChildTool));
+    registry.register(Arc::new(delegate::ListChildrenTool));
     registry.register(Arc::new(memory::SearchMemoryTool));
     registry.register(Arc::new(memory::ReadMemoryTool));
     registry.register(Arc::new(openalex::SearchPapersTool));

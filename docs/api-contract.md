@@ -134,6 +134,10 @@ server/resource URI/name provenance；所有远端描述、Card 和输出均按�
 | GET | `/api/sessions` | 可发现会话列表（带 `live: bool`；排除 archived project 和 `discoverable=0`） |
 | POST | `/api/sessions` | 建会话（sid=`uuid4()[:12]`，复制模板 `template.tex`→`main.tex`，返回 `{id, frame_id, mcp_tools, model, workspace}`） |
 | GET | `/api/sessions/{sid}` | 按精确 ID 取会话状态（含 `discoverable=0`；live 走内存，否则从 DB 恢复） |
+| GET | `/api/sessions/{sid}/events?after_seq=&limit=` | 有界分页读取 typed durable events |
+| GET | `/api/sessions/{sid}/frames` | 读取稳定 Frame 树与当前 activity |
+| GET | `/api/sessions/{sid}/runs/{run_id}/reconcile-tool` | 列出阻塞 Run 的未知外部工具调用 |
+| POST | `/api/sessions/{sid}/runs/{run_id}/reconcile-tool` | 提交一个工具调用的人工成功/失败观察结果；全部解决后允许恢复同一 Run |
 | DELETE | `/api/sessions/{sid}` | 删会话（DB + workspace + MCP 清理） |
 
 ### Files
@@ -165,14 +169,14 @@ server/resource URI/name provenance；所有远端描述、Card 和输出均按�
 | `thinking` | `text` | `on_assistant_thinking` | 累加到 curRef.thinking |
 | `text` | `text` | `on_assistant_text` | 累加到 curRef.text（打字机） |
 | `tool_calls` | `calls:[{id,name,input}]` | `on_tool_calls` | 按 call.id 去重追加 |
-| `tool_results` | `results:[{tool_use_id,content,is_error}]` | `on_tool_results` | 挂到最近 assistant 消息 |
+| `tool_results` | `results:[{tool_use_id,content,is_error,outcome_unknown?}]` | `on_tool_results` | 挂到最近 assistant 消息；未知外部结果触发对账边界 |
 | `plan_update` | `plan:{steps,approved}` | `on_plan_update` | setPlan |
 | `notice` | `event, detail` | `on_event` | 作为 system 消息气泡 |
 | `complete` | `kind, final_text, awaiting?, pending_ask?, error?, usage, iterations, frame_status, plan?, artifacts` | manager `emit_complete` | 设 usage/plan/artifacts/awaiting；status 由 kind 推导 |
 | `error` | `message` | 传输层 | status=error |
 
-**`complete.kind` 取值**：`natural | awaiting | max_iters | error | cancelled`。
-**`complete.awaiting`**：`"user_response" | "plan_approval" | null`。
+**`complete.kind` 取值**：`natural | awaiting | reconciliation | max_iters | error | cancelled`。
+**`complete.awaiting`**：`"user_response" | "plan_approval" | "plan_execution" | "tool_reconciliation" | null`。
 **`complete.usage`**：`{input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens, …}`。`cache_hit_tokens`/`cache_miss_tokens` 来自 DeepSeek `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`（前缀缓存，命中输入约 1/120 价）；OpenAI 兼容端点回退 `prompt_tokens_details.cached_tokens`，缺失时为 0。
 
 前端把当前流式 iteration 的 Thinking disclosure 默认展开，把刷新恢复的历史 Thinking 默认收起；

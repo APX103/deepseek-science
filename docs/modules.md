@@ -119,7 +119,10 @@ pub trait Host: Send + Sync {                // 暴露给沙箱代码
 
 本项目自有的 schema，聚焦运行时实际读写的字段，不保留当前未充分使用的列（如 token_class_usage、aux_*、specialists_used 等）。详见 [data-model 数据模型](data-model.md)。
 
-核心表：`projects` / `sessions` / `session_messages` / `memories` / `artifacts` / `artifact_versions` / `artifact_dependencies` / `verification_checks` / `compaction_archives`。**frames 表**：运行时 frame 树存内存（`FrameService` 持有 in-memory `_frames` dict）。本项目决定 frames 是否落库——见 [data-model](data-model.md#frames-是否落库)。
+Harness 核心表除 projection 外，还包括 `execution_frames` / `run_attempts` /
+`tool_call_attempts` / `frame_mailbox` / `child_results`。Frame 树、执行 lease 与子结果均持久化；
+内存 Session 只是 root Frame 的热 projection。详见 [data-model](data-model.md#10-execution_frames)
+和 [ADR-001](adr-001-durable-agent-frames.md)。
 
 ### 连接与 PRAGMA
 

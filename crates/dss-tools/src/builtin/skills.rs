@@ -23,6 +23,10 @@ struct SkillArgs {
 
 #[async_trait]
 impl Tool for SearchSkillsTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search_skills".into(),
@@ -51,6 +55,10 @@ impl Tool for SearchSkillsTool {
 
 #[async_trait]
 impl Tool for ListSkillsTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_skills".into(),
@@ -74,6 +82,10 @@ impl Tool for ListSkillsTool {
 
 #[async_trait]
 impl Tool for SkillTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "skill".into(),

@@ -161,6 +161,10 @@ pub struct SearchPapersTool;
 
 #[async_trait]
 impl Tool for SearchPapersTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search_papers".into(),
@@ -321,6 +325,10 @@ pub struct FetchPaperTool;
 
 #[async_trait]
 impl Tool for FetchPaperTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fetch_paper".into(),

@@ -225,10 +225,10 @@
 - 状态：**部分完成，仍为有效 DEFER**。
 - 来源：plans/P2b-tools.md 回顾。
 
-#### D-F09 frames 不落库（有效 DEFER）
-- P3 选 data-model 选项 A（frames 纯内存，session 恢复靠 `session_messages` + 重置 root frame 为 Completed）。理由：P3 无 verification/compaction，frames 表的 FK 依赖方都不存在；恢复靠消息历史即可重建可继续 run 的 Session。
-- 当前虽已有 run/frame 元数据与历史 checkpoint，但仍没有完整 frames 树、verification/compaction archives 的持久化；需落实选项 B 才能崩溃恢复 frame status。
-- 状态：**有效债务（未完成）**。
+#### D-F09 frames 不落库 ✅ 已完成（决策反转）
+- P3 曾暂选纯内存 Frame；P9 现已采用持久化 `execution_frames`，并加入稳定父子拓扑、Frame-local 消息序号、RunAttempt lease/fencing、mailbox 与 collect-only child results。
+- root Frame 与 Session 同 ID；旧 run 的 `frame_id` 通过 alias 迁移，不伪造历史。
+- 状态：**已完成，不再是 DEFER**。详细不变量见 [ADR-001](adr-001-durable-agent-frames.md)。
 - 来源：plans/P3-persistence.md 回顾、data-model.md「frames 是否落库」。
 
 #### D-F10 run 中途取消丢未持久化消息 ✅ 已完成
@@ -246,8 +246,9 @@
 #### D-F12 Rolling Compact 索引版 projection（有效 DEFER）
 - modules.md 的 RC 用 `applied_summary_uuids` + 带 uuid/compact_boundary 的 Message。当前 `ChatMessage`（dss-llm）是 OpenAI 协议精简态、无 uuid。
 - P4a 用**索引范围 fold**（`CompactionState.folds: Vec<Fold{start_idx,end_idx,summary}>`）实现 projection：把 fold 区间替换成 assistant summary。语义等价（append-only + projection，日志不 mutate）。
-- schema 已有 `sessions.compaction_state` 列，但当前没有读写路径。仍需完整 uuid/compact_boundary Message 模型、L2 fold、boundary 工具对齐及 compaction state 持久化/恢复。
-- 状态：**有效债务（未完成）**。
+- P9 已把 `sessions.compaction_state` 接入工具 checkpoint 与 run 终态事务，并在冷恢复时反序列化；重启后不会再退回完整原始视图。
+- 仍需完整 uuid/compact_boundary Message 模型、L2 fold 和 boundary 工具对齐。
+- 状态：**部分完成；持久化/恢复已完成，索引边界与 L2 仍是有效债务**。
 - 来源：plans/P4a-compact.md 回顾、modules.md §8。
 
 ---

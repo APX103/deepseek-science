@@ -32,6 +32,10 @@ struct UpdateStepArgs {
 
 #[async_trait]
 impl Tool for GeneratePlanTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::Idempotent
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "generate_plan".into(),
@@ -76,6 +80,10 @@ impl Tool for GeneratePlanTool {
 
 #[async_trait]
 impl Tool for UpdateStepStatusTool {
+    fn effect_class(&self, _args: &Value) -> crate::spec::ToolEffectClass {
+        crate::spec::ToolEffectClass::Idempotent
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "update_step_status".into(),

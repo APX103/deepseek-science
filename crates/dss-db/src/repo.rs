@@ -6,8 +6,10 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::DbError;
+use crate::events::{append_event_in_transaction, NewSessionEvent, SessionEventKind};
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -62,6 +64,9 @@ pub struct BotRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotJobRow {
     pub id: String,
+    /// Canonical identity reference used by the generic JobRuntime API.
+    pub profile_id: String,
+    /// Deprecated compatibility alias for pre-P9 clients.
     pub bot_id: String,
     pub session_id: String,
     pub prompt: String,
@@ -77,6 +82,10 @@ pub struct BotJobRow {
     pub claimed_at: Option<String>,
     pub completed_at: Option<String>,
 }
+
+/// Canonical P9 names. The historical Rust names remain source-compatible while callers migrate.
+pub type AgentProfileRow = BotRow;
+pub type AgentJobRow = BotJobRow;
 
 /// 一条持久化消息（content 是 OpenAI 协议形态 JSON 字符串）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,11 +143,23 @@ pub struct PersistRunRequest {
     pub output_tokens: i64,
     pub iterations: i64,
     pub plan_data: Option<String>,
+    /// Serialized `dss_compact::CompactionState`, committed with the run projection.
+    pub compaction_state: Option<String>,
     pub title: Option<String>,
     pub started_at: String,
     /// First sequence already written by crash-safe tool checkpoints for this run.
     pub checkpoint_start_seq: Option<i64>,
     pub messages: Vec<PersistMessage>,
+    /// Fences terminal writes from a stale worker. Legacy/import callers may omit it.
+    pub attempt: Option<PersistAttemptLease>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistAttemptLease {
+    pub attempt_id: String,
+    pub lease_token: String,
+    pub lease_owner: String,
+    pub lease_expires_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +173,19 @@ pub struct PersistCheckpointRequest {
     pub awaiting: Option<String>,
     pub pending_ask_json: Option<String>,
     pub plan_data: Option<String>,
+    /// Serialized `dss_compact::CompactionState`, committed with this crash-safe checkpoint.
+    pub compaction_state: Option<String>,
     pub title: Option<String>,
     pub started_at: String,
     pub expected_count: usize,
     pub messages: Vec<PersistMessage>,
+    /// Present only for the first checkpoint. The run acceptance fact and its first user message
+    /// then commit in the same transaction.
+    pub accepted_event_payload: Option<Value>,
+    /// Present when a parked Run continues on a new Attempt without changing Run identity.
+    pub resumed_event_payload: Option<Value>,
+    /// Required for newly accepted live Runs; repeated checkpoints carry the same fencing token.
+    pub attempt: Option<PersistAttemptLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +194,66 @@ pub struct PersistRunResult {
     pub start_seq: Option<i64>,
     pub end_seq: Option<i64>,
     pub ordinal: i64,
+}
+
+fn append_message_event(
+    conn: &Connection,
+    session_id: &str,
+    run_id: &str,
+    frame_id: &str,
+    message_seq: i64,
+    message: &PersistMessage,
+    created_at: &str,
+) -> Result<(), DbError> {
+    let content = serde_json::from_str(&message.content)
+        .unwrap_or_else(|_| serde_json::Value::String(message.content.clone()));
+    append_event_in_transaction(
+        conn,
+        &NewSessionEvent {
+            session_id: session_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            frame_id: Some(frame_id.to_string()),
+            kind: SessionEventKind::MessageAppended,
+            payload: json!({
+                "message_seq": message_seq,
+                "role": message.role,
+                "content": content,
+                "harness_notice": message.harness_notice,
+            }),
+        },
+        created_at,
+    )?;
+    Ok(())
+}
+
+fn append_compaction_event(
+    conn: &Connection,
+    session_id: &str,
+    run_id: &str,
+    frame_id: &str,
+    compaction_state: Option<&str>,
+    created_at: &str,
+) -> Result<(), DbError> {
+    let Some(compaction_state) = compaction_state else {
+        return Ok(());
+    };
+    let state: serde_json::Value = serde_json::from_str(compaction_state).map_err(|error| {
+        DbError::Other(format!(
+            "invalid compaction state for session {session_id}: {error}"
+        ))
+    })?;
+    append_event_in_transaction(
+        conn,
+        &NewSessionEvent {
+            session_id: session_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            frame_id: Some(frame_id.to_string()),
+            kind: SessionEventKind::CompactionUpdated,
+            payload: json!({ "state": state }),
+        },
+        created_at,
+    )?;
+    Ok(())
 }
 
 // ----------------- projects -----------------
@@ -485,7 +575,7 @@ pub fn enqueue_bot_job(
         ));
     }
     let position: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(position), 0) + 1 FROM bot_jobs \
+        "SELECT COALESCE(MAX(position), 0) + 1 FROM agent_jobs \
          WHERE session_id=?1 AND status='queued'",
         params![session_id],
         |row| row.get(0),
@@ -495,9 +585,9 @@ pub fn enqueue_bot_job(
         .unwrap_or_else(|| format!("job_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
     let timestamp = now();
     tx.execute(
-        "INSERT INTO bot_jobs \
-         (id, bot_id, session_id, prompt, requested_plan_mode, position, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        "INSERT INTO agent_jobs \
+         (id, job_kind, profile_id, session_id, prompt, requested_plan_mode, position, created_at, updated_at) \
+         VALUES (?1, 'agent_turn', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
             id,
             bot_id,
@@ -508,6 +598,23 @@ pub fn enqueue_bot_job(
             timestamp
         ],
     )?;
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id: session_id.to_string(),
+            run_id: None,
+            frame_id: None,
+            kind: SessionEventKind::JobEnqueued,
+            payload: json!({
+                "job_id": id,
+                "job_kind": "agent_turn",
+                "profile_id": bot_id,
+                "requested_plan_mode": requested_plan_mode,
+                "position": position,
+            }),
+        },
+        &timestamp,
+    )?;
     tx.commit()?;
     get_bot_job(conn, &id)?.ok_or_else(|| DbError::Other("just-created bot job missing".into()))
 }
@@ -515,9 +622,9 @@ pub fn enqueue_bot_job(
 pub fn get_bot_job(conn: &Connection, id: &str) -> Result<Option<BotJobRow>, DbError> {
     Ok(conn
         .query_row(
-            "SELECT id, bot_id, session_id, prompt, requested_plan_mode, priority, position, \
+            "SELECT id, COALESCE(profile_id, ''), session_id, prompt, requested_plan_mode, priority, position, \
              revision, status, run_id, last_error, created_at, updated_at, claimed_at, completed_at \
-             FROM bot_jobs WHERE id=?1",
+             FROM agent_jobs WHERE id=?1",
             params![id],
             row_to_bot_job,
         )
@@ -526,9 +633,9 @@ pub fn get_bot_job(conn: &Connection, id: &str) -> Result<Option<BotJobRow>, DbE
 
 pub fn list_bot_jobs(conn: &Connection, session_id: &str) -> Result<Vec<BotJobRow>, DbError> {
     let mut stmt = conn.prepare(
-        "SELECT id, bot_id, session_id, prompt, requested_plan_mode, priority, position, \
+        "SELECT id, COALESCE(profile_id, ''), session_id, prompt, requested_plan_mode, priority, position, \
          revision, status, run_id, last_error, created_at, updated_at, claimed_at, completed_at \
-         FROM bot_jobs WHERE session_id=?1 AND status IN ('queued','running','failed') \
+         FROM agent_jobs WHERE session_id=?1 AND status IN ('queued','running','failed') \
          ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, \
          priority DESC, position ASC, created_at ASC",
     )?;
@@ -546,7 +653,7 @@ pub fn edit_bot_job(
     requested_plan_mode: bool,
 ) -> Result<BotJobRow, DbError> {
     let changed = conn.execute(
-        "UPDATE bot_jobs SET prompt=?1, requested_plan_mode=?2, revision=revision+1, updated_at=?3 \
+        "UPDATE agent_jobs SET prompt=?1, requested_plan_mode=?2, revision=revision+1, updated_at=?3 \
          WHERE id=?4 AND revision=?5 AND status='queued'",
         params![prompt, i64::from(requested_plan_mode), now(), id, expected_revision],
     )?;
@@ -560,7 +667,7 @@ pub fn edit_bot_job(
 
 pub fn delete_bot_job(conn: &Connection, id: &str, expected_revision: i64) -> Result<(), DbError> {
     let changed = conn.execute(
-        "DELETE FROM bot_jobs WHERE id=?1 AND revision=?2 AND status IN ('queued','failed')",
+        "DELETE FROM agent_jobs WHERE id=?1 AND revision=?2 AND status IN ('queued','failed')",
         params![id, expected_revision],
     )?;
     if changed == 0 {
@@ -578,7 +685,7 @@ pub fn reorder_bot_jobs(
 ) -> Result<Vec<BotJobRow>, DbError> {
     let tx = conn.unchecked_transaction()?;
     let mut stmt = tx.prepare(
-        "SELECT id FROM bot_jobs WHERE session_id=?1 AND status='queued' ORDER BY id ASC",
+        "SELECT id FROM agent_jobs WHERE session_id=?1 AND status='queued' ORDER BY id ASC",
     )?;
     let mut existing = stmt
         .query_map(params![session_id], |row| row.get::<_, String>(0))?
@@ -596,7 +703,7 @@ pub fn reorder_bot_jobs(
     let timestamp = now();
     for (index, id) in ordered_ids.iter().enumerate() {
         tx.execute(
-            "UPDATE bot_jobs SET position=?1, revision=revision+1, updated_at=?2 \
+            "UPDATE agent_jobs SET position=?1, revision=revision+1, updated_at=?2 \
              WHERE id=?3 AND session_id=?4 AND status='queued'",
             params![index as i64 + 1, timestamp, id, session_id],
         )?;
@@ -613,7 +720,7 @@ pub fn claim_next_bot_job(
     let tx = conn.unchecked_transaction()?;
     let next_id = tx
         .query_row(
-            "SELECT id FROM bot_jobs WHERE session_id=?1 AND status='queued' \
+            "SELECT id FROM agent_jobs WHERE session_id=?1 AND status='queued' \
              ORDER BY priority DESC, position ASC, created_at ASC LIMIT 1",
             params![session_id],
             |row| row.get::<_, String>(0),
@@ -624,9 +731,21 @@ pub fn claim_next_bot_job(
     };
     let timestamp = now();
     tx.execute(
-        "UPDATE bot_jobs SET status='running', run_id=?1, revision=revision+1, \
-         claimed_at=?2, updated_at=?2 WHERE id=?3 AND status='queued'",
+        "UPDATE agent_jobs SET status='running', run_id=?1, attempt=attempt+1, \
+         lease_owner='frontend-compat', revision=revision+1, claimed_at=?2, updated_at=?2 \
+         WHERE id=?3 AND status='queued'",
         params![run_id, timestamp, id],
+    )?;
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id: session_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            frame_id: None,
+            kind: SessionEventKind::JobClaimed,
+            payload: json!({ "job_id": id, "owner": "frontend-compat" }),
+        },
+        &timestamp,
     )?;
     tx.commit()?;
     get_bot_job(conn, &id)
@@ -641,9 +760,19 @@ pub fn finish_bot_job(
 ) -> Result<BotJobRow, DbError> {
     let timestamp = now();
     let status = if succeeded { "completed" } else { "failed" };
-    let changed = conn.execute(
-        "UPDATE bot_jobs SET status=?1, last_error=?2, revision=revision+1, \
-         completed_at=?3, updated_at=?3 WHERE id=?4 AND run_id=?5 AND status='running'",
+    let tx = conn.unchecked_transaction()?;
+    let session_id = tx
+        .query_row(
+            "SELECT session_id FROM agent_jobs WHERE id=?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| DbError::NotFound(format!("agent job {id}")))?;
+    let changed = tx.execute(
+        "UPDATE agent_jobs SET status=?1, last_error=?2, revision=revision+1, \
+         lease_owner=NULL, lease_expires_at=NULL, completed_at=?3, updated_at=?3 \
+         WHERE id=?4 AND run_id=?5 AND status='running'",
         params![status, error, timestamp, id, run_id],
     )?;
     if changed == 0 {
@@ -651,6 +780,22 @@ pub fn finish_bot_job(
             "bot job {id} is not owned by run {run_id}"
         )));
     }
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id,
+            run_id: Some(run_id.to_string()),
+            frame_id: None,
+            kind: SessionEventKind::JobSettled,
+            payload: json!({
+                "job_id": id,
+                "status": status,
+                "error": error,
+            }),
+        },
+        &timestamp,
+    )?;
+    tx.commit()?;
     get_bot_job(conn, id)?.ok_or_else(|| DbError::NotFound(format!("bot job {id}")))
 }
 
@@ -661,9 +806,19 @@ pub fn claim_bot_job(
     run_id: &str,
 ) -> Result<BotJobRow, DbError> {
     let timestamp = now();
-    let changed = conn.execute(
-        "UPDATE bot_jobs SET status='running', run_id=?1, revision=revision+1, \
-         claimed_at=?2, updated_at=?2 WHERE id=?3 AND revision=?4 AND status='queued'",
+    let tx = conn.unchecked_transaction()?;
+    let session_id = tx
+        .query_row(
+            "SELECT session_id FROM agent_jobs WHERE id=?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| DbError::NotFound(format!("agent job {id}")))?;
+    let changed = tx.execute(
+        "UPDATE agent_jobs SET status='running', run_id=?1, attempt=attempt+1, \
+         lease_owner='frontend-compat', revision=revision+1, claimed_at=?2, updated_at=?2 \
+         WHERE id=?3 AND revision=?4 AND status='queued'",
         params![run_id, timestamp, id, expected_revision],
     )?;
     if changed == 0 {
@@ -671,6 +826,18 @@ pub fn claim_bot_job(
             "bot job {id} is stale or no longer queued"
         )));
     }
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id,
+            run_id: Some(run_id.to_string()),
+            frame_id: None,
+            kind: SessionEventKind::JobClaimed,
+            payload: json!({ "job_id": id, "owner": "frontend-compat" }),
+        },
+        &timestamp,
+    )?;
+    tx.commit()?;
     get_bot_job(conn, id)?.ok_or_else(|| DbError::NotFound(format!("bot job {id}")))
 }
 
@@ -694,9 +861,11 @@ fn row_to_bot(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
 }
 
 fn row_to_bot_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotJobRow> {
+    let profile_id = row.get::<_, String>(1)?;
     Ok(BotJobRow {
         id: row.get(0)?,
-        bot_id: row.get(1)?,
+        profile_id: profile_id.clone(),
+        bot_id: profile_id,
         session_id: row.get(2)?,
         prompt: row.get(3)?,
         requested_plan_mode: row.get::<_, i64>(4)? != 0,
@@ -712,6 +881,22 @@ fn row_to_bot_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotJobRow> {
         completed_at: row.get(14)?,
     })
 }
+
+// Canonical repository vocabulary; legacy names above remain compatibility entry points.
+pub use claim_bot_job as claim_agent_job;
+pub use claim_next_bot_job as claim_next_agent_job;
+pub use create_bot as create_agent_profile;
+pub use delete_bot as delete_agent_profile;
+pub use delete_bot_job as delete_agent_job;
+pub use edit_bot_job as edit_agent_job;
+pub use enqueue_bot_job as enqueue_agent_job;
+pub use finish_bot_job as settle_agent_job;
+pub use get_bot as get_agent_profile;
+pub use get_bot_job as get_agent_job;
+pub use list_bot_jobs as list_agent_jobs;
+pub use list_bots as list_agent_profiles;
+pub use reorder_bot_jobs as reorder_agent_jobs;
+pub use update_bot as update_agent_profile;
 
 // ----------------- sessions -----------------
 
@@ -736,9 +921,47 @@ pub fn create_session_for_bot(
     let now = now();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO sessions (id, title, workspace, model, plan_mode, status, project_id, bot_id, created_at, updated_at) \
-         VALUES (?1, NULL, ?2, ?3, 0, 'active', ?4, ?5, ?6, ?6)",
+        "INSERT INTO sessions (id, title, workspace, model, plan_mode, status, project_id, bot_id, root_frame_id, created_at, updated_at) \
+         VALUES (?1, NULL, ?2, ?3, 0, 'active', ?4, ?5, ?1, ?6, ?6)",
         params![id, workspace, model, project_id, bot_id, now],
+    )?;
+    tx.execute(
+        "INSERT INTO execution_frames (id, session_id, parent_frame_id, root_frame_id, kind, \
+             profile_id, visibility, activity, workspace_scope_id, revision, created_at, updated_at) \
+         VALUES (?1, ?1, NULL, ?1, 'main', ?2, 'normal', 'idle', ?3, 1, ?4, ?4)",
+        params![id, bot_id, workspace, now],
+    )?;
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id: id.to_string(),
+            run_id: None,
+            frame_id: Some(id.to_string()),
+            kind: SessionEventKind::SessionCreated,
+            payload: json!({
+                "workspace": workspace,
+                "model": model,
+                "project_id": project_id,
+                "bot_id": bot_id,
+            }),
+        },
+        &now,
+    )?;
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id: id.to_string(),
+            run_id: None,
+            frame_id: Some(id.to_string()),
+            kind: SessionEventKind::FrameCreated,
+            payload: json!({
+                "parent_frame_id": null,
+                "root_frame_id": id,
+                "kind": "main",
+                "visibility": "normal",
+            }),
+        },
+        &now,
     )?;
     if let Some(project_id) = project_id {
         let changed = tx.execute(
@@ -918,6 +1141,20 @@ pub fn get_session_plan(conn: &Connection, id: &str) -> Result<Option<String>, D
     Ok(row.flatten())
 }
 
+pub fn get_session_compaction_state(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<String>, DbError> {
+    let row = conn
+        .query_row(
+            "SELECT compaction_state FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(row.flatten())
+}
+
 pub fn delete_session(conn: &Connection, id: &str) -> Result<(), DbError> {
     let n = conn.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
     if n == 0 {
@@ -952,7 +1189,8 @@ pub fn append_message(
     harness_notice: bool,
 ) -> Result<i64, DbError> {
     let now = now();
-    let max_seq: i64 = conn
+    let tx = conn.unchecked_transaction()?;
+    let max_seq: i64 = tx
         .query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM session_messages WHERE session_id = ?1",
             params![session_id],
@@ -960,19 +1198,26 @@ pub fn append_message(
         )
         .unwrap_or(0);
     let seq = max_seq + 1;
-    conn.execute(
+    let frame_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(frame_seq), 0) + 1 FROM session_messages WHERE frame_id=?1",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
         "INSERT INTO session_messages \
-         (session_id, seq, run_id, role, content, harness_notice, created_at) \
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+         (session_id, seq, run_id, frame_id, frame_seq, role, content, harness_notice, created_at) \
+         VALUES (?1, ?2, NULL, ?1, ?3, ?4, ?5, ?6, ?7)",
         params![
             session_id,
             seq,
+            frame_seq,
             role,
             content,
             if harness_notice { 1 } else { 0 },
             now
         ],
     )?;
+    tx.commit()?;
     Ok(seq)
 }
 
@@ -1015,9 +1260,14 @@ pub fn append_history_checkpoint(
             request.expected_count
         )));
     }
+    if request.accepted_event_payload.is_some() && request.resumed_event_payload.is_some() {
+        return Err(DbError::Other(
+            "a checkpoint cannot accept and resume a run simultaneously".into(),
+        ));
+    }
     let existing_run = tx
         .query_row(
-            "SELECT session_id, ordinal, start_seq, end_seq, completed_at \
+            "SELECT session_id, ordinal, start_seq, end_seq, completed_at, status \
              FROM session_runs WHERE run_id = ?1",
             params![request.run_id],
             |row| {
@@ -1027,6 +1277,7 @@ pub fn append_history_checkpoint(
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
@@ -1034,8 +1285,54 @@ pub fn append_history_checkpoint(
     let appended_start = (!request.messages.is_empty()).then_some(max_seq + 1);
     let appended_end =
         (!request.messages.is_empty()).then_some(max_seq + request.messages.len() as i64);
+    let max_frame_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(frame_seq), 0) FROM session_messages WHERE frame_id=?1",
+        params![request.frame_id],
+        |row| row.get(0),
+    )?;
+    if let Some(payload) = request.accepted_event_payload.as_ref() {
+        if existing_run.is_some() {
+            return Err(DbError::Conflict(format!(
+                "run {} was already accepted",
+                request.run_id
+            )));
+        }
+        append_event_in_transaction(
+            &tx,
+            &NewSessionEvent {
+                session_id: request.session_id.clone(),
+                run_id: Some(request.run_id.clone()),
+                frame_id: Some(request.frame_id.clone()),
+                kind: SessionEventKind::RunAccepted,
+                payload: payload.clone(),
+            },
+            &now,
+        )?;
+    }
+    if let Some(payload) = request.resumed_event_payload.as_ref() {
+        let Some((_, _, _, _, completed_at, status)) = existing_run.as_ref() else {
+            return Err(DbError::NotFound(format!("run {}", request.run_id)));
+        };
+        if completed_at.is_some() || !(status.starts_with("awaiting") || status == "interrupted") {
+            return Err(DbError::Conflict(format!(
+                "run {} is not parked and resumable",
+                request.run_id
+            )));
+        }
+        append_event_in_transaction(
+            &tx,
+            &NewSessionEvent {
+                session_id: request.session_id.clone(),
+                run_id: Some(request.run_id.clone()),
+                frame_id: Some(request.frame_id.clone()),
+                kind: SessionEventKind::RunResumed,
+                payload: payload.clone(),
+            },
+            &now,
+        )?;
+    }
     match existing_run {
-        Some((session_id, _ordinal, start_seq, end_seq, completed_at)) => {
+        Some((session_id, _ordinal, start_seq, end_seq, completed_at, _status)) => {
             if session_id != request.session_id {
                 return Err(DbError::Other(format!(
                     "checkpoint run {} belongs to another session",
@@ -1054,7 +1351,7 @@ pub fn append_history_checkpoint(
                 )));
             }
             tx.execute(
-                "UPDATE session_runs SET frame_id=?1, task_summary=?2, plan_mode=?3, status=?4, \
+                "UPDATE session_runs SET frame_id=?1, actor_frame_id=?1, task_summary=?2, plan_mode=?3, status=?4, \
                  awaiting=?5, pending_ask_json=?6, plan_data=?7, \
                  start_seq=COALESCE(start_seq, ?8), end_seq=COALESCE(?9, end_seq) \
                  WHERE run_id=?10",
@@ -1078,18 +1375,24 @@ pub fn append_history_checkpoint(
                 params![request.session_id],
                 |row| row.get(0),
             )?;
+            let frame_ordinal: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(frame_ordinal), 0) + 1 FROM session_runs WHERE actor_frame_id=?1",
+                params![request.frame_id],
+                |row| row.get(0),
+            )?;
             tx.execute(
                 "INSERT INTO session_runs (\
-                     run_id, session_id, ordinal, frame_id, task_summary, plan_mode, status, kind, \
+                     run_id, session_id, ordinal, frame_id, actor_frame_id, frame_ordinal, task_summary, plan_mode, status, kind, \
                      awaiting, pending_ask_json, error, input_tokens, output_tokens, iterations, \
                      plan_data, start_seq, end_seq, started_at, completed_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, NULL, 0, 0, 0, \
-                           ?10, ?11, ?12, ?13, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, NULL, 0, 0, 0, \
+                           ?11, ?12, ?13, ?14, NULL)",
                 params![
                     request.run_id,
                     request.session_id,
                     ordinal,
                     request.frame_id,
+                    frame_ordinal,
                     request.task_summary,
                     if request.plan_mode { 1 } else { 0 },
                     request.status,
@@ -1103,38 +1406,183 @@ pub fn append_history_checkpoint(
             )?;
         }
     }
+    if let Some(attempt) = request.attempt.as_ref() {
+        if request.accepted_event_payload.is_some() || request.resumed_event_payload.is_some() {
+            let attempt_no: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM run_attempts WHERE run_id=?1",
+                params![request.run_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO run_attempts (attempt_id, run_id, attempt_no, lease_owner, lease_token, \
+                     lease_expires_at, status, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+                params![
+                    attempt.attempt_id,
+                    request.run_id,
+                    attempt_no,
+                    attempt.lease_owner,
+                    attempt.lease_token,
+                    attempt.lease_expires_at,
+                    now,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE session_runs SET active_attempt_id=?1 WHERE run_id=?2",
+                params![attempt.attempt_id, request.run_id],
+            )?;
+            let claimed = tx.execute(
+                "UPDATE execution_frames SET active_run_id=?1, activity='running', \
+                     revision=revision+1, updated_at=?2 \
+                 WHERE id=?3 AND activity<>'closed' \
+                   AND (active_run_id IS NULL OR active_run_id=?1)",
+                params![request.run_id, now, request.frame_id],
+            )?;
+            if claimed != 1 {
+                return Err(DbError::Conflict(format!(
+                    "frame {} already has an active run",
+                    request.frame_id
+                )));
+            }
+            append_event_in_transaction(
+                &tx,
+                &NewSessionEvent {
+                    session_id: request.session_id.clone(),
+                    run_id: Some(request.run_id.clone()),
+                    frame_id: Some(request.frame_id.clone()),
+                    kind: SessionEventKind::AttemptStarted,
+                    payload: json!({
+                        "attempt_id": attempt.attempt_id,
+                        "attempt_no": attempt_no,
+                        "lease_owner": attempt.lease_owner,
+                        "lease_expires_at": attempt.lease_expires_at,
+                    }),
+                },
+                &now,
+            )?;
+            append_event_in_transaction(
+                &tx,
+                &NewSessionEvent {
+                    session_id: request.session_id.clone(),
+                    run_id: Some(request.run_id.clone()),
+                    frame_id: Some(request.frame_id.clone()),
+                    kind: SessionEventKind::FrameActivityChanged,
+                    payload: json!({"activity": "running", "active_run_id": request.run_id}),
+                },
+                &now,
+            )?;
+        } else {
+            let owned: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM run_attempts a JOIN session_runs r ON r.run_id=a.run_id \
+                 WHERE a.attempt_id=?1 AND a.run_id=?2 AND a.lease_token=?3 \
+                   AND a.status IN ('running','waiting') AND r.active_attempt_id=a.attempt_id",
+                params![attempt.attempt_id, request.run_id, attempt.lease_token],
+                |row| row.get(0),
+            )?;
+            if owned != 1 {
+                return Err(DbError::Conflict(
+                    "stale run attempt checkpoint refused".into(),
+                ));
+            }
+        }
+    }
     for (offset, message) in request.messages.iter().enumerate() {
         let seq = max_seq + offset as i64 + 1;
+        let frame_seq = max_frame_seq + offset as i64 + 1;
         tx.execute(
             "INSERT INTO session_messages \
-             (session_id, seq, run_id, role, content, harness_notice, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (session_id, seq, run_id, frame_id, frame_seq, role, content, harness_notice, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 request.session_id,
                 seq,
                 request.run_id,
+                request.frame_id,
+                frame_seq,
                 message.role,
                 message.content,
                 if message.harness_notice { 1 } else { 0 },
                 now,
             ],
         )?;
+        append_message_event(
+            &tx,
+            &request.session_id,
+            &request.run_id,
+            &request.frame_id,
+            seq,
+            message,
+            &now,
+        )?;
     }
     let changed = tx.execute(
         "UPDATE sessions SET \
          title = CASE WHEN title IS NULL THEN ?1 ELSE title END, \
-         plan_mode = ?2, status = ?3, plan_data = ?4, updated_at = ?5 WHERE id = ?6",
+         plan_mode = ?2, status = ?3, plan_data = ?4, compaction_state = ?5, \
+         updated_at = ?6 WHERE id = ?7",
         params![
             request.title,
             if request.plan_mode { 1 } else { 0 },
             request.status,
             request.plan_data,
+            request.compaction_state,
             now,
             request.session_id,
         ],
     )?;
     if changed == 0 {
         return Err(DbError::NotFound(format!("session {}", request.session_id)));
+    }
+    append_compaction_event(
+        &tx,
+        &request.session_id,
+        &request.run_id,
+        &request.frame_id,
+        request.compaction_state.as_deref(),
+        &now,
+    )?;
+    let checkpoint_event = append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id: request.session_id.clone(),
+            run_id: Some(request.run_id.clone()),
+            frame_id: Some(request.frame_id.clone()),
+            kind: SessionEventKind::RunCheckpointed,
+            payload: json!({
+                "status": request.status,
+                "message_count": request.expected_count + request.messages.len(),
+                "start_seq": appended_start,
+                "end_seq": appended_end,
+            }),
+        },
+        &now,
+    )?;
+    if let Some(attempt) = request.attempt.as_ref() {
+        let changed = tx.execute(
+            "UPDATE run_attempts SET checkpoint_event_seq=?1 WHERE attempt_id=?2 AND lease_token=?3 \
+             AND status IN ('running','waiting')",
+            params![checkpoint_event.seq, attempt.attempt_id, attempt.lease_token],
+        )?;
+        if changed != 1 {
+            return Err(DbError::Conflict(
+                "stale run attempt checkpoint refused".into(),
+            ));
+        }
+        append_event_in_transaction(
+            &tx,
+            &NewSessionEvent {
+                session_id: request.session_id.clone(),
+                run_id: Some(request.run_id.clone()),
+                frame_id: Some(request.frame_id.clone()),
+                kind: SessionEventKind::AttemptCheckpointed,
+                payload: json!({
+                    "attempt_id": attempt.attempt_id,
+                    "checkpoint_event_seq": checkpoint_event.seq,
+                    "message_count": request.expected_count + request.messages.len(),
+                }),
+            },
+            &now,
+        )?;
     }
     tx.commit()?;
     Ok(request.expected_count + request.messages.len())
@@ -1149,7 +1597,40 @@ pub fn persist_run(
     request: &PersistRunRequest,
 ) -> Result<PersistRunResult, DbError> {
     let completed_at = now();
+    let run_is_waiting = request.status.starts_with("awaiting");
+    let run_needs_reconciliation = request.status == "needs_reconciliation";
+    let run_completed_at =
+        (!(run_is_waiting || run_needs_reconciliation)).then_some(completed_at.as_str());
     let tx = conn.unchecked_transaction()?;
+
+    if let Some(attempt) = request.attempt.as_ref() {
+        let owned: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run_attempts a JOIN session_runs r ON r.run_id=a.run_id \
+             WHERE a.attempt_id=?1 AND a.run_id=?2 AND a.lease_token=?3 \
+               AND a.status IN ('running','waiting') AND r.active_attempt_id=a.attempt_id",
+            params![attempt.attempt_id, request.run_id, attempt.lease_token],
+            |row| row.get(0),
+        )?;
+        if owned != 1 {
+            return Err(DbError::Conflict(
+                "stale run attempt terminal write refused".into(),
+            ));
+        }
+
+        let unresolved_external: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tool_call_attempts \
+             WHERE run_id=?1 AND attempt_id=?2 AND effect_class='external_side_effect' \
+               AND status IN ('started','unknown')",
+            params![request.run_id, attempt.attempt_id],
+            |row| row.get(0),
+        )?;
+        if unresolved_external > 0 && !run_needs_reconciliation {
+            return Err(DbError::Conflict(
+                "run with an unresolved external side effect must enter needs_reconciliation"
+                    .into(),
+            ));
+        }
+    }
 
     let (project_id, discoverable) = tx
         .query_row(
@@ -1203,6 +1684,11 @@ pub fn persist_run(
         params![request.session_id],
         |row| row.get(0),
     )?;
+    let previous_frame_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(frame_seq), 0) FROM session_messages WHERE frame_id=?1",
+        params![request.frame_id],
+        |row| row.get(0),
+    )?;
     let appended_start_seq = (!request.messages.is_empty()).then_some(previous_seq + 1);
     let existing_start_seq = existing_checkpoint.as_ref().and_then(|row| row.2);
     let existing_end_seq = existing_checkpoint.as_ref().and_then(|row| row.3);
@@ -1230,7 +1716,7 @@ pub fn persist_run(
 
     if existing_checkpoint.is_some() {
         tx.execute(
-            "UPDATE session_runs SET frame_id=?1, task_summary=?2, plan_mode=?3, status=?4, \
+            "UPDATE session_runs SET frame_id=?1, actor_frame_id=?1, task_summary=?2, plan_mode=?3, status=?4, \
              kind=?5, awaiting=?6, pending_ask_json=?7, error=?8, input_tokens=?9, \
              output_tokens=?10, iterations=?11, plan_data=?12, start_seq=?13, end_seq=?14, \
              started_at=?15, completed_at=?16 WHERE run_id=?17",
@@ -1250,25 +1736,31 @@ pub fn persist_run(
                 start_seq,
                 end_seq,
                 request.started_at,
-                completed_at,
+                run_completed_at,
                 request.run_id,
             ],
         )?;
     } else {
+        let frame_ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(frame_ordinal), 0) + 1 FROM session_runs WHERE actor_frame_id=?1",
+            params![request.frame_id],
+            |row| row.get(0),
+        )?;
         tx.execute(
             "INSERT INTO session_runs (\
-                 run_id, session_id, ordinal, frame_id, task_summary, plan_mode, status, kind, \
+                 run_id, session_id, ordinal, frame_id, actor_frame_id, frame_ordinal, task_summary, plan_mode, status, kind, \
                  awaiting, pending_ask_json, error, input_tokens, output_tokens, iterations, \
                  plan_data, start_seq, end_seq, started_at, completed_at\
              ) VALUES (\
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                 ?15, ?16, ?17, ?18, ?19\
+                 ?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                 ?16, ?17, ?18, ?19, ?20\
              )",
             params![
                 request.run_id,
                 request.session_id,
                 ordinal,
                 request.frame_id,
+                frame_ordinal,
                 request.task_summary,
                 if request.plan_mode { 1 } else { 0 },
                 request.status,
@@ -1283,7 +1775,7 @@ pub fn persist_run(
                 start_seq,
                 end_seq,
                 request.started_at,
-                completed_at,
+                run_completed_at,
             ],
         )?;
     }
@@ -1318,38 +1810,170 @@ pub fn persist_run(
 
     for (offset, message) in request.messages.iter().enumerate() {
         let seq = previous_seq + offset as i64 + 1;
+        let frame_seq = previous_frame_seq + offset as i64 + 1;
         tx.execute(
             "INSERT INTO session_messages \
-             (session_id, seq, run_id, role, content, harness_notice, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (session_id, seq, run_id, frame_id, frame_seq, role, content, harness_notice, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 request.session_id,
                 seq,
                 request.run_id,
+                request.frame_id,
+                frame_seq,
                 message.role,
                 message.content,
                 if message.harness_notice { 1 } else { 0 },
                 completed_at,
             ],
         )?;
+        append_message_event(
+            &tx,
+            &request.session_id,
+            &request.run_id,
+            &request.frame_id,
+            seq,
+            message,
+            &completed_at,
+        )?;
     }
 
     let changed = tx.execute(
         "UPDATE sessions SET \
              title = CASE WHEN title IS NULL THEN ?1 ELSE title END, \
-             plan_mode = ?2, status = ?3, plan_data = ?4, updated_at = ?5 \
-         WHERE id = ?6",
+             plan_mode = ?2, status = ?3, plan_data = ?4, compaction_state = ?5, \
+             updated_at = ?6 WHERE id = ?7",
         params![
             request.title,
             if request.plan_mode { 1 } else { 0 },
             request.status,
             request.plan_data,
+            request.compaction_state,
             completed_at,
             request.session_id,
         ],
     )?;
     if changed == 0 {
         return Err(DbError::NotFound(format!("session {}", request.session_id)));
+    }
+
+    append_compaction_event(
+        &tx,
+        &request.session_id,
+        &request.run_id,
+        &request.frame_id,
+        request.compaction_state.as_deref(),
+        &completed_at,
+    )?;
+    append_event_in_transaction(
+        &tx,
+        &NewSessionEvent {
+            session_id: request.session_id.clone(),
+            run_id: Some(request.run_id.clone()),
+            frame_id: Some(request.frame_id.clone()),
+            kind: if run_needs_reconciliation {
+                SessionEventKind::ToolReconciliationRequired
+            } else if run_is_waiting {
+                SessionEventKind::RunWaiting
+            } else {
+                SessionEventKind::RunCompleted
+            },
+            payload: json!({
+                "status": request.status,
+                "kind": request.kind,
+                "error": request.error,
+                "input_tokens": request.input_tokens,
+                "output_tokens": request.output_tokens,
+                "iterations": request.iterations,
+                "start_seq": start_seq,
+                "end_seq": end_seq,
+            }),
+        },
+        &completed_at,
+    )?;
+
+    if let Some(attempt) = request.attempt.as_ref() {
+        let awaiting = run_is_waiting;
+        let retains_run_identity = awaiting || run_needs_reconciliation;
+        let attempt_status = if awaiting {
+            "waiting"
+        } else {
+            match request.status.as_str() {
+                "completed" | "success" => "completed",
+                "cancelled" => "cancelled",
+                "interrupted" => "interrupted",
+                "needs_reconciliation" => "needs_reconciliation",
+                _ => "failed",
+            }
+        };
+        let frame_activity = if awaiting {
+            "waiting"
+        } else if request.status == "interrupted" || request.status == "needs_reconciliation" {
+            "suspended"
+        } else {
+            "idle"
+        };
+        let ended_at = Some(completed_at.as_str());
+        let changed = tx.execute(
+            "UPDATE run_attempts SET status=?1, error=?2, ended_at=?3 \
+             WHERE attempt_id=?4 AND lease_token=?5 AND status IN ('running','waiting')",
+            params![
+                attempt_status,
+                request.error,
+                ended_at,
+                attempt.attempt_id,
+                attempt.lease_token,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DbError::Conflict(
+                "stale run attempt terminal write refused".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE session_runs SET active_attempt_id=NULL WHERE run_id=?1 AND active_attempt_id=?2",
+            params![request.run_id, attempt.attempt_id],
+        )?;
+        let frame_changed = tx.execute(
+            "UPDATE execution_frames SET activity=?1, \
+                active_run_id=CASE WHEN ?2 THEN active_run_id ELSE NULL END, \
+                 revision=revision+1, updated_at=?3 \
+             WHERE id=?4 AND active_run_id=?5",
+            params![
+                frame_activity,
+                if retains_run_identity { 1 } else { 0 },
+                completed_at,
+                request.frame_id,
+                request.run_id,
+            ],
+        )?;
+        if frame_changed != 1 {
+            return Err(DbError::Conflict(
+                "frame ownership changed before terminal write".into(),
+            ));
+        }
+        append_event_in_transaction(
+            &tx,
+            &NewSessionEvent {
+                session_id: request.session_id.clone(),
+                run_id: Some(request.run_id.clone()),
+                frame_id: Some(request.frame_id.clone()),
+                kind: SessionEventKind::AttemptSettled,
+                payload: json!({"attempt_id": attempt.attempt_id, "status": attempt_status}),
+            },
+            &completed_at,
+        )?;
+        append_event_in_transaction(
+            &tx,
+            &NewSessionEvent {
+                session_id: request.session_id.clone(),
+                run_id: Some(request.run_id.clone()),
+                frame_id: Some(request.frame_id.clone()),
+                kind: SessionEventKind::FrameActivityChanged,
+                payload: json!({"activity": frame_activity, "active_run_id": if retains_run_identity { Some(&request.run_id) } else { None }}),
+            },
+            &completed_at,
+        )?;
     }
 
     if discoverable {
@@ -1973,7 +2597,9 @@ mod tests {
                 discoverable INTEGER NOT NULL DEFAULT 1,
                 project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
                 bot_id TEXT REFERENCES bots(id) ON DELETE SET NULL,
+                root_frame_id TEXT,
                 plan_data  TEXT,
+                compaction_state TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -1994,11 +2620,27 @@ mod tests {
                 run_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 claimed_at TEXT, completed_at TEXT
             );
+            CREATE TABLE agent_jobs (
+                id TEXT PRIMARY KEY, job_kind TEXT NOT NULL DEFAULT 'agent_turn',
+                profile_id TEXT REFERENCES bots(id) ON DELETE SET NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                prompt TEXT NOT NULL, requested_plan_mode INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'queued',
+                run_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, lease_owner TEXT,
+                lease_expires_at TEXT, last_error TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, claimed_at TEXT, completed_at TEXT
+            );
             CREATE TABLE session_runs (
                 run_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 ordinal INTEGER NOT NULL,
                 frame_id TEXT NOT NULL,
+                actor_frame_id TEXT,
+                frame_ordinal INTEGER,
+                trigger_kind TEXT NOT NULL DEFAULT 'user',
+                retry_of_run_id TEXT,
+                active_attempt_id TEXT,
                 task_summary TEXT NOT NULL,
                 plan_mode INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
@@ -2021,11 +2663,41 @@ mod tests {
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 seq INTEGER NOT NULL,
                 run_id TEXT REFERENCES session_runs(run_id) ON DELETE SET NULL,
+                frame_id TEXT,
+                frame_seq INTEGER,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 harness_notice INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 UNIQUE(session_id, seq)
+            );
+            CREATE TABLE session_events (
+                event_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                run_id TEXT,
+                frame_id TEXT,
+                event_type TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            CREATE TABLE execution_frames (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                parent_frame_id TEXT REFERENCES execution_frames(id) ON DELETE RESTRICT,
+                root_frame_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'main',
+                profile_id TEXT REFERENCES bots(id) ON DELETE SET NULL,
+                visibility TEXT NOT NULL DEFAULT 'normal',
+                activity TEXT NOT NULL DEFAULT 'idle',
+                active_run_id TEXT,
+                workspace_scope_id TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT
             );
             "#,
         )
@@ -2296,6 +2968,7 @@ mod tests {
             output_tokens: 7,
             iterations: 2,
             plan_data: Some(r#"{"approved":false,"steps":[]}"#.into()),
+            compaction_state: None,
             title: Some("research task".into()),
             started_at: "2026-08-04T10:00:00Z".into(),
             checkpoint_start_seq: None,
@@ -2311,6 +2984,7 @@ mod tests {
                     harness_notice: false,
                 },
             ],
+            attempt: None,
         }
     }
 
@@ -2326,7 +3000,11 @@ mod tests {
         )
         .unwrap();
 
-        let result = persist_run(&conn, &run_request("session-run", "run-one")).unwrap();
+        let mut request = run_request("session-run", "run-one");
+        request.compaction_state = Some(
+            r#"{"folds":[{"start_idx":0,"end_idx":1,"summary":"prior work","level":1}],"l1_summary_count":1}"#.into(),
+        );
+        let result = persist_run(&conn, &request).unwrap();
         assert_eq!(
             result,
             PersistRunResult {
@@ -2355,6 +3033,28 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("research task"));
         assert!(session.plan_mode);
         assert_eq!(session.status, "awaiting_user_response");
+        assert_eq!(
+            get_session_compaction_state(&conn, "session-run")
+                .unwrap()
+                .as_deref(),
+            request.compaction_state.as_deref()
+        );
+        let events = crate::events::list_session_events(&conn, "session-run", 0, 100).unwrap();
+        assert_eq!(
+            events.first().unwrap().kind,
+            SessionEventKind::SessionCreated
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == SessionEventKind::MessageAppended)
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::CompactionUpdated));
+        assert_eq!(events.last().unwrap().kind, SessionEventKind::RunWaiting);
         assert_eq!(
             get_project(&conn, crate::DEFAULT_PROJECT_ID)
                 .unwrap()
@@ -2407,10 +3107,17 @@ mod tests {
                     awaiting: None,
                     pending_ask_json: None,
                     plan_data: None,
+                    compaction_state: None,
                     title: Some("delegate".into()),
                     started_at: "2026-08-04T10:00:00Z".into(),
                     expected_count: 0,
                     messages: checkpoint,
+                    accepted_event_payload: Some(json!({
+                        "request": { "prompt": "delegate" },
+                        "envelope": { "model": "deepseek-chat" }
+                    })),
+                    resumed_event_payload: None,
+                    attempt: None,
                 },
             )
             .unwrap(),
@@ -2421,6 +3128,17 @@ mod tests {
         assert!(interrupted_rows
             .iter()
             .all(|row| row.run_id.as_deref() == Some("run-checkpoint")));
+        let acceptance_events =
+            crate::events::list_session_events(&conn, "session-checkpoint", 0, 100).unwrap();
+        let accepted_index = acceptance_events
+            .iter()
+            .position(|event| event.kind == SessionEventKind::RunAccepted)
+            .expect("acceptance event");
+        let first_message_index = acceptance_events
+            .iter()
+            .position(|event| event.kind == SessionEventKind::MessageAppended)
+            .expect("first message event");
+        assert!(accepted_index < first_message_index);
         let provisional_runs = list_runs(&conn, "session-checkpoint").unwrap();
         assert_eq!(provisional_runs.len(), 1);
         assert_eq!(provisional_runs[0].status, "processing");
@@ -2438,6 +3156,7 @@ mod tests {
                     awaiting: None,
                     pending_ask_json: None,
                     plan_data: None,
+                    compaction_state: None,
                     title: None,
                     started_at: "2026-08-04T10:00:00Z".into(),
                     expected_count: 3,
@@ -2446,6 +3165,9 @@ mod tests {
                         content: r#"{"role":"assistant","content":"continuing"}"#.into(),
                         harness_notice: false,
                     }],
+                    accepted_event_payload: None,
+                    resumed_event_payload: None,
+                    attempt: None,
                 },
             )
             .unwrap(),
@@ -2513,10 +3235,14 @@ mod tests {
                 awaiting: None,
                 pending_ask_json: None,
                 plan_data: None,
+                compaction_state: None,
                 title: Some("delegate".into()),
                 started_at: "2026-08-04T10:00:00Z".into(),
                 expected_count: 0,
                 messages: checkpoint,
+                accepted_event_payload: None,
+                resumed_event_payload: None,
+                attempt: None,
             },
         )
         .unwrap();
@@ -2661,7 +3387,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_bot_queue_reorders_claims_and_finishes_exactly_once() {
+    fn generic_job_runtime_reorders_claims_audits_and_finishes_exactly_once() {
         let conn = test_connection();
         let bot = create_bot(
             &conn,
@@ -2699,6 +3425,15 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, second.id);
         assert_eq!(claimed.status, "running");
+        let (attempt, owner): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT attempt, lease_owner FROM agent_jobs WHERE id=?1",
+                params![claimed.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt, 1);
+        assert_eq!(owner.as_deref(), Some("frontend-compat"));
         let completed = finish_bot_job(&conn, &claimed.id, "run-1", true, None).unwrap();
         assert_eq!(completed.status, "completed");
         assert!(matches!(
@@ -2706,6 +3441,24 @@ mod tests {
             Err(DbError::Conflict(_))
         ));
         assert_eq!(list_bot_jobs(&conn, "queue-session").unwrap().len(), 1);
+        let legacy_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bot_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(legacy_rows, 0, "new jobs must not write the legacy table");
+        let events = crate::events::list_session_events(&conn, "queue-session", 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == SessionEventKind::JobEnqueued)
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::JobClaimed));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::JobSettled));
     }
 
     // ---------- logs prune 测试（D-T07） ----------
