@@ -1,4 +1,0 @@
-# 项目级 Reasonix 配置
-# 允许将调研文档等产物写入用户的 Documents 目录（用户明确要求）
-[sandbox]
-allow_write = ["/Users/apx103/Documents"]
